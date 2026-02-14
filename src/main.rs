@@ -89,7 +89,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 app.apply_message(msg);
             }
             _ = tick_interval.tick() => {
-                // Just triggers a redraw for elapsed time updates
+                app.tick = app.tick.wrapping_add(1);
             }
         }
 

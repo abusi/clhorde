@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 
 pub enum WorkerMessage {
     OutputChunk { prompt_id: usize, text: String },
+    TurnComplete { prompt_id: usize },
     Finished { prompt_id: usize, exit_code: Option<i32> },
     SpawnError { prompt_id: usize, error: String },
 }
@@ -101,6 +102,11 @@ pub fn spawn_worker(
                             });
                         }
                     }
+                }
+
+                // Detect turn completion
+                if json["type"] == "result" {
+                    let _ = reader_tx.send(WorkerMessage::TurnComplete { prompt_id });
                 }
             }
         });

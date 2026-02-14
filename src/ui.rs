@@ -94,6 +94,7 @@ fn render_main_area(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
 }
 
 fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let tick = app.tick;
     let items: Vec<ListItem> = app
         .prompts
         .iter()
@@ -103,9 +104,14 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                 .map(|s| format!(" ({s:.1}s)"))
                 .unwrap_or_default();
 
+            let is_unseen_done = !prompt.seen
+                && (prompt.status == PromptStatus::Completed
+                    || prompt.status == PromptStatus::Failed);
+
             let status_style = match prompt.status {
                 PromptStatus::Pending => Style::default().fg(Color::Yellow),
                 PromptStatus::Running => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                PromptStatus::Idle => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
                 PromptStatus::Completed => Style::default().fg(Color::Green),
                 PromptStatus::Failed => Style::default().fg(Color::Red),
             };
@@ -125,6 +131,47 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                 Span::styled(display, Style::default().fg(Color::Magenta))
             });
 
+            let status_tag = if prompt.status == PromptStatus::Idle {
+                let bright = (tick / 5) % 2 == 0;
+                let style = if bright {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                };
+                Some(Span::styled(" IDLE ", style))
+            } else if is_unseen_done {
+                let tag = if prompt.status == PromptStatus::Completed {
+                    " READY "
+                } else {
+                    " FAILED "
+                };
+                let tag_color = if prompt.status == PromptStatus::Completed {
+                    Color::Green
+                } else {
+                    Color::Red
+                };
+                // Pulse between bright and dim every ~500ms (5 ticks at 100ms)
+                let bright = (tick / 5) % 2 == 0;
+                let style = if bright {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(tag_color)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(tag_color)
+                        .add_modifier(Modifier::BOLD)
+                };
+                Some(Span::styled(tag, style))
+            } else {
+                None
+            };
+
             let mut spans = vec![
                 Span::styled(
                     format!("{} ", prompt.status.symbol()),
@@ -140,10 +187,32 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
             if let Some(cwd_span) = cwd_hint {
                 spans.push(cwd_span);
             }
+            if let Some(tag) = status_tag {
+                spans.push(Span::raw(" "));
+                spans.push(tag);
+            }
 
             let line = Line::from(spans);
 
-            ListItem::new(line)
+            // Give unseen/idle items a subtle background highlight
+            let item = ListItem::new(line);
+            if prompt.status == PromptStatus::Idle {
+                let bg = if (tick / 5) % 2 == 0 {
+                    Color::Rgb(45, 30, 50)
+                } else {
+                    Color::Rgb(35, 25, 40)
+                };
+                item.style(Style::default().bg(bg))
+            } else if is_unseen_done {
+                let bg = if (tick / 5) % 2 == 0 {
+                    Color::Rgb(40, 50, 30)
+                } else {
+                    Color::Rgb(30, 35, 25)
+                };
+                item.style(Style::default().bg(bg))
+            } else {
+                item
+            }
         })
         .collect();
 
@@ -181,6 +250,15 @@ fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rec
                             format!("Running... ({elapsed:.1}s)\n\n{output}")
                         }
                         None => format!("Running... ({elapsed:.1}s)"),
+                    }
+                }
+                PromptStatus::Idle => {
+                    let elapsed = prompt.elapsed_secs().unwrap_or(0.0);
+                    match &prompt.output {
+                        Some(output) => {
+                            format!("{output}\n\n— Idle ({elapsed:.1}s) — press 's' to interact")
+                        }
+                        None => format!("Idle ({elapsed:.1}s) — press 's' to interact"),
                     }
                 }
                 PromptStatus::Completed => {
@@ -226,6 +304,7 @@ fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rec
 
     let output_border_color = match app.selected_prompt().map(|p| &p.status) {
         Some(PromptStatus::Running) => Color::Cyan,
+        Some(PromptStatus::Idle) => Color::Magenta,
         Some(PromptStatus::Completed) => Color::Green,
         Some(PromptStatus::Failed) => Color::Red,
         Some(PromptStatus::Pending) => Color::Yellow,
@@ -342,7 +421,7 @@ fn render_suggestions(f: &mut Frame, app: &App, input_area: Rect) {
 
 fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let bindings: &[(&str, &str)] = match app.mode {
-        AppMode::Normal => &[("i", "insert"), ("q", "quit"), ("j/k", "navigate"), ("Enter", "view"), ("+/-", "workers")],
+        AppMode::Normal => &[("i", "insert"), ("q", "quit"), ("j/k", "navigate"), ("Enter", "view"), ("s", "interact"), ("+/-", "workers")],
         AppMode::Insert => &[("Enter", "submit"), ("Esc", "cancel"), ("Tab", "complete dir")],
         AppMode::ViewOutput => &[("Esc/q", "back"), ("j/k", "scroll"), ("s", "interact"), ("f", "auto-scroll"), ("x", "kill")],
         AppMode::Interact => &[("Enter", "send"), ("Esc", "back")],

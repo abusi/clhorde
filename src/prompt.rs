@@ -4,6 +4,8 @@ use std::time::Instant;
 pub enum PromptStatus {
     Pending,
     Running,
+    /// Turn complete, process alive, waiting for follow-up input.
+    Idle,
     Completed,
     Failed,
 }
@@ -13,6 +15,7 @@ impl PromptStatus {
         match self {
             PromptStatus::Pending => "⏳",
             PromptStatus::Running => "🔄",
+            PromptStatus::Idle => "💬",
             PromptStatus::Completed => "✅",
             PromptStatus::Failed => "❌",
         }
@@ -29,6 +32,8 @@ pub struct Prompt {
     pub error: Option<String>,
     pub started_at: Option<Instant>,
     pub finished_at: Option<Instant>,
+    /// Whether the user has seen/acknowledged this prompt's completion.
+    pub seen: bool,
 }
 
 impl Prompt {
@@ -42,6 +47,7 @@ impl Prompt {
             error: None,
             started_at: None,
             finished_at: None,
+            seen: false,
         }
     }
 

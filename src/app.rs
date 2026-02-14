@@ -33,6 +33,8 @@ pub struct App {
     pub auto_scroll: bool,
     pub suggestions: Vec<String>,
     pub suggestion_index: usize,
+    /// Tick counter incremented every 100ms, used for pulsing animations.
+    pub tick: u64,
 }
 
 impl App {
@@ -54,6 +56,7 @@ impl App {
             auto_scroll: true,
             suggestions: Vec::new(),
             suggestion_index: 0,
+            tick: 0,
         }
     }
 
@@ -176,9 +179,20 @@ impl App {
         match msg {
             WorkerMessage::OutputChunk { prompt_id, text } => {
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
+                    // If we get output after being idle, we're running again
+                    if prompt.status == PromptStatus::Idle {
+                        prompt.status = PromptStatus::Running;
+                    }
                     match &mut prompt.output {
                         Some(existing) => existing.push_str(&text),
                         None => prompt.output = Some(text),
+                    }
+                }
+            }
+            WorkerMessage::TurnComplete { prompt_id } => {
+                if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
+                    if prompt.status == PromptStatus::Running {
+                        prompt.status = PromptStatus::Idle;
                     }
                 }
             }
@@ -218,6 +232,18 @@ impl App {
             .and_then(|i| self.prompts.get(i))
     }
 
+    /// Mark the currently selected prompt as seen if it's finished.
+    fn mark_selected_seen(&mut self) {
+        if let Some(idx) = self.list_state.selected() {
+            if let Some(prompt) = self.prompts.get_mut(idx) {
+                if prompt.status == PromptStatus::Completed || prompt.status == PromptStatus::Failed
+                {
+                    prompt.seen = true;
+                }
+            }
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         match self.mode {
             AppMode::Normal => self.handle_normal_key(key),
@@ -234,12 +260,32 @@ impl App {
                 self.mode = AppMode::Insert;
                 self.input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down => self.select_next(),
-            KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.select_next();
+                self.mark_selected_seen();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.select_prev();
+                self.mark_selected_seen();
+            }
             KeyCode::Enter => {
-                if self.selected_prompt().is_some() {
-                    self.scroll_offset = 0;
-                    self.mode = AppMode::ViewOutput;
+                if let Some(idx) = self.list_state.selected() {
+                    if idx < self.prompts.len() {
+                        self.prompts[idx].seen = true;
+                        self.scroll_offset = 0;
+                        self.mode = AppMode::ViewOutput;
+                    }
+                }
+            }
+            KeyCode::Char('s') => {
+                if let Some(prompt) = self.selected_prompt() {
+                    if prompt.status == PromptStatus::Running
+                        || prompt.status == PromptStatus::Idle
+                    {
+                        self.interact_input.clear();
+                        self.scroll_offset = 0;
+                        self.mode = AppMode::Interact;
+                    }
                 }
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -316,7 +362,9 @@ impl App {
             }
             KeyCode::Char('s') => {
                 if let Some(prompt) = self.selected_prompt() {
-                    if prompt.status == PromptStatus::Running {
+                    if prompt.status == PromptStatus::Running
+                        || prompt.status == PromptStatus::Idle
+                    {
                         self.interact_input.clear();
                         self.mode = AppMode::Interact;
                     }
@@ -328,7 +376,9 @@ impl App {
             KeyCode::Char('x') => {
                 if let Some(prompt) = self.selected_prompt() {
                     let id = prompt.id;
-                    if prompt.status == PromptStatus::Running {
+                    if prompt.status == PromptStatus::Running
+                        || prompt.status == PromptStatus::Idle
+                    {
                         if let Some(sender) = self.worker_inputs.get(&id) {
                             let _ = sender.send(WorkerInput::Kill);
                         }
@@ -342,7 +392,7 @@ impl App {
     fn handle_interact_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.mode = AppMode::ViewOutput;
+                self.mode = AppMode::Normal;
                 self.interact_input.clear();
             }
             KeyCode::Enter => {
