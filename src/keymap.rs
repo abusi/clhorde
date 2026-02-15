@@ -465,3 +465,221 @@ impl Keymap {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_key ──
+
+    #[test]
+    fn parse_key_special_names() {
+        assert_eq!(parse_key("Enter"), Some(KeyCode::Enter));
+        assert_eq!(parse_key("Esc"), Some(KeyCode::Esc));
+        assert_eq!(parse_key("Tab"), Some(KeyCode::Tab));
+        assert_eq!(parse_key("Backspace"), Some(KeyCode::Backspace));
+        assert_eq!(parse_key("Up"), Some(KeyCode::Up));
+        assert_eq!(parse_key("Down"), Some(KeyCode::Down));
+        assert_eq!(parse_key("Left"), Some(KeyCode::Left));
+        assert_eq!(parse_key("Right"), Some(KeyCode::Right));
+        assert_eq!(parse_key("Space"), Some(KeyCode::Char(' ')));
+    }
+
+    #[test]
+    fn parse_key_single_chars() {
+        assert_eq!(parse_key("q"), Some(KeyCode::Char('q')));
+        assert_eq!(parse_key("i"), Some(KeyCode::Char('i')));
+        assert_eq!(parse_key("+"), Some(KeyCode::Char('+')));
+        assert_eq!(parse_key("/"), Some(KeyCode::Char('/')));
+        assert_eq!(parse_key("K"), Some(KeyCode::Char('K')));
+    }
+
+    #[test]
+    fn parse_key_invalid() {
+        assert_eq!(parse_key(""), None);
+        assert_eq!(parse_key("Unknown"), None);
+        assert_eq!(parse_key("Ctrl+A"), None);
+        assert_eq!(parse_key("ab"), None);
+    }
+
+    // ── key_display roundtrip ──
+
+    #[test]
+    fn key_display_roundtrip() {
+        let names = [
+            "Enter", "Esc", "Tab", "Backspace", "Up", "Down", "Left", "Right", "Space",
+            "q", "i", "+", "/",
+        ];
+        for name in names {
+            let kc = parse_key(name).unwrap();
+            assert_eq!(key_display(&kc), name, "roundtrip failed for {name}");
+        }
+    }
+
+    // ── Keymap::default ──
+
+    #[test]
+    fn default_normal_bindings() {
+        let km = Keymap::default();
+        assert_eq!(km.normal.get(&KeyCode::Char('q')), Some(&NormalAction::Quit));
+        assert_eq!(km.normal.get(&KeyCode::Char('i')), Some(&NormalAction::Insert));
+        assert_eq!(km.normal.get(&KeyCode::Char('j')), Some(&NormalAction::SelectNext));
+        assert_eq!(km.normal.get(&KeyCode::Down), Some(&NormalAction::SelectNext));
+        assert_eq!(km.normal.get(&KeyCode::Enter), Some(&NormalAction::ViewOutput));
+        assert_eq!(km.normal.get(&KeyCode::Char('m')), Some(&NormalAction::ToggleMode));
+        assert_eq!(km.normal.get(&KeyCode::Char('r')), Some(&NormalAction::Retry));
+        assert_eq!(km.normal.get(&KeyCode::Char('/')), Some(&NormalAction::Search));
+    }
+
+    #[test]
+    fn default_view_bindings() {
+        let km = Keymap::default();
+        assert_eq!(km.view.get(&KeyCode::Esc), Some(&ViewAction::Back));
+        assert_eq!(km.view.get(&KeyCode::Char('q')), Some(&ViewAction::Back));
+        assert_eq!(km.view.get(&KeyCode::Char('f')), Some(&ViewAction::ToggleAutoscroll));
+        assert_eq!(km.view.get(&KeyCode::Char('x')), Some(&ViewAction::KillWorker));
+        assert_eq!(km.view.get(&KeyCode::Char('w')), Some(&ViewAction::Export));
+    }
+
+    #[test]
+    fn default_insert_bindings() {
+        let km = Keymap::default();
+        assert_eq!(km.insert.get(&KeyCode::Esc), Some(&InsertAction::Cancel));
+        assert_eq!(km.insert.get(&KeyCode::Enter), Some(&InsertAction::Submit));
+        assert_eq!(km.insert.get(&KeyCode::Tab), Some(&InsertAction::AcceptSuggestion));
+    }
+
+    #[test]
+    fn default_interact_bindings() {
+        let km = Keymap::default();
+        assert_eq!(km.interact.get(&KeyCode::Esc), Some(&InteractAction::Back));
+        assert_eq!(km.interact.get(&KeyCode::Enter), Some(&InteractAction::Send));
+    }
+
+    #[test]
+    fn default_filter_bindings() {
+        let km = Keymap::default();
+        assert_eq!(km.filter.get(&KeyCode::Esc), Some(&FilterAction::Cancel));
+        assert_eq!(km.filter.get(&KeyCode::Enter), Some(&FilterAction::Confirm));
+    }
+
+    // ── from_toml partial override ──
+
+    #[test]
+    fn from_toml_partial_override() {
+        let toml_str = r#"
+[normal]
+quit = ["Q"]
+"#;
+        let config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let km = Keymap::from_toml(config);
+
+        // Old quit key removed, new one works
+        assert_eq!(km.normal.get(&KeyCode::Char('q')), None);
+        assert_eq!(km.normal.get(&KeyCode::Char('Q')), Some(&NormalAction::Quit));
+
+        // Other bindings unchanged
+        assert_eq!(km.normal.get(&KeyCode::Char('i')), Some(&NormalAction::Insert));
+        assert_eq!(km.normal.get(&KeyCode::Char('j')), Some(&NormalAction::SelectNext));
+        assert_eq!(km.normal.get(&KeyCode::Enter), Some(&NormalAction::ViewOutput));
+    }
+
+    #[test]
+    fn from_toml_empty_config() {
+        let config: TomlConfig = toml::from_str("").unwrap();
+        let km = Keymap::from_toml(config);
+        let default = Keymap::default();
+
+        // Spot-check that empty config produces same result as default
+        assert_eq!(km.normal.len(), default.normal.len());
+        assert_eq!(km.insert.len(), default.insert.len());
+        assert_eq!(km.view.len(), default.view.len());
+        assert_eq!(km.interact.len(), default.interact.len());
+        assert_eq!(km.filter.len(), default.filter.len());
+
+        for (key, action) in &default.normal {
+            assert_eq!(km.normal.get(key), Some(action));
+        }
+    }
+
+    // ── apply_bindings ──
+
+    #[test]
+    fn apply_bindings_removes_old_keys() {
+        let mut map = HashMap::new();
+        map.insert(KeyCode::Char('q'), NormalAction::Quit);
+        map.insert(KeyCode::Char('i'), NormalAction::Insert);
+
+        apply_bindings(&mut map, NormalAction::Quit, Some(vec!["x".to_string()]));
+
+        assert_eq!(map.get(&KeyCode::Char('q')), None);
+        assert_eq!(map.get(&KeyCode::Char('x')), Some(&NormalAction::Quit));
+        // Unrelated binding untouched
+        assert_eq!(map.get(&KeyCode::Char('i')), Some(&NormalAction::Insert));
+    }
+
+    #[test]
+    fn apply_bindings_none_keeps_defaults() {
+        let mut map = HashMap::new();
+        map.insert(KeyCode::Char('q'), NormalAction::Quit);
+
+        apply_bindings(&mut map, NormalAction::Quit, None);
+
+        assert_eq!(map.get(&KeyCode::Char('q')), Some(&NormalAction::Quit));
+    }
+
+    #[test]
+    fn apply_bindings_multiple_keys() {
+        let mut map = HashMap::new();
+        map.insert(KeyCode::Char('q'), NormalAction::Quit);
+
+        apply_bindings(
+            &mut map,
+            NormalAction::Quit,
+            Some(vec!["x".to_string(), "X".to_string()]),
+        );
+
+        assert_eq!(map.get(&KeyCode::Char('q')), None);
+        assert_eq!(map.get(&KeyCode::Char('x')), Some(&NormalAction::Quit));
+        assert_eq!(map.get(&KeyCode::Char('X')), Some(&NormalAction::Quit));
+    }
+
+    // ── help bar generation ──
+
+    #[test]
+    fn normal_help_contains_expected_entries() {
+        let km = Keymap::default();
+        let help = km.normal_help();
+        let labels: Vec<&str> = help.iter().map(|(_, l)| *l).collect();
+
+        assert!(labels.contains(&"insert"), "missing 'insert' in help");
+        assert!(labels.contains(&"quit"), "missing 'quit' in help");
+        assert!(labels.contains(&"view"), "missing 'view' in help");
+        assert!(labels.contains(&"mode"), "missing 'mode' in help");
+        assert!(labels.contains(&"retry"), "missing 'retry' in help");
+    }
+
+    #[test]
+    fn help_skips_unbound_actions() {
+        let mut km = Keymap::default();
+        // Remove all quit bindings
+        km.normal.retain(|_, v| *v != NormalAction::Quit);
+        let help = km.normal_help();
+        let labels: Vec<&str> = help.iter().map(|(_, l)| *l).collect();
+        assert!(!labels.contains(&"quit"));
+    }
+
+    #[test]
+    fn key_hint_returns_question_mark_for_unbound() {
+        let mut km = Keymap::default();
+        km.normal.retain(|_, v| *v != NormalAction::Insert);
+        assert_eq!(km.normal_key_hint(NormalAction::Insert), "?");
+    }
+
+    #[test]
+    fn key_hint_returns_key_for_bound() {
+        let km = Keymap::default();
+        assert_eq!(km.normal_key_hint(NormalAction::Insert), "i");
+        assert_eq!(km.view_key_hint(ViewAction::ToggleAutoscroll), "f");
+    }
+}

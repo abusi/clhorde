@@ -142,3 +142,150 @@ impl SerializablePrompt {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── PromptMode ──
+
+    #[test]
+    fn toggle_interactive_to_oneshot() {
+        assert_eq!(PromptMode::Interactive.toggle(), PromptMode::OneShot);
+    }
+
+    #[test]
+    fn toggle_oneshot_to_interactive() {
+        assert_eq!(PromptMode::OneShot.toggle(), PromptMode::Interactive);
+    }
+
+    #[test]
+    fn toggle_roundtrip() {
+        assert_eq!(PromptMode::Interactive.toggle().toggle(), PromptMode::Interactive);
+    }
+
+    #[test]
+    fn label_interactive() {
+        assert_eq!(PromptMode::Interactive.label(), "interactive");
+    }
+
+    #[test]
+    fn label_oneshot() {
+        assert_eq!(PromptMode::OneShot.label(), "one-shot");
+    }
+
+    // ── PromptStatus::symbol ──
+
+    #[test]
+    fn status_symbols() {
+        assert_eq!(PromptStatus::Pending.symbol(), "⏳");
+        assert_eq!(PromptStatus::Running.symbol(), "🔄");
+        assert_eq!(PromptStatus::Idle.symbol(), "💬");
+        assert_eq!(PromptStatus::Completed.symbol(), "✅");
+        assert_eq!(PromptStatus::Failed.symbol(), "❌");
+    }
+
+    // ── Prompt::new ──
+
+    #[test]
+    fn new_prompt_defaults() {
+        let p = Prompt::new(1, "hello".to_string(), None, PromptMode::Interactive);
+        assert_eq!(p.id, 1);
+        assert_eq!(p.text, "hello");
+        assert_eq!(p.cwd, None);
+        assert_eq!(p.mode, PromptMode::Interactive);
+        assert_eq!(p.status, PromptStatus::Pending);
+        assert!(p.output.is_none());
+        assert!(p.error.is_none());
+        assert!(p.started_at.is_none());
+        assert!(p.finished_at.is_none());
+        assert!(!p.seen);
+        assert!(p.saved_elapsed.is_none());
+    }
+
+    #[test]
+    fn new_prompt_with_cwd() {
+        let p = Prompt::new(5, "test".to_string(), Some("/tmp".to_string()), PromptMode::OneShot);
+        assert_eq!(p.cwd, Some("/tmp".to_string()));
+        assert_eq!(p.mode, PromptMode::OneShot);
+    }
+
+    #[test]
+    fn elapsed_secs_none_when_not_started() {
+        let p = Prompt::new(1, "test".to_string(), None, PromptMode::Interactive);
+        assert!(p.elapsed_secs().is_none());
+    }
+
+    #[test]
+    fn elapsed_secs_uses_saved_value() {
+        let mut p = Prompt::new(1, "test".to_string(), None, PromptMode::Interactive);
+        p.saved_elapsed = Some(42.5);
+        assert_eq!(p.elapsed_secs(), Some(42.5));
+    }
+
+    // ── SerializablePrompt::into_prompt ──
+
+    fn make_serializable(status: PromptStatus) -> SerializablePrompt {
+        SerializablePrompt {
+            id: 1,
+            text: "test".to_string(),
+            cwd: Some("/home".to_string()),
+            mode: PromptMode::Interactive,
+            status,
+            output: Some("output".to_string()),
+            error: None,
+            elapsed_secs: Some(5.0),
+        }
+    }
+
+    #[test]
+    fn into_prompt_running_becomes_completed() {
+        let sp = make_serializable(PromptStatus::Running);
+        let p = sp.into_prompt();
+        assert_eq!(p.status, PromptStatus::Completed);
+    }
+
+    #[test]
+    fn into_prompt_idle_becomes_completed() {
+        let sp = make_serializable(PromptStatus::Idle);
+        let p = sp.into_prompt();
+        assert_eq!(p.status, PromptStatus::Completed);
+    }
+
+    #[test]
+    fn into_prompt_pending_stays_pending() {
+        let sp = make_serializable(PromptStatus::Pending);
+        let p = sp.into_prompt();
+        assert_eq!(p.status, PromptStatus::Pending);
+    }
+
+    #[test]
+    fn into_prompt_completed_stays_completed() {
+        let sp = make_serializable(PromptStatus::Completed);
+        let p = sp.into_prompt();
+        assert_eq!(p.status, PromptStatus::Completed);
+    }
+
+    #[test]
+    fn into_prompt_failed_stays_failed() {
+        let sp = make_serializable(PromptStatus::Failed);
+        let p = sp.into_prompt();
+        assert_eq!(p.status, PromptStatus::Failed);
+    }
+
+    #[test]
+    fn into_prompt_fields_preserved() {
+        let sp = make_serializable(PromptStatus::Completed);
+        let p = sp.into_prompt();
+        assert_eq!(p.id, 1);
+        assert_eq!(p.text, "test");
+        assert_eq!(p.cwd, Some("/home".to_string()));
+        assert_eq!(p.mode, PromptMode::Interactive);
+        assert_eq!(p.output, Some("output".to_string()));
+        assert!(p.error.is_none());
+        assert_eq!(p.saved_elapsed, Some(5.0));
+        assert!(p.seen); // restored prompts are seen
+        assert!(p.started_at.is_none());
+        assert!(p.finished_at.is_none());
+    }
+}

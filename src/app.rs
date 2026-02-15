@@ -997,3 +997,519 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::WorkerMessage;
+
+    // ── App::new defaults ──
+
+    #[test]
+    fn app_new_defaults() {
+        let app = App::new();
+        assert_eq!(app.max_workers, 3);
+        assert_eq!(app.active_workers, 0);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.auto_scroll);
+        assert!(app.prompts.is_empty());
+        assert_eq!(app.next_id, 1);
+        assert!(!app.should_quit);
+        assert!(!app.confirm_quit);
+        assert_eq!(app.default_mode, PromptMode::Interactive);
+        assert!(app.filter_text.is_none());
+        assert!(app.history_index.is_none());
+    }
+
+    // ── add_prompt / pending_count / completed_count ──
+
+    #[test]
+    fn add_prompt_increments_id() {
+        let mut app = App::new();
+        app.add_prompt("first".to_string(), None);
+        app.add_prompt("second".to_string(), None);
+        app.add_prompt("third".to_string(), None);
+
+        assert_eq!(app.prompts.len(), 3);
+        assert_eq!(app.prompts[0].id, 1);
+        assert_eq!(app.prompts[1].id, 2);
+        assert_eq!(app.prompts[2].id, 3);
+        assert_eq!(app.next_id, 4);
+    }
+
+    #[test]
+    fn add_prompt_selects_first() {
+        let mut app = App::new();
+        assert!(app.list_state.selected().is_none());
+        app.add_prompt("test".to_string(), None);
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn pending_and_completed_counts() {
+        let mut app = App::new();
+        app.add_prompt("a".to_string(), None);
+        app.add_prompt("b".to_string(), None);
+        app.add_prompt("c".to_string(), None);
+
+        assert_eq!(app.pending_count(), 3);
+        assert_eq!(app.completed_count(), 0);
+
+        app.prompts[0].status = PromptStatus::Completed;
+        app.prompts[1].status = PromptStatus::Failed;
+
+        assert_eq!(app.pending_count(), 1);
+        assert_eq!(app.completed_count(), 2);
+    }
+
+    // ── select_next / select_prev ──
+
+    #[test]
+    fn select_next_empty_list() {
+        let mut app = App::new();
+        app.select_next(); // should not panic
+        assert!(app.list_state.selected().is_none());
+    }
+
+    #[test]
+    fn select_prev_empty_list() {
+        let mut app = App::new();
+        app.select_prev(); // should not panic
+        assert!(app.list_state.selected().is_none());
+    }
+
+    #[test]
+    fn select_next_clamps_to_end() {
+        let mut app = App::new();
+        app.add_prompt("a".to_string(), None);
+        app.add_prompt("b".to_string(), None);
+        app.list_state.select(Some(1));
+
+        app.select_next();
+        assert_eq!(app.list_state.selected(), Some(1)); // stays at end
+    }
+
+    #[test]
+    fn select_prev_clamps_to_start() {
+        let mut app = App::new();
+        app.add_prompt("a".to_string(), None);
+        app.add_prompt("b".to_string(), None);
+        app.list_state.select(Some(0));
+
+        app.select_prev();
+        assert_eq!(app.list_state.selected(), Some(0)); // stays at start
+    }
+
+    #[test]
+    fn select_next_advances() {
+        let mut app = App::new();
+        app.add_prompt("a".to_string(), None);
+        app.add_prompt("b".to_string(), None);
+        app.add_prompt("c".to_string(), None);
+        app.list_state.select(Some(0));
+
+        app.select_next();
+        assert_eq!(app.list_state.selected(), Some(1));
+        app.select_next();
+        assert_eq!(app.list_state.selected(), Some(2));
+    }
+
+    #[test]
+    fn select_prev_goes_back() {
+        let mut app = App::new();
+        app.add_prompt("a".to_string(), None);
+        app.add_prompt("b".to_string(), None);
+        app.list_state.select(Some(1));
+
+        app.select_prev();
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    // ── move_selected_up / move_selected_down ──
+
+    fn app_with_prompts(texts: &[&str]) -> App {
+        let mut app = App::new();
+        for t in texts {
+            app.add_prompt(t.to_string(), None);
+        }
+        app
+    }
+
+    #[test]
+    fn move_down_swaps_pending() {
+        let mut app = app_with_prompts(&["a", "b", "c"]);
+        app.list_state.select(Some(0));
+
+        app.move_selected_down();
+        assert_eq!(app.prompts[0].text, "b");
+        assert_eq!(app.prompts[1].text, "a");
+        assert_eq!(app.list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn move_up_swaps_pending() {
+        let mut app = app_with_prompts(&["a", "b", "c"]);
+        app.list_state.select(Some(2));
+
+        app.move_selected_up();
+        assert_eq!(app.prompts[1].text, "c");
+        assert_eq!(app.prompts[2].text, "b");
+        assert_eq!(app.list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn move_down_at_end_is_noop() {
+        let mut app = app_with_prompts(&["a", "b"]);
+        app.list_state.select(Some(1));
+
+        app.move_selected_down();
+        assert_eq!(app.prompts[0].text, "a");
+        assert_eq!(app.prompts[1].text, "b");
+        assert_eq!(app.list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn move_up_at_start_is_noop() {
+        let mut app = app_with_prompts(&["a", "b"]);
+        app.list_state.select(Some(0));
+
+        app.move_selected_up();
+        assert_eq!(app.prompts[0].text, "a");
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn move_non_pending_is_noop() {
+        let mut app = app_with_prompts(&["a", "b"]);
+        app.prompts[0].status = PromptStatus::Running;
+        app.list_state.select(Some(0));
+
+        app.move_selected_down();
+        assert_eq!(app.prompts[0].text, "a");
+        assert_eq!(app.prompts[1].text, "b");
+    }
+
+    #[test]
+    fn move_no_selection_is_noop() {
+        let mut app = app_with_prompts(&["a", "b"]);
+        app.list_state.select(None);
+        app.move_selected_up(); // should not panic
+        app.move_selected_down(); // should not panic
+    }
+
+    // ── retry_selected ──
+
+    #[test]
+    fn retry_completed_creates_new_prompt() {
+        let mut app = app_with_prompts(&["hello world"]);
+        app.prompts[0].status = PromptStatus::Completed;
+        app.prompts[0].cwd = Some("/tmp".to_string());
+        app.list_state.select(Some(0));
+
+        app.retry_selected();
+
+        assert_eq!(app.prompts.len(), 2);
+        let retried = &app.prompts[1];
+        assert_eq!(retried.text, "hello world");
+        assert_eq!(retried.cwd, Some("/tmp".to_string()));
+        assert_eq!(retried.status, PromptStatus::Pending);
+        assert!(retried.id > app.prompts[0].id);
+    }
+
+    #[test]
+    fn retry_failed_creates_new_prompt() {
+        let mut app = app_with_prompts(&["fail"]);
+        app.prompts[0].status = PromptStatus::Failed;
+        app.list_state.select(Some(0));
+
+        app.retry_selected();
+        assert_eq!(app.prompts.len(), 2);
+        assert_eq!(app.prompts[1].status, PromptStatus::Pending);
+    }
+
+    #[test]
+    fn retry_running_is_noop() {
+        let mut app = app_with_prompts(&["running"]);
+        app.prompts[0].status = PromptStatus::Running;
+        app.list_state.select(Some(0));
+
+        app.retry_selected();
+        assert_eq!(app.prompts.len(), 1);
+    }
+
+    #[test]
+    fn retry_pending_is_noop() {
+        let mut app = app_with_prompts(&["pending"]);
+        app.list_state.select(Some(0));
+
+        app.retry_selected();
+        assert_eq!(app.prompts.len(), 1);
+    }
+
+    #[test]
+    fn retry_no_selection_is_noop() {
+        let mut app = app_with_prompts(&["test"]);
+        app.prompts[0].status = PromptStatus::Completed;
+        app.list_state.select(None);
+
+        app.retry_selected();
+        assert_eq!(app.prompts.len(), 1);
+    }
+
+    // ── rebuild_filter ──
+
+    #[test]
+    fn filter_no_text_includes_all() {
+        let mut app = app_with_prompts(&["foo", "bar", "baz"]);
+        app.filter_text = None;
+        app.rebuild_filter();
+        assert_eq!(app.filtered_indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn filter_matches_case_insensitive() {
+        let mut app = app_with_prompts(&["Hello World", "goodbye", "HELLO again"]);
+        app.filter_text = Some("hello".to_string());
+        app.rebuild_filter();
+        assert_eq!(app.filtered_indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn filter_no_matches() {
+        let mut app = app_with_prompts(&["foo", "bar"]);
+        app.filter_text = Some("xyz".to_string());
+        app.rebuild_filter();
+        assert!(app.filtered_indices.is_empty());
+    }
+
+    #[test]
+    fn filter_partial_match() {
+        let mut app = app_with_prompts(&["refactor auth", "fix auth bug", "add tests"]);
+        app.filter_text = Some("auth".to_string());
+        app.rebuild_filter();
+        assert_eq!(app.filtered_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn clamp_selection_when_filtered_out() {
+        let mut app = app_with_prompts(&["foo", "bar", "baz"]);
+        app.list_state.select(Some(1)); // "bar" selected
+        app.filter_text = Some("foo".to_string());
+        app.rebuild_filter();
+        app.clamp_selection_to_filter();
+        // "bar" is filtered out, selection should snap to first match
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn clamp_selection_empty_filter_result() {
+        let mut app = app_with_prompts(&["foo"]);
+        app.list_state.select(Some(0));
+        app.filter_text = Some("xyz".to_string());
+        app.rebuild_filter();
+        app.clamp_selection_to_filter();
+        assert!(app.list_state.selected().is_none());
+    }
+
+    // ── history_prev / history_next ──
+
+    #[test]
+    fn history_empty_is_noop() {
+        let mut app = App::new();
+        app.input = "current".to_string();
+        app.history_prev();
+        assert_eq!(app.input, "current");
+        assert!(app.history_index.is_none());
+    }
+
+    #[test]
+    fn history_prev_stashes_and_navigates() {
+        let mut app = App::new();
+        app.history = vec!["first".to_string(), "second".to_string()];
+        app.input = "typing".to_string();
+
+        app.history_prev();
+        assert_eq!(app.input, "second");
+        assert_eq!(app.history_index, Some(1));
+        assert_eq!(app.history_stash, "typing");
+
+        app.history_prev();
+        assert_eq!(app.input, "first");
+        assert_eq!(app.history_index, Some(0));
+    }
+
+    #[test]
+    fn history_prev_stops_at_beginning() {
+        let mut app = App::new();
+        app.history = vec!["only".to_string()];
+        app.input = "typing".to_string();
+
+        app.history_prev();
+        assert_eq!(app.input, "only");
+        assert_eq!(app.history_index, Some(0));
+
+        app.history_prev(); // already at start
+        assert_eq!(app.input, "only");
+        assert_eq!(app.history_index, Some(0));
+    }
+
+    #[test]
+    fn history_next_restores_stash() {
+        let mut app = App::new();
+        app.history = vec!["first".to_string(), "second".to_string()];
+        app.input = "typing".to_string();
+
+        app.history_prev(); // "second"
+        app.history_next(); // past end -> restore stash
+        assert_eq!(app.input, "typing");
+        assert!(app.history_index.is_none());
+    }
+
+    #[test]
+    fn history_next_without_navigating_is_noop() {
+        let mut app = App::new();
+        app.history = vec!["first".to_string()];
+        app.input = "current".to_string();
+        app.history_next();
+        assert_eq!(app.input, "current");
+    }
+
+    #[test]
+    fn history_prev_next_roundtrip() {
+        let mut app = App::new();
+        app.history = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        app.input = "now".to_string();
+
+        app.history_prev(); // "c"
+        app.history_prev(); // "b"
+        assert_eq!(app.input, "b");
+
+        app.history_next(); // "c"
+        assert_eq!(app.input, "c");
+
+        app.history_next(); // restore "now"
+        assert_eq!(app.input, "now");
+        assert!(app.history_index.is_none());
+    }
+
+    // ── parse_cwd_prefix ──
+
+    #[test]
+    fn parse_cwd_with_valid_dir() {
+        // /tmp should exist on any unix system
+        let (cwd, text) = App::parse_cwd_prefix("/tmp: do something");
+        assert_eq!(cwd, Some("/tmp".to_string()));
+        assert_eq!(text, "do something");
+    }
+
+    #[test]
+    fn parse_cwd_with_nonexistent_dir() {
+        let (cwd, text) = App::parse_cwd_prefix("/nonexistent_xyz_123: do something");
+        assert!(cwd.is_none());
+        assert_eq!(text, "/nonexistent_xyz_123: do something");
+    }
+
+    #[test]
+    fn parse_cwd_no_colon() {
+        let (cwd, text) = App::parse_cwd_prefix("plain text here");
+        assert!(cwd.is_none());
+        assert_eq!(text, "plain text here");
+    }
+
+    #[test]
+    fn parse_cwd_empty_prefix() {
+        let (cwd, text) = App::parse_cwd_prefix(": after colon");
+        assert!(cwd.is_none());
+        assert_eq!(text, ": after colon");
+    }
+
+    // ── apply_message ──
+
+    #[test]
+    fn apply_output_chunk() {
+        let mut app = app_with_prompts(&["test"]);
+        app.prompts[0].status = PromptStatus::Running;
+
+        app.apply_message(WorkerMessage::OutputChunk {
+            prompt_id: 1,
+            text: "hello ".to_string(),
+        });
+        app.apply_message(WorkerMessage::OutputChunk {
+            prompt_id: 1,
+            text: "world".to_string(),
+        });
+
+        assert_eq!(app.prompts[0].output, Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn apply_turn_complete_transitions_to_idle() {
+        let mut app = app_with_prompts(&["test"]);
+        app.prompts[0].status = PromptStatus::Running;
+        app.prompts[0].output = Some("output".to_string());
+
+        app.apply_message(WorkerMessage::TurnComplete { prompt_id: 1 });
+
+        assert_eq!(app.prompts[0].status, PromptStatus::Idle);
+        assert_eq!(app.prompts[0].output, Some("output\n".to_string()));
+    }
+
+    #[test]
+    fn apply_finished_success() {
+        let mut app = app_with_prompts(&["test"]);
+        app.prompts[0].status = PromptStatus::Running;
+        app.active_workers = 1;
+
+        app.apply_message(WorkerMessage::Finished {
+            prompt_id: 1,
+            exit_code: Some(0),
+        });
+
+        assert_eq!(app.prompts[0].status, PromptStatus::Completed);
+        assert!(app.prompts[0].finished_at.is_some());
+        assert_eq!(app.active_workers, 0);
+    }
+
+    #[test]
+    fn apply_finished_failure() {
+        let mut app = app_with_prompts(&["test"]);
+        app.prompts[0].status = PromptStatus::Running;
+        app.active_workers = 1;
+
+        app.apply_message(WorkerMessage::Finished {
+            prompt_id: 1,
+            exit_code: Some(1),
+        });
+
+        assert_eq!(app.prompts[0].status, PromptStatus::Failed);
+        assert!(app.prompts[0].error.is_some());
+    }
+
+    #[test]
+    fn apply_spawn_error() {
+        let mut app = app_with_prompts(&["test"]);
+        app.active_workers = 1;
+
+        app.apply_message(WorkerMessage::SpawnError {
+            prompt_id: 1,
+            error: "not found".to_string(),
+        });
+
+        assert_eq!(app.prompts[0].status, PromptStatus::Failed);
+        assert_eq!(app.prompts[0].error, Some("not found".to_string()));
+        assert_eq!(app.active_workers, 0);
+    }
+
+    #[test]
+    fn output_chunk_on_idle_transitions_to_running() {
+        let mut app = app_with_prompts(&["test"]);
+        app.prompts[0].status = PromptStatus::Idle;
+
+        app.apply_message(WorkerMessage::OutputChunk {
+            prompt_id: 1,
+            text: "more".to_string(),
+        });
+
+        assert_eq!(app.prompts[0].status, PromptStatus::Running);
+    }
+}
