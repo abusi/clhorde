@@ -1,5 +1,27 @@
 use std::time::Instant;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PromptMode {
+    Interactive,
+    OneShot,
+}
+
+impl PromptMode {
+    pub fn label(&self) -> &str {
+        match self {
+            PromptMode::Interactive => "interactive",
+            PromptMode::OneShot => "one-shot",
+        }
+    }
+
+    pub fn toggle(&self) -> Self {
+        match self {
+            PromptMode::Interactive => PromptMode::OneShot,
+            PromptMode::OneShot => PromptMode::Interactive,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptStatus {
     Pending,
@@ -27,6 +49,7 @@ pub struct Prompt {
     pub id: usize,
     pub text: String,
     pub cwd: Option<String>,
+    pub mode: PromptMode,
     pub status: PromptStatus,
     pub output: Option<String>,
     pub error: Option<String>,
@@ -37,11 +60,12 @@ pub struct Prompt {
 }
 
 impl Prompt {
-    pub fn new(id: usize, text: String, cwd: Option<String>) -> Self {
+    pub fn new(id: usize, text: String, cwd: Option<String>, mode: PromptMode) -> Self {
         Self {
             id,
             text,
             cwd,
+            mode,
             status: PromptStatus::Pending,
             output: None,
             error: None,

@@ -22,7 +22,10 @@ src/
 - **Event handling**: Crossterm events are read on a dedicated OS thread (not async) and forwarded via `mpsc` channel to avoid blocking the tokio runtime.
 - **Worker threads**: Each `claude` subprocess runs in a std::thread (not tokio task) with separate reader/writer threads for stdout parsing and stdin writing.
 - **Communication**: Workers send `WorkerMessage` variants (OutputChunk, Finished, SpawnError) back to the app via `tokio::sync::mpsc`. The app sends `WorkerInput` (SendInput, Kill) to workers.
-- **Claude CLI integration**: Uses `--input-format stream-json --output-format stream-json --verbose --include-partial-messages --dangerously-skip-permissions`. Removes `CLAUDECODE` env var to avoid nesting issues.
+- **Claude CLI integration**: Two spawn strategies based on prompt mode:
+  - **Interactive**: `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --dangerously-skip-permissions` — initial prompt sent via stdin JSON, process stays alive for follow-ups.
+  - **One-shot**: `claude -p "prompt" --output-format stream-json --verbose --include-partial-messages --dangerously-skip-permissions` — prompt as CLI arg, no stdin writer, process exits after responding.
+  - Removes `CLAUDECODE` env var to avoid nesting issues.
 
 ## Dependencies
 
@@ -46,6 +49,7 @@ Requires `claude` CLI to be installed and available in PATH.
 - `i` — enter insert mode (type a prompt)
 - `j`/`k` or arrows — navigate prompt list
 - `Enter` — view selected prompt output
+- `m` — toggle prompt mode (interactive / one-shot)
 - `+`/`-` — increase/decrease max workers (1–20)
 - `q` — quit
 

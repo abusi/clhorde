@@ -38,6 +38,7 @@ No tmux. No git worktrees. No Python. No Node. Just a single Rust binary and the
 - **Worker pool with queue** — queue unlimited prompts, configure 1–20 concurrent workers with `+`/`-`
 - **Real-time streaming** — output streams token-by-token as Claude generates it
 - **Interactive follow-ups** — send messages to running workers mid-conversation
+- **One-shot & interactive modes** — toggle with `m`: one-shot prompts complete and exit, interactive prompts stay alive for follow-ups
 - **Vim-style modal interface** — Normal, Insert, View, and Interact modes
 - **Live status dashboard** — active workers, queue depth, completed count, per-prompt elapsed time
 - **Auto-scroll** — follows output in real time, toggleable with `f`
@@ -74,6 +75,7 @@ That's it. You'll see the TUI. Press `i` to start typing a prompt.
 | `j` / `k` / `↑` / `↓` | Navigate prompt list |
 | `Enter` | View selected prompt's output |
 | `+` / `-` | Increase / decrease max workers (1–20) |
+| `m` | Toggle prompt mode (interactive / one-shot) |
 | `q` | Quit |
 
 ### Insert mode
@@ -142,16 +144,26 @@ That's it. You'll see the TUI. Press `i` to start typing a prompt.
 - **Input bar** — context-aware prompt based on current mode
 - **Help bar** — shows available keybindings for current mode
 
+## Prompt modes
+
+clhorde supports two prompt modes, toggled with `m` in Normal mode:
+
+- **Interactive** (default) — spawns `claude -p --input-format stream-json --output-format stream-json`. The initial prompt is sent via stdin JSON. The process stays alive after responding (Idle state), allowing follow-up messages with `s`.
+- **One-shot** — spawns `claude -p "prompt text" --output-format stream-json`. The prompt is passed as a CLI argument. No stdin writer, no follow-ups. The process exits after responding and goes directly to Completed.
+
+The current default mode is shown in the status bar (`[interactive]` or `[one-shot]`). Each prompt remembers the mode it was created with.
+
 ## How it works under the hood
 
-1. You type a prompt → it's added to the queue as `Pending`
+1. You type a prompt → it's added to the queue as `Pending` with the current default mode
 2. The event loop checks: `active_workers < max_workers`?
 3. If yes, the next pending prompt is dispatched to a new worker
-4. The worker spawns `claude -p --stream-json` with the prompt as a JSON user message
-5. A reader thread parses streaming deltas and sends them back as `OutputChunk` messages
-6. The UI renders chunks in real time with auto-scroll
-7. When Claude finishes, the worker sends `Finished` and the prompt moves to `Completed`
-8. The next queued prompt is automatically dispatched
+4. **Interactive mode:** the worker spawns `claude -p --stream-json` with the prompt as a JSON user message via stdin
+5. **One-shot mode:** the worker spawns `claude -p "prompt"` with the prompt as a CLI argument, no stdin
+6. A reader thread parses streaming deltas and sends them back as `OutputChunk` messages
+7. The UI renders chunks in real time with auto-scroll
+8. When Claude finishes, the worker sends `Finished` and the prompt moves to `Completed`
+9. The next queued prompt is automatically dispatched
 
 ## License
 

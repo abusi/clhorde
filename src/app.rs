@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 
-use crate::prompt::{Prompt, PromptStatus};
+use crate::prompt::{Prompt, PromptMode, PromptStatus};
 use crate::worker::{WorkerInput, WorkerMessage};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +35,7 @@ pub struct App {
     pub suggestion_index: usize,
     /// Tick counter incremented every 100ms, used for pulsing animations.
     pub tick: u64,
+    pub default_mode: PromptMode,
 }
 
 impl App {
@@ -57,6 +58,7 @@ impl App {
             suggestions: Vec::new(),
             suggestion_index: 0,
             tick: 0,
+            default_mode: PromptMode::Interactive,
         }
     }
 
@@ -75,7 +77,7 @@ impl App {
     }
 
     pub fn add_prompt(&mut self, text: String, cwd: Option<String>) {
-        let prompt = Prompt::new(self.next_id, text, cwd);
+        let prompt = Prompt::new(self.next_id, text, cwd, self.default_mode);
         self.next_id += 1;
         self.prompts.push(prompt);
         if self.list_state.selected().is_none() {
@@ -293,6 +295,9 @@ impl App {
             }
             KeyCode::Char('-') => {
                 self.max_workers = self.max_workers.saturating_sub(1).max(1);
+            }
+            KeyCode::Char('m') => {
+                self.default_mode = self.default_mode.toggle();
             }
             _ => {}
         }

@@ -14,7 +14,7 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use app::App;
-use worker::{WorkerInput, WorkerMessage, spawn_worker};
+use worker::{WorkerInput, WorkerMessage};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -67,10 +67,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 let id = prompt.id;
                 let text = prompt.text.clone();
                 let cwd = prompt.cwd.clone();
+                let mode = prompt.mode;
                 app.mark_running(idx);
                 app.active_workers += 1;
-                let input_sender = spawn_worker(id, text, cwd, worker_tx.clone());
-                app.worker_inputs.insert(id, input_sender);
+                if let Some(input_sender) =
+                    worker::spawn_worker(id, text, cwd, mode, worker_tx.clone())
+                {
+                    app.worker_inputs.insert(id, input_sender);
+                }
             } else {
                 break;
             }

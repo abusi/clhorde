@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, AppMode};
-use crate::prompt::PromptStatus;
+use crate::prompt::{PromptMode, PromptStatus};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -66,6 +66,14 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Span::styled(
             format!("{}", app.prompts.len()),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" │ ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!("[{}]", app.default_mode.label()),
+            Style::default().fg(match app.default_mode {
+                PromptMode::Interactive => Color::Magenta,
+                PromptMode::OneShot => Color::Yellow,
+            }).add_modifier(Modifier::BOLD),
         ),
     ];
 
@@ -254,11 +262,16 @@ fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rec
                 }
                 PromptStatus::Idle => {
                     let elapsed = prompt.elapsed_secs().unwrap_or(0.0);
+                    let hint = if prompt.mode == PromptMode::Interactive {
+                        " — press 's' to interact"
+                    } else {
+                        ""
+                    };
                     match &prompt.output {
                         Some(output) => {
-                            format!("{output}\n\n— Idle ({elapsed:.1}s) — press 's' to interact")
+                            format!("{output}\n\n— Idle ({elapsed:.1}s){hint}")
                         }
-                        None => format!("Idle ({elapsed:.1}s) — press 's' to interact"),
+                        None => format!("Idle ({elapsed:.1}s){hint}"),
                     }
                 }
                 PromptStatus::Completed => {
@@ -421,7 +434,7 @@ fn render_suggestions(f: &mut Frame, app: &App, input_area: Rect) {
 
 fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let bindings: &[(&str, &str)] = match app.mode {
-        AppMode::Normal => &[("i", "insert"), ("q", "quit"), ("j/k", "navigate"), ("Enter", "view"), ("s", "interact"), ("+/-", "workers")],
+        AppMode::Normal => &[("i", "insert"), ("q", "quit"), ("j/k", "navigate"), ("Enter", "view"), ("s", "interact"), ("+/-", "workers"), ("m", "mode")],
         AppMode::Insert => &[("Enter", "submit"), ("Esc", "cancel"), ("Tab", "complete dir")],
         AppMode::ViewOutput => &[("Esc/q", "back"), ("j/k", "scroll"), ("s", "interact"), ("f", "auto-scroll"), ("x", "kill")],
         AppMode::Interact => &[("Enter", "send"), ("Esc", "back")],
