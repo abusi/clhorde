@@ -99,6 +99,23 @@ That's it. You'll see the TUI. Press `i` to start typing a prompt.
 | `Enter` | Send follow-up message to worker |
 | `Esc` | Back to view mode |
 
+## Custom keybindings
+
+All keybindings can be remapped via `~/.config/clhorde/keymap.toml` (or `$XDG_CONFIG_HOME/clhorde/keymap.toml`). The config file is optional — missing file or missing keys silently use defaults. You only need to specify what you want to change.
+
+See [`keymap_example.toml`](keymap_example.toml) for the full default keymap with all available actions.
+
+Example — remap quit to `Q` and navigation to arrow keys only:
+
+```toml
+[normal]
+quit = ["Q"]
+select_next = ["Down"]
+select_prev = ["Up"]
+```
+
+Key names: single characters (`"q"`, `"+"`) or special names (`"Enter"`, `"Esc"`, `"Tab"`, `"Up"`, `"Down"`, `"Left"`, `"Right"`, `"Space"`, `"Backspace"`).
+
 ## Architecture
 
 ```

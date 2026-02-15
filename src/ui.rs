@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, AppMode};
+use crate::keymap::{NormalAction, ViewAction};
 use crate::prompt::{PromptMode, PromptStatus};
 
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -263,9 +264,10 @@ fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rec
                 PromptStatus::Idle => {
                     let elapsed = prompt.elapsed_secs().unwrap_or(0.0);
                     let hint = if prompt.mode == PromptMode::Interactive {
-                        " — press 's' to interact"
+                        let key = app.keymap.view_key_hint(ViewAction::Interact);
+                        format!(" — press '{}' to interact", key)
                     } else {
-                        ""
+                        String::new()
                     };
                     match &prompt.output {
                         Some(output) => {
@@ -340,25 +342,28 @@ fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rec
 }
 
 fn render_input_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let (title, content, style, border_color) = match app.mode {
+    let (title, content, style, border_color): (String, String, Style, Color) = match app.mode {
         AppMode::Insert => (
-            " Input (Enter to submit, Esc to cancel) ",
-            app.input.as_str(),
+            " Input (Enter to submit, Esc to cancel) ".to_string(),
+            app.input.clone(),
             Style::default().fg(Color::White),
             Color::Green,
         ),
         AppMode::Interact => (
-            " Interact (Enter to send, Esc to cancel) ",
-            app.interact_input.as_str(),
+            " Interact (Enter to send, Esc to cancel) ".to_string(),
+            app.interact_input.clone(),
             Style::default().fg(Color::Cyan),
             Color::Magenta,
         ),
-        _ => (
-            " Input (press 'i' to enter a prompt) ",
-            "",
-            Style::default().fg(Color::DarkGray),
-            Color::Rgb(80, 80, 100),
-        ),
+        _ => {
+            let key = app.keymap.normal_key_hint(NormalAction::Insert);
+            (
+                format!(" Input (press '{}' to enter a prompt) ", key),
+                String::new(),
+                Style::default().fg(Color::DarkGray),
+                Color::Rgb(80, 80, 100),
+            )
+        }
     };
 
     let paragraph = Paragraph::new(content)
@@ -433,11 +438,11 @@ fn render_suggestions(f: &mut Frame, app: &App, input_area: Rect) {
 }
 
 fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let bindings: &[(&str, &str)] = match app.mode {
-        AppMode::Normal => &[("i", "insert"), ("q", "quit"), ("j/k", "navigate"), ("Enter", "view"), ("s", "interact"), ("+/-", "workers"), ("m", "mode")],
-        AppMode::Insert => &[("Enter", "submit"), ("Esc", "cancel"), ("Tab", "complete dir")],
-        AppMode::ViewOutput => &[("Esc/q", "back"), ("j/k", "scroll"), ("s", "interact"), ("f", "auto-scroll"), ("x", "kill")],
-        AppMode::Interact => &[("Enter", "send"), ("Esc", "back")],
+    let bindings: Vec<(String, &str)> = match app.mode {
+        AppMode::Normal => app.keymap.normal_help(),
+        AppMode::Insert => app.keymap.insert_help(),
+        AppMode::ViewOutput => app.keymap.view_help(),
+        AppMode::Interact => app.keymap.interact_help(),
     };
 
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
@@ -446,7 +451,7 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             spans.push(Span::styled("  ", Style::default().fg(Color::Rgb(60, 60, 60))));
         }
         spans.push(Span::styled(
-            *key,
+            key.as_str(),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(

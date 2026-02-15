@@ -1,0 +1,35 @@
+# clhorde keymap configuration
+# Copy to ~/.config/clhorde/keymap.toml and customize.
+# Only override what you want — missing keys keep defaults.
+# Key names: single chars ("q", "+"), or special names
+#   ("Enter", "Esc", "Tab", "Up", "Down", "Left", "Right", "Space", "Backspace")
+
+[normal]
+quit = ["q"]
+insert = ["i"]
+select_next = ["j", "Down"]
+select_prev = ["k", "Up"]
+view_output = ["Enter"]
+interact = ["s"]
+increase_workers = ["+", "="]
+decrease_workers = ["-"]
+toggle_mode = ["m"]
+
+[insert]
+cancel = ["Esc"]
+submit = ["Enter"]
+accept_suggestion = ["Tab"]
+next_suggestion = ["Down"]
+prev_suggestion = ["Up"]
+
+[view]
+back = ["Esc", "q"]
+scroll_down = ["j", "Down"]
+scroll_up = ["k", "Up"]
+interact = ["s"]
+toggle_autoscroll = ["f"]
+kill_worker = ["x"]
+
+[interact]
+back = ["Esc"]
+send = ["Enter"]

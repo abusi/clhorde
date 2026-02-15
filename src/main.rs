@@ -1,4 +1,5 @@
 mod app;
+mod keymap;
 mod prompt;
 mod ui;
 mod worker;

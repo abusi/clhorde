@@ -7,6 +7,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 
+use crate::keymap::{
+    InsertAction, InteractAction, Keymap, NormalAction, ViewAction,
+};
 use crate::prompt::{Prompt, PromptMode, PromptStatus};
 use crate::worker::{WorkerInput, WorkerMessage};
 
@@ -36,6 +39,7 @@ pub struct App {
     /// Tick counter incremented every 100ms, used for pulsing animations.
     pub tick: u64,
     pub default_mode: PromptMode,
+    pub keymap: Keymap,
 }
 
 impl App {
@@ -59,6 +63,7 @@ impl App {
             suggestion_index: 0,
             tick: 0,
             default_mode: PromptMode::Interactive,
+            keymap: Keymap::load(),
         }
     }
 
@@ -256,21 +261,24 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('i') => {
+        let Some(action) = self.keymap.normal.get(&key.code) else {
+            return;
+        };
+        match action {
+            NormalAction::Quit => self.should_quit = true,
+            NormalAction::Insert => {
                 self.mode = AppMode::Insert;
                 self.input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            NormalAction::SelectNext => {
                 self.select_next();
                 self.mark_selected_seen();
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            NormalAction::SelectPrev => {
                 self.select_prev();
                 self.mark_selected_seen();
             }
-            KeyCode::Enter => {
+            NormalAction::ViewOutput => {
                 if let Some(idx) = self.list_state.selected() {
                     if idx < self.prompts.len() {
                         self.prompts[idx].seen = true;
@@ -279,7 +287,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('s') => {
+            NormalAction::Interact => {
                 if let Some(prompt) = self.selected_prompt() {
                     if prompt.status == PromptStatus::Running
                         || prompt.status == PromptStatus::Idle
@@ -290,57 +298,63 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
+            NormalAction::IncreaseWorkers => {
                 self.max_workers = (self.max_workers + 1).min(20);
             }
-            KeyCode::Char('-') => {
+            NormalAction::DecreaseWorkers => {
                 self.max_workers = self.max_workers.saturating_sub(1).max(1);
             }
-            KeyCode::Char('m') => {
+            NormalAction::ToggleMode => {
                 self.default_mode = self.default_mode.toggle();
             }
-            _ => {}
         }
     }
 
     fn handle_insert_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = AppMode::Normal;
-                self.input.clear();
-                self.suggestions.clear();
-                self.suggestion_index = 0;
-            }
-            KeyCode::Enter => {
-                let text = self.input.trim().to_string();
-                if !text.is_empty() {
-                    let (cwd, prompt_text) = Self::parse_cwd_prefix(&text);
-                    if !prompt_text.is_empty() {
-                        self.add_prompt(prompt_text, cwd);
+        if let Some(action) = self.keymap.insert.get(&key.code) {
+            match action {
+                InsertAction::Cancel => {
+                    self.mode = AppMode::Normal;
+                    self.input.clear();
+                    self.suggestions.clear();
+                    self.suggestion_index = 0;
+                }
+                InsertAction::Submit => {
+                    let text = self.input.trim().to_string();
+                    if !text.is_empty() {
+                        let (cwd, prompt_text) = Self::parse_cwd_prefix(&text);
+                        if !prompt_text.is_empty() {
+                            self.add_prompt(prompt_text, cwd);
+                        }
+                    }
+                    self.input.clear();
+                    self.suggestions.clear();
+                    self.suggestion_index = 0;
+                    self.mode = AppMode::Normal;
+                }
+                InsertAction::AcceptSuggestion => {
+                    self.accept_suggestion();
+                }
+                InsertAction::NextSuggestion => {
+                    if !self.suggestions.is_empty() {
+                        self.suggestion_index =
+                            (self.suggestion_index + 1) % self.suggestions.len();
                     }
                 }
-                self.input.clear();
-                self.suggestions.clear();
-                self.suggestion_index = 0;
-                self.mode = AppMode::Normal;
-            }
-            KeyCode::Tab => {
-                self.accept_suggestion();
-            }
-            KeyCode::Down => {
-                if !self.suggestions.is_empty() {
-                    self.suggestion_index = (self.suggestion_index + 1) % self.suggestions.len();
+                InsertAction::PrevSuggestion => {
+                    if !self.suggestions.is_empty() {
+                        self.suggestion_index = if self.suggestion_index == 0 {
+                            self.suggestions.len() - 1
+                        } else {
+                            self.suggestion_index - 1
+                        };
+                    }
                 }
             }
-            KeyCode::Up => {
-                if !self.suggestions.is_empty() {
-                    self.suggestion_index = if self.suggestion_index == 0 {
-                        self.suggestions.len() - 1
-                    } else {
-                        self.suggestion_index - 1
-                    };
-                }
-            }
+            return;
+        }
+        // Text input fallthrough
+        match key.code {
             KeyCode::Backspace => {
                 self.input.pop();
                 self.update_suggestions();
@@ -354,18 +368,21 @@ impl App {
     }
 
     fn handle_view_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+        let Some(action) = self.keymap.view.get(&key.code) else {
+            return;
+        };
+        match action {
+            ViewAction::Back => {
                 self.mode = AppMode::Normal;
                 self.scroll_offset = 0;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            ViewAction::ScrollDown => {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            ViewAction::ScrollUp => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
             }
-            KeyCode::Char('s') => {
+            ViewAction::Interact => {
                 if let Some(prompt) = self.selected_prompt() {
                     if prompt.status == PromptStatus::Running
                         || prompt.status == PromptStatus::Idle
@@ -375,10 +392,10 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('f') => {
+            ViewAction::ToggleAutoscroll => {
                 self.auto_scroll = !self.auto_scroll;
             }
-            KeyCode::Char('x') => {
+            ViewAction::KillWorker => {
                 if let Some(prompt) = self.selected_prompt() {
                     let id = prompt.id;
                     if prompt.status == PromptStatus::Running
@@ -390,36 +407,40 @@ impl App {
                     }
                 }
             }
-            _ => {}
         }
     }
 
     fn handle_interact_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = AppMode::Normal;
-                self.interact_input.clear();
-            }
-            KeyCode::Enter => {
-                if let Some(idx) = self.list_state.selected() {
-                    if let Some(prompt) = self.prompts.get_mut(idx) {
-                        let id = prompt.id;
-                        if let Some(sender) = self.worker_inputs.get(&id) {
-                            let text = self.interact_input.clone();
-                            // Echo user input into the output panel
-                            let echo = format!("\n\n> {text}\n\n");
-                            match &mut prompt.output {
-                                Some(existing) => existing.push_str(&echo),
-                                None => prompt.output = Some(echo),
+        if let Some(action) = self.keymap.interact.get(&key.code) {
+            match action {
+                InteractAction::Back => {
+                    self.mode = AppMode::Normal;
+                    self.interact_input.clear();
+                }
+                InteractAction::Send => {
+                    if let Some(idx) = self.list_state.selected() {
+                        if let Some(prompt) = self.prompts.get_mut(idx) {
+                            let id = prompt.id;
+                            if let Some(sender) = self.worker_inputs.get(&id) {
+                                let text = self.interact_input.clone();
+                                let echo = format!("\n\n> {text}\n\n");
+                                match &mut prompt.output {
+                                    Some(existing) => existing.push_str(&echo),
+                                    None => prompt.output = Some(echo),
+                                }
+                                let mut send_text = text;
+                                send_text.push('\n');
+                                let _ = sender.send(WorkerInput::SendInput(send_text));
                             }
-                            let mut send_text = text;
-                            send_text.push('\n');
-                            let _ = sender.send(WorkerInput::SendInput(send_text));
                         }
                     }
+                    self.interact_input.clear();
                 }
-                self.interact_input.clear();
             }
+            return;
+        }
+        // Text input fallthrough
+        match key.code {
             KeyCode::Backspace => {
                 self.interact_input.pop();
             }
