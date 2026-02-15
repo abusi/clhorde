@@ -351,7 +351,7 @@ fn keys_for_action<A: PartialEq>(map: &HashMap<KeyCode, A>, action: A) -> Vec<Ke
         .filter(|(_, a)| **a == action)
         .map(|(k, _)| *k)
         .collect();
-    keys.sort_by_key(|k| key_display(k));
+    keys.sort_by_key(key_display);
     keys
 }
 

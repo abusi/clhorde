@@ -18,7 +18,7 @@ pub enum WorkerInput {
 }
 
 fn format_user_message(text: &str) -> String {
-    let content = serde_json::to_string(text).unwrap_or_else(|_| format!("\"{}\"", text));
+    let content = serde_json::to_string(text).unwrap_or_else(|_| format!("\"{text}\""));
     format!(r#"{{"type":"user","message":{{"role":"user","content":{content}}}}}"#)
 }
 

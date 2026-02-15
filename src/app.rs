@@ -200,7 +200,7 @@ impl App {
 
     fn accept_suggestion(&mut self) {
         if let Some(path) = self.suggestions.get(self.suggestion_index) {
-            self.input = format!("{}/", path);
+            self.input = format!("{path}/");
             self.suggestions.clear();
             self.suggestion_index = 0;
             self.update_suggestions();
@@ -825,7 +825,7 @@ impl App {
                 .append(true)
                 .open(&path)
             {
-                let _ = writeln!(file, "{}", text);
+                let _ = writeln!(file, "{text}");
             }
         }
     }
@@ -947,10 +947,7 @@ impl App {
             Ok(config) => config.templates.unwrap_or_default(),
             Err(_) => {
                 // Try as flat key-value pairs (no [templates] section)
-                match toml::from_str::<HashMap<String, String>>(&content) {
-                    Ok(map) => map,
-                    Err(_) => HashMap::new(),
-                }
+                toml::from_str::<HashMap<String, String>>(&content).unwrap_or_default()
             }
         }
     }
@@ -990,7 +987,7 @@ impl App {
     fn accept_template_suggestion(&mut self) {
         if let Some(name) = self.template_suggestions.get(self.template_suggestion_index).cloned() {
             if let Some(template_text) = self.templates.get(&name).cloned() {
-                self.input = format!("{} ", template_text);
+                self.input = format!("{template_text} ");
                 self.template_suggestions.clear();
                 self.template_suggestion_index = 0;
             }

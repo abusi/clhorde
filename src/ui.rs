@@ -235,7 +235,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
 
     // Build title with optional filter indicator
     let title = if let Some(ref filter) = app.filter_text {
-        format!(" Prompts [filter: {}] ", filter)
+        format!(" Prompts [filter: {filter}] ")
     } else {
         " Prompts ".to_string()
     };
@@ -287,7 +287,7 @@ fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rec
                     let elapsed = prompt.elapsed_secs().unwrap_or(0.0);
                     let hint = if prompt.mode == PromptMode::Interactive {
                         let key = app.keymap.view_key_hint(ViewAction::Interact);
-                        format!(" — press '{}' to interact", key)
+                        format!(" — press '{key}' to interact")
                     } else {
                         String::new()
                     };
@@ -341,7 +341,7 @@ fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rec
 
     // Status message indicator (transient, shown for 3s)
     let status_indicator = if let Some((ref msg, _)) = app.status_message {
-        Span::styled(format!(" {} ", msg), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        Span::styled(format!(" {msg} "), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     } else {
         Span::raw("")
     };
@@ -394,7 +394,7 @@ fn render_input_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         _ => {
             let key = app.keymap.normal_key_hint(NormalAction::Insert);
             (
-                format!(" Input (press '{}' to enter a prompt) ", key),
+                format!(" Input (press '{key}' to enter a prompt) "),
                 String::new(),
                 Style::default().fg(Color::DarkGray),
                 Color::Rgb(80, 80, 100),
