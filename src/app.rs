@@ -199,6 +199,9 @@ impl App {
             WorkerMessage::TurnComplete { prompt_id } => {
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
                     if prompt.status == PromptStatus::Running {
+                        if let Some(output) = &mut prompt.output {
+                            output.push('\n');
+                        }
                         prompt.status = PromptStatus::Idle;
                     }
                 }
@@ -208,6 +211,9 @@ impl App {
                 exit_code,
             } => {
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
+                    if let Some(output) = &mut prompt.output {
+                        output.push('\n');
+                    }
                     prompt.finished_at = Some(Instant::now());
                     if exit_code == Some(0) || exit_code.is_none() {
                         prompt.status = PromptStatus::Completed;
