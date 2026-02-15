@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -8,9 +9,9 @@ use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 
 use crate::keymap::{
-    InsertAction, InteractAction, Keymap, NormalAction, ViewAction,
+    FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction,
 };
-use crate::prompt::{Prompt, PromptMode, PromptStatus};
+use crate::prompt::{Prompt, PromptMode, PromptStatus, SerializablePrompt};
 use crate::worker::{WorkerInput, WorkerMessage};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -19,6 +20,7 @@ pub enum AppMode {
     Insert,
     ViewOutput,
     Interact,
+    Filter,
 }
 
 pub struct App {
@@ -40,12 +42,36 @@ pub struct App {
     pub tick: u64,
     pub default_mode: PromptMode,
     pub keymap: Keymap,
+    /// Transient status message shown in the output viewer title.
+    pub status_message: Option<(String, Instant)>,
+    /// Whether quit confirmation dialog is showing.
+    pub confirm_quit: bool,
+    /// Active filter text (None = no filter).
+    pub filter_text: Option<String>,
+    /// Input buffer for filter mode.
+    pub filter_input: String,
+    /// Cached list of prompt indices matching the current filter.
+    pub filtered_indices: Vec<usize>,
+    /// Command history (most recent last).
+    pub history: Vec<String>,
+    /// Current position in history navigation (None = not navigating).
+    pub history_index: Option<usize>,
+    /// Stashed input text when entering history navigation.
+    pub history_stash: String,
+    /// Prompt templates loaded from config.
+    pub templates: HashMap<String, String>,
+    /// Template suggestion names matching current input.
+    pub template_suggestions: Vec<String>,
+    /// Selected template suggestion index.
+    pub template_suggestion_index: usize,
 }
 
 impl App {
     pub fn new() -> Self {
         let mut list_state = ListState::default();
         list_state.select(None);
+        let templates = Self::load_templates();
+        let history = Self::load_history();
         Self {
             prompts: Vec::new(),
             next_id: 1,
@@ -64,6 +90,17 @@ impl App {
             tick: 0,
             default_mode: PromptMode::Interactive,
             keymap: Keymap::load(),
+            status_message: None,
+            confirm_quit: false,
+            filter_text: None,
+            filter_input: String::new(),
+            filtered_indices: Vec::new(),
+            history,
+            history_index: None,
+            history_stash: String::new(),
+            templates,
+            template_suggestions: Vec::new(),
+            template_suggestion_index: 0,
         }
     }
 
@@ -85,6 +122,7 @@ impl App {
         let prompt = Prompt::new(self.next_id, text, cwd, self.default_mode);
         self.next_id += 1;
         self.prompts.push(prompt);
+        self.rebuild_filter();
         if self.list_state.selected().is_none() {
             self.list_state.select(Some(0));
         }
@@ -257,12 +295,31 @@ impl App {
         }
     }
 
+    /// Clear expired status messages (older than 3 seconds).
+    pub fn clear_expired_status(&mut self) {
+        if let Some((_, created)) = &self.status_message {
+            if created.elapsed().as_secs() >= 3 {
+                self.status_message = None;
+            }
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Quit confirmation intercepts all keys
+        if self.confirm_quit {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.should_quit = true,
+                _ => self.confirm_quit = false,
+            }
+            return;
+        }
+
         match self.mode {
             AppMode::Normal => self.handle_normal_key(key),
             AppMode::Insert => self.handle_insert_key(key),
             AppMode::ViewOutput => self.handle_view_key(key),
             AppMode::Interact => self.handle_interact_key(key),
+            AppMode::Filter => self.handle_filter_key(key),
         }
     }
 
@@ -271,10 +328,23 @@ impl App {
             return;
         };
         match action {
-            NormalAction::Quit => self.should_quit = true,
+            NormalAction::Quit => {
+                let has_active = self.prompts.iter().any(|p| {
+                    p.status == PromptStatus::Running || p.status == PromptStatus::Idle
+                });
+                if has_active {
+                    self.confirm_quit = true;
+                } else {
+                    self.should_quit = true;
+                }
+            }
             NormalAction::Insert => {
                 self.mode = AppMode::Insert;
                 self.input.clear();
+                self.history_index = None;
+                self.history_stash.clear();
+                self.template_suggestions.clear();
+                self.template_suggestion_index = 0;
             }
             NormalAction::SelectNext => {
                 self.select_next();
@@ -313,6 +383,19 @@ impl App {
             NormalAction::ToggleMode => {
                 self.default_mode = self.default_mode.toggle();
             }
+            NormalAction::Retry => {
+                self.retry_selected();
+            }
+            NormalAction::MoveUp => {
+                self.move_selected_up();
+            }
+            NormalAction::MoveDown => {
+                self.move_selected_down();
+            }
+            NormalAction::Search => {
+                self.filter_input.clear();
+                self.mode = AppMode::Filter;
+            }
         }
     }
 
@@ -324,27 +407,45 @@ impl App {
                     self.input.clear();
                     self.suggestions.clear();
                     self.suggestion_index = 0;
+                    self.history_index = None;
+                    self.history_stash.clear();
+                    self.template_suggestions.clear();
+                    self.template_suggestion_index = 0;
                 }
                 InsertAction::Submit => {
                     let text = self.input.trim().to_string();
                     if !text.is_empty() {
                         let (cwd, prompt_text) = Self::parse_cwd_prefix(&text);
                         if !prompt_text.is_empty() {
-                            self.add_prompt(prompt_text, cwd);
+                            self.add_prompt(prompt_text.clone(), cwd);
+                            self.append_history(&text);
                         }
                     }
                     self.input.clear();
                     self.suggestions.clear();
                     self.suggestion_index = 0;
+                    self.history_index = None;
+                    self.history_stash.clear();
+                    self.template_suggestions.clear();
+                    self.template_suggestion_index = 0;
                     self.mode = AppMode::Normal;
                 }
                 InsertAction::AcceptSuggestion => {
-                    self.accept_suggestion();
+                    if !self.suggestions.is_empty() {
+                        self.accept_suggestion();
+                    } else if !self.template_suggestions.is_empty() {
+                        self.accept_template_suggestion();
+                    }
                 }
                 InsertAction::NextSuggestion => {
                     if !self.suggestions.is_empty() {
                         self.suggestion_index =
                             (self.suggestion_index + 1) % self.suggestions.len();
+                    } else if !self.template_suggestions.is_empty() {
+                        self.template_suggestion_index =
+                            (self.template_suggestion_index + 1) % self.template_suggestions.len();
+                    } else {
+                        self.history_prev();
                     }
                 }
                 InsertAction::PrevSuggestion => {
@@ -354,6 +455,14 @@ impl App {
                         } else {
                             self.suggestion_index - 1
                         };
+                    } else if !self.template_suggestions.is_empty() {
+                        self.template_suggestion_index = if self.template_suggestion_index == 0 {
+                            self.template_suggestions.len() - 1
+                        } else {
+                            self.template_suggestion_index - 1
+                        };
+                    } else {
+                        self.history_next();
                     }
                 }
             }
@@ -363,11 +472,15 @@ impl App {
         match key.code {
             KeyCode::Backspace => {
                 self.input.pop();
+                self.history_index = None;
                 self.update_suggestions();
+                self.update_template_suggestions();
             }
             KeyCode::Char(c) => {
                 self.input.push(c);
+                self.history_index = None;
                 self.update_suggestions();
+                self.update_template_suggestions();
             }
             _ => {}
         }
@@ -413,6 +526,9 @@ impl App {
                     }
                 }
             }
+            ViewAction::Export => {
+                self.export_selected_output();
+            }
         }
     }
 
@@ -457,25 +573,427 @@ impl App {
         }
     }
 
+    fn handle_filter_key(&mut self, key: KeyEvent) {
+        if let Some(action) = self.keymap.filter.get(&key.code) {
+            match action {
+                FilterAction::Confirm => {
+                    let text = self.filter_input.trim().to_string();
+                    if text.is_empty() {
+                        self.filter_text = None;
+                    } else {
+                        self.filter_text = Some(text);
+                    }
+                    self.rebuild_filter();
+                    self.mode = AppMode::Normal;
+                    // Adjust selection to be valid within filtered view
+                    self.clamp_selection_to_filter();
+                }
+                FilterAction::Cancel => {
+                    self.filter_text = None;
+                    self.filter_input.clear();
+                    self.rebuild_filter();
+                    self.mode = AppMode::Normal;
+                }
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Backspace => {
+                self.filter_input.pop();
+                // Live filter as user types
+                let text = self.filter_input.trim().to_string();
+                self.filter_text = if text.is_empty() { None } else { Some(text) };
+                self.rebuild_filter();
+                self.clamp_selection_to_filter();
+            }
+            KeyCode::Char(c) => {
+                self.filter_input.push(c);
+                let text = self.filter_input.trim().to_string();
+                self.filter_text = if text.is_empty() { None } else { Some(text) };
+                self.rebuild_filter();
+                self.clamp_selection_to_filter();
+            }
+            _ => {}
+        }
+    }
+
     fn select_next(&mut self) {
         if self.prompts.is_empty() {
             return;
         }
-        let i = match self.list_state.selected() {
-            Some(i) => (i + 1).min(self.prompts.len() - 1),
-            None => 0,
-        };
-        self.list_state.select(Some(i));
+        if self.filter_text.is_some() && !self.filtered_indices.is_empty() {
+            // Navigate within filtered list
+            let current = self.list_state.selected().unwrap_or(0);
+            let current_filter_pos = self
+                .filtered_indices
+                .iter()
+                .position(|&i| i == current)
+                .unwrap_or(0);
+            let next_pos = (current_filter_pos + 1).min(self.filtered_indices.len() - 1);
+            self.list_state
+                .select(Some(self.filtered_indices[next_pos]));
+        } else {
+            let i = match self.list_state.selected() {
+                Some(i) => (i + 1).min(self.prompts.len() - 1),
+                None => 0,
+            };
+            self.list_state.select(Some(i));
+        }
     }
 
     fn select_prev(&mut self) {
         if self.prompts.is_empty() {
             return;
         }
-        let i = match self.list_state.selected() {
-            Some(i) => i.saturating_sub(1),
-            None => 0,
+        if self.filter_text.is_some() && !self.filtered_indices.is_empty() {
+            let current = self.list_state.selected().unwrap_or(0);
+            let current_filter_pos = self
+                .filtered_indices
+                .iter()
+                .position(|&i| i == current)
+                .unwrap_or(0);
+            let prev_pos = current_filter_pos.saturating_sub(1);
+            self.list_state
+                .select(Some(self.filtered_indices[prev_pos]));
+        } else {
+            let i = match self.list_state.selected() {
+                Some(i) => i.saturating_sub(1),
+                None => 0,
+            };
+            self.list_state.select(Some(i));
+        }
+    }
+
+    // ── Feature 1: Export ──
+
+    fn export_selected_output(&mut self) {
+        let Some(prompt) = self.selected_prompt() else {
+            self.status_message = Some(("No prompt selected".to_string(), Instant::now()));
+            return;
         };
-        self.list_state.select(Some(i));
+        let output = prompt.output.clone().unwrap_or_default();
+        if output.is_empty() {
+            self.status_message = Some(("No output to export".to_string(), Instant::now()));
+            return;
+        }
+
+        let id = prompt.id;
+        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let filename = home.join(format!("clhorde-output-{id}-{timestamp}.md"));
+
+        let header = format!("# clhorde output #{id}\n\nPrompt: {}\n\n---\n\n", prompt.text);
+        let content = format!("{header}{output}");
+
+        match fs::write(&filename, &content) {
+            Ok(_) => {
+                self.status_message = Some((
+                    format!("Saved to {}", filename.display()),
+                    Instant::now(),
+                ));
+            }
+            Err(e) => {
+                self.status_message =
+                    Some((format!("Export failed: {e}"), Instant::now()));
+            }
+        }
+    }
+
+    // ── Feature 2: Retry ──
+
+    fn retry_selected(&mut self) {
+        let Some(prompt) = self.selected_prompt() else {
+            return;
+        };
+        if prompt.status != PromptStatus::Completed && prompt.status != PromptStatus::Failed {
+            return;
+        }
+        let text = prompt.text.clone();
+        let cwd = prompt.cwd.clone();
+        let mode = prompt.mode;
+        let new_prompt = Prompt::new(self.next_id, text, cwd, mode);
+        self.next_id += 1;
+        self.prompts.push(new_prompt);
+        self.rebuild_filter();
+    }
+
+    // ── Feature 4: Reorder ──
+
+    fn move_selected_up(&mut self) {
+        let Some(idx) = self.list_state.selected() else {
+            return;
+        };
+        if idx == 0 {
+            return;
+        }
+        // Only move pending prompts
+        if self.prompts[idx].status != PromptStatus::Pending {
+            return;
+        }
+        self.prompts.swap(idx, idx - 1);
+        self.list_state.select(Some(idx - 1));
+        self.rebuild_filter();
+    }
+
+    fn move_selected_down(&mut self) {
+        let Some(idx) = self.list_state.selected() else {
+            return;
+        };
+        if idx >= self.prompts.len() - 1 {
+            return;
+        }
+        if self.prompts[idx].status != PromptStatus::Pending {
+            return;
+        }
+        self.prompts.swap(idx, idx + 1);
+        self.list_state.select(Some(idx + 1));
+        self.rebuild_filter();
+    }
+
+    // ── Feature 5: Filter ──
+
+    fn rebuild_filter(&mut self) {
+        self.filtered_indices = match &self.filter_text {
+            Some(filter) => {
+                let lower = filter.to_lowercase();
+                self.prompts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.text.to_lowercase().contains(&lower))
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+            None => (0..self.prompts.len()).collect(),
+        };
+    }
+
+    fn clamp_selection_to_filter(&mut self) {
+        if self.filtered_indices.is_empty() {
+            self.list_state.select(None);
+        } else if let Some(current) = self.list_state.selected() {
+            if !self.filtered_indices.contains(&current) {
+                self.list_state.select(Some(self.filtered_indices[0]));
+            }
+        } else {
+            self.list_state.select(Some(self.filtered_indices[0]));
+        }
+    }
+
+    /// Get the indices of prompts to display (respects filter).
+    pub fn visible_prompt_indices(&self) -> &[usize] {
+        &self.filtered_indices
+    }
+
+    // ── Feature 6: History ──
+
+    fn data_dir() -> Option<PathBuf> {
+        dirs::data_dir().map(|d| d.join("clhorde"))
+    }
+
+    fn history_path() -> Option<PathBuf> {
+        Self::data_dir().map(|d| d.join("history"))
+    }
+
+    fn load_history() -> Vec<String> {
+        let Some(path) = Self::history_path() else {
+            return Vec::new();
+        };
+        match fs::read_to_string(&path) {
+            Ok(content) => content
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn append_history(&mut self, text: &str) {
+        // Avoid duplicating the most recent entry
+        if self.history.last().map(|s| s.as_str()) == Some(text) {
+            return;
+        }
+        self.history.push(text.to_string());
+
+        // Persist to file
+        if let Some(path) = Self::history_path() {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(file, "{}", text);
+            }
+        }
+    }
+
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        match self.history_index {
+            None => {
+                // Start navigating: stash current input
+                self.history_stash = self.input.clone();
+                let idx = self.history.len() - 1;
+                self.history_index = Some(idx);
+                self.input = self.history[idx].clone();
+            }
+            Some(idx) => {
+                if idx > 0 {
+                    let new_idx = idx - 1;
+                    self.history_index = Some(new_idx);
+                    self.input = self.history[new_idx].clone();
+                }
+            }
+        }
+    }
+
+    fn history_next(&mut self) {
+        let Some(idx) = self.history_index else {
+            return;
+        };
+        if idx + 1 < self.history.len() {
+            let new_idx = idx + 1;
+            self.history_index = Some(new_idx);
+            self.input = self.history[new_idx].clone();
+        } else {
+            // Past the end: restore stashed input
+            self.history_index = None;
+            self.input = self.history_stash.clone();
+            self.history_stash.clear();
+        }
+    }
+
+    // ── Feature 7: Session persistence ──
+
+    fn session_path() -> Option<PathBuf> {
+        Self::data_dir().map(|d| d.join("session.json"))
+    }
+
+    pub fn save_session(&self) {
+        let Some(path) = Self::session_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let serializable: Vec<SerializablePrompt> =
+            self.prompts.iter().map(SerializablePrompt::from).collect();
+        if let Ok(json) = serde_json::to_string_pretty(&serializable) {
+            let _ = fs::write(&path, json);
+        }
+    }
+
+    pub fn load_session(&mut self) {
+        let Some(path) = Self::session_path() else {
+            return;
+        };
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let serialized: Vec<SerializablePrompt> = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        for sp in serialized {
+            let prompt = sp.into_prompt();
+            if prompt.id >= self.next_id {
+                self.next_id = prompt.id + 1;
+            }
+            self.prompts.push(prompt);
+        }
+
+        self.rebuild_filter();
+        if !self.prompts.is_empty() && self.list_state.selected().is_none() {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    // ── Feature 8: Templates ──
+
+    fn templates_path() -> Option<PathBuf> {
+        let config_dir = std::env::var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .ok()
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".config"))
+            })?;
+        Some(config_dir.join("clhorde").join("templates.toml"))
+    }
+
+    fn load_templates() -> HashMap<String, String> {
+        let Some(path) = Self::templates_path() else {
+            return HashMap::new();
+        };
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return HashMap::new(),
+        };
+
+        #[derive(serde::Deserialize)]
+        struct TemplateConfig {
+            templates: Option<HashMap<String, String>>,
+        }
+
+        match toml::from_str::<TemplateConfig>(&content) {
+            Ok(config) => config.templates.unwrap_or_default(),
+            Err(_) => {
+                // Try as flat key-value pairs (no [templates] section)
+                match toml::from_str::<HashMap<String, String>>(&content) {
+                    Ok(map) => map,
+                    Err(_) => HashMap::new(),
+                }
+            }
+        }
+    }
+
+    fn update_template_suggestions(&mut self) {
+        self.template_suggestions.clear();
+        self.template_suggestion_index = 0;
+
+        if self.templates.is_empty() {
+            return;
+        }
+
+        // Check if input starts with `:` and has no space yet (still typing template name)
+        let input = &self.input;
+        if !input.starts_with(':') {
+            return;
+        }
+
+        let prefix = &input[1..]; // after the colon
+        if prefix.contains(' ') {
+            return; // already expanded or typing after template
+        }
+
+        let mut matches: Vec<String> = self
+            .templates
+            .keys()
+            .filter(|name| name.starts_with(prefix))
+            .cloned()
+            .collect();
+        matches.sort();
+        if matches.len() > 10 {
+            matches.truncate(10);
+        }
+        self.template_suggestions = matches;
+    }
+
+    fn accept_template_suggestion(&mut self) {
+        if let Some(name) = self.template_suggestions.get(self.template_suggestion_index).cloned() {
+            if let Some(template_text) = self.templates.get(&name).cloned() {
+                self.input = format!("{} ", template_text);
+                self.template_suggestions.clear();
+                self.template_suggestion_index = 0;
+            }
+        }
     }
 }

@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{App, AppMode};
 use crate::keymap::{NormalAction, ViewAction};
@@ -24,6 +24,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_input_bar(f, app, chunks[2]);
     render_help_bar(f, app, chunks[3]);
     render_suggestions(f, app, chunks[2]);
+    render_template_suggestions(f, app, chunks[2]);
+
+    if app.confirm_quit {
+        render_quit_confirmation(f, f.area());
+    }
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -32,6 +37,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         AppMode::Insert => ("INSERT", Color::Green),
         AppMode::ViewOutput => ("VIEW", Color::Yellow),
         AppMode::Interact => ("INTERACT", Color::Magenta),
+        AppMode::Filter => ("FILTER", Color::Cyan),
     };
 
     let spans = vec![
@@ -104,10 +110,12 @@ fn render_main_area(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
 
 fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let tick = app.tick;
-    let items: Vec<ListItem> = app
-        .prompts
+    let visible_indices = app.visible_prompt_indices().to_vec();
+
+    let items: Vec<ListItem> = visible_indices
         .iter()
-        .map(|prompt| {
+        .map(|&idx| {
+            let prompt = &app.prompts[idx];
             let elapsed = prompt
                 .elapsed_secs()
                 .map(|s| format!(" ({s:.1}s)"))
@@ -225,13 +233,27 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
         })
         .collect();
 
+    // Build title with optional filter indicator
+    let title = if let Some(ref filter) = app.filter_text {
+        format!(" Prompts [filter: {}] ", filter)
+    } else {
+        " Prompts ".to_string()
+    };
+
+    // Map the real selection index to the position in the filtered list
+    let mut filtered_list_state = ListState::default();
+    if let Some(selected) = app.list_state.selected() {
+        let filtered_pos = visible_indices.iter().position(|&i| i == selected);
+        filtered_list_state.select(filtered_pos);
+    }
+
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Rgb(80, 80, 100)))
                 .title(Span::styled(
-                    " Prompts ",
+                    title,
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 )),
         )
@@ -242,7 +264,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
         )
         .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(list, area, &mut app.list_state);
+    f.render_stateful_widget(list, area, &mut filtered_list_state);
 }
 
 fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
@@ -317,6 +339,13 @@ fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rec
         Span::raw("")
     };
 
+    // Status message indicator (transient, shown for 3s)
+    let status_indicator = if let Some((ref msg, _)) = app.status_message {
+        Span::styled(format!(" {} ", msg), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        Span::raw("")
+    };
+
     let output_border_color = match app.selected_prompt().map(|p| &p.status) {
         Some(PromptStatus::Running) => Color::Cyan,
         Some(PromptStatus::Idle) => Color::Magenta,
@@ -334,6 +363,7 @@ fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rec
                 .title(vec![
                     Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                     auto_scroll_indicator,
+                    status_indicator,
                 ]),
         )
         .wrap(Wrap { trim: false })
@@ -354,6 +384,12 @@ fn render_input_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             app.interact_input.clone(),
             Style::default().fg(Color::Cyan),
             Color::Magenta,
+        ),
+        AppMode::Filter => (
+            " Filter (Enter to apply, Esc to cancel) ".to_string(),
+            app.filter_input.clone(),
+            Style::default().fg(Color::White),
+            Color::Cyan,
         ),
         _ => {
             let key = app.keymap.normal_key_hint(NormalAction::Insert);
@@ -384,6 +420,11 @@ fn render_input_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         }
         AppMode::Interact => {
             let x = area.x + app.interact_input.len() as u16 + 1;
+            let y = area.y + 1;
+            f.set_cursor_position((x, y));
+        }
+        AppMode::Filter => {
+            let x = area.x + app.filter_input.len() as u16 + 1;
             let y = area.y + 1;
             f.set_cursor_position((x, y));
         }
@@ -437,12 +478,111 @@ fn render_suggestions(f: &mut Frame, app: &App, input_area: Rect) {
     f.render_widget(list, popup_area);
 }
 
+fn render_template_suggestions(f: &mut Frame, app: &App, input_area: Rect) {
+    if app.mode != AppMode::Insert || app.template_suggestions.is_empty() {
+        return;
+    }
+    // Don't show if directory suggestions are visible
+    if !app.suggestions.is_empty() {
+        return;
+    }
+
+    let visible = app.template_suggestions.len().min(5) as u16;
+    let height = visible + 2;
+
+    let popup_area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(height),
+        width: input_area.width.min(60),
+        height,
+    };
+
+    let items: Vec<ListItem> = app
+        .template_suggestions
+        .iter()
+        .enumerate()
+        .take(5)
+        .map(|(i, name)| {
+            let preview = app.templates.get(name).map(|t| {
+                if t.len() > 40 {
+                    format!("{}...", &t[..37])
+                } else {
+                    t.clone()
+                }
+            }).unwrap_or_default();
+
+            let style = if i == app.template_suggestion_index {
+                Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(":{name} "), style),
+                Span::styled(preview, Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(Span::styled(
+                    " Templates (Tab to select) ",
+                    Style::default().fg(Color::Cyan),
+                )),
+        );
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(list, popup_area);
+}
+
+fn render_quit_confirmation(f: &mut Frame, area: Rect) {
+    let width = 44;
+    let height = 5;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup_area = Rect {
+        x,
+        y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Workers still active. Quit? "),
+            Span::styled("y", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("/"),
+            Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(Span::styled(
+                    " Confirm Quit ",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .style(Style::default().bg(Color::Rgb(40, 30, 30)));
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(paragraph, popup_area);
+}
+
 fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let bindings: Vec<(String, &str)> = match app.mode {
         AppMode::Normal => app.keymap.normal_help(),
         AppMode::Insert => app.keymap.insert_help(),
         AppMode::ViewOutput => app.keymap.view_help(),
         AppMode::Interact => app.keymap.interact_help(),
+        AppMode::Filter => app.keymap.filter_help(),
     };
 
     let mut spans: Vec<Span> = vec![Span::raw(" ")];

@@ -11,7 +11,7 @@ clhorde lets you queue up multiple prompts and run them concurrently across a po
 ```
 src/
 ├── main.rs     # Entry point, terminal setup, event loop (crossterm + tokio::select!)
-├── app.rs      # App state, mode handling, keybindings (vim-style: Normal/Insert/View/Interact)
+├── app.rs      # App state, mode handling, keybindings (vim-style: Normal/Insert/View/Interact/Filter)
 ├── prompt.rs   # Prompt data model (id, text, status, output, timing)
 ├── ui.rs       # ratatui rendering (status bar, prompt list, output viewer, input bar, help bar)
 └── worker.rs   # Worker subprocess management (spawns `claude -p --stream-json`, reader/writer threads)
@@ -32,13 +32,18 @@ src/
 - `ratatui` 0.30 — TUI framework
 - `crossterm` 0.28 — terminal backend
 - `tokio` 1 (full features) — async runtime
+- `serde` 1 — serialization (session persistence)
 - `serde_json` 1 — JSON parsing for claude stream protocol
+- `toml` 0.8 — config file parsing
+- `dirs` 6 — XDG data/config directory resolution
+- `chrono` 0.4 — timestamps for export filenames
 
 ## Building and running
 
 ```bash
 cargo build
 cargo run
+cargo run -- --restore   # restore previous session
 ```
 
 Requires `claude` CLI to be installed and available in PATH.
@@ -49,24 +54,55 @@ Requires `claude` CLI to be installed and available in PATH.
 - `i` — enter insert mode (type a prompt)
 - `j`/`k` or arrows — navigate prompt list
 - `Enter` — view selected prompt output
+- `s` — interact with running/idle prompt
 - `m` — toggle prompt mode (interactive / one-shot)
+- `r` — retry selected completed/failed prompt
+- `J`/`K` — move selected pending prompt down/up in queue
+- `/` — enter filter mode (search prompts)
 - `+`/`-` — increase/decrease max workers (1–20)
-- `q` — quit
+- `q` — quit (with confirmation if workers active)
 
 ### Insert mode
 - `Enter` — submit prompt
 - `Esc` — cancel
+- `Up`/`Down` — cycle through prompt history (when no suggestions visible)
+- `Tab` — accept directory or template suggestion
+- Type `:name` to expand a template
 
 ### View mode
 - `j`/`k` — scroll output
 - `s` — enter interact mode (send follow-up to running prompt)
 - `f` — toggle auto-scroll
+- `w` — export output to file (`~/clhorde-output-{id}-{timestamp}.md`)
 - `x` — kill running worker
 - `Esc`/`q` — back to normal
 
 ### Interact mode
 - `Enter` — send message to running worker
-- `Esc` — back to view
+- `Esc` — back to normal
+
+### Filter mode
+- Type to filter prompts (live filtering, case-insensitive)
+- `Enter` — apply filter and return to normal
+- `Esc` — clear filter and return to normal
+
+## Config files
+
+- `~/.config/clhorde/keymap.toml` — custom keybindings (see `keymap_example.toml`)
+- `~/.config/clhorde/templates.toml` — prompt templates
+- `~/.local/share/clhorde/history` — prompt history (auto-managed)
+- `~/.local/share/clhorde/session.json` — session persistence (auto-saved on quit)
+
+### Templates format
+
+```toml
+[templates]
+review = "Review this code for bugs and security issues:"
+explain = "Explain what this code does:"
+refactor = "Refactor this code to be more idiomatic:"
+```
+
+Type `:review` in insert mode and press Tab to expand.
 
 ## Code conventions
 

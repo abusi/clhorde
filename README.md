@@ -39,10 +39,18 @@ No tmux. No git worktrees. No Python. No Node. Just a single Rust binary and the
 - **Real-time streaming** — output streams token-by-token as Claude generates it
 - **Interactive follow-ups** — send messages to running workers mid-conversation
 - **One-shot & interactive modes** — toggle with `m`: one-shot prompts complete and exit, interactive prompts stay alive for follow-ups
-- **Vim-style modal interface** — Normal, Insert, View, and Interact modes
+- **Vim-style modal interface** — Normal, Insert, View, Interact, and Filter modes
 - **Live status dashboard** — active workers, queue depth, completed count, per-prompt elapsed time
 - **Auto-scroll** — follows output in real time, toggleable with `f`
 - **Kill workers** — terminate a running prompt with `x`
+- **Export output** — save a prompt's output to a markdown file with `w`
+- **Retry prompts** — re-queue completed or failed prompts with `r`
+- **Reorder queue** — move pending prompts up/down with `J`/`K`
+- **Search/filter** — press `/` to live-filter prompts by text
+- **Prompt history** — `Up`/`Down` in insert mode cycles through previously submitted prompts
+- **Session persistence** — auto-saves on quit, restore with `--restore`
+- **Prompt templates** — define reusable prompt snippets, expand with `:name` + Tab
+- **Quit confirmation** — warns before quitting with active workers
 - **Graceful shutdown** — sends EOF to all workers on quit, no orphaned processes
 
 ## Install
@@ -61,7 +69,8 @@ Requires:
 ## Usage
 
 ```bash
-clhorde
+clhorde              # fresh session
+clhorde --restore    # restore previous session
 ```
 
 That's it. You'll see the TUI. Press `i` to start typing a prompt.
@@ -74,15 +83,21 @@ That's it. You'll see the TUI. Press `i` to start typing a prompt.
 | `i` | Enter insert mode (type a prompt) |
 | `j` / `k` / `↑` / `↓` | Navigate prompt list |
 | `Enter` | View selected prompt's output |
+| `s` | Interact with running/idle prompt |
+| `r` | Retry selected completed/failed prompt |
+| `J` / `K` | Move selected pending prompt down/up in queue |
+| `/` | Enter filter mode (search prompts) |
 | `+` / `-` | Increase / decrease max workers (1–20) |
 | `m` | Toggle prompt mode (interactive / one-shot) |
-| `q` | Quit |
+| `q` | Quit (confirms if workers active) |
 
 ### Insert mode
 | Key | Action |
 |-----|--------|
 | `Enter` | Submit prompt to queue |
 | `Esc` | Cancel and return to normal mode |
+| `↑` / `↓` | Cycle through prompt history (when no suggestions visible) |
+| `Tab` | Accept directory or template suggestion |
 
 ### View mode
 | Key | Action |
@@ -90,6 +105,7 @@ That's it. You'll see the TUI. Press `i` to start typing a prompt.
 | `j` / `k` / `↑` / `↓` | Scroll output |
 | `s` | Enter interact mode (send follow-up) |
 | `f` | Toggle auto-scroll |
+| `w` | Export output to `~/clhorde-output-{id}-{timestamp}.md` |
 | `x` | Kill running worker |
 | `Esc` / `q` | Back to normal mode |
 
@@ -97,7 +113,14 @@ That's it. You'll see the TUI. Press `i` to start typing a prompt.
 | Key | Action |
 |-----|--------|
 | `Enter` | Send follow-up message to worker |
-| `Esc` | Back to view mode |
+| `Esc` | Back to normal mode |
+
+### Filter mode
+| Key | Action |
+|-----|--------|
+| *type* | Live-filter prompts (case-insensitive) |
+| `Enter` | Apply filter and return to normal |
+| `Esc` | Clear filter and return to normal |
 
 ## Custom keybindings
 
@@ -115,6 +138,36 @@ select_prev = ["Up"]
 ```
 
 Key names: single characters (`"q"`, `"+"`) or special names (`"Enter"`, `"Esc"`, `"Tab"`, `"Up"`, `"Down"`, `"Left"`, `"Right"`, `"Space"`, `"Backspace"`).
+
+## Prompt templates
+
+Define reusable prompt snippets in `~/.config/clhorde/templates.toml`:
+
+```toml
+[templates]
+review = "Review this code for bugs and security issues:"
+explain = "Explain what this code does:"
+test = "Write unit tests for this code:"
+refactor = "Refactor this code to be more idiomatic:"
+```
+
+In insert mode, type `:review` and press `Tab` — the template name is replaced with its full text. A suggestion popup shows matching templates as you type.
+
+This is especially useful when combined with working directories. For example, type `/path/to/project: ` then `:review` + Tab to get:
+
+```
+/path/to/project: Review this code for bugs and security issues:
+```
+
+## Session persistence
+
+clhorde automatically saves your session (all prompts and their outputs) to `~/.local/share/clhorde/session.json` when you quit. To restore a previous session:
+
+```bash
+clhorde --restore
+```
+
+Completed and failed prompts are restored as-is. Running/idle prompts (whose processes are gone) are restored as completed. Pending prompts are re-queued and will be dispatched to workers.
 
 ## Architecture
 

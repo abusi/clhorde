@@ -17,6 +17,10 @@ pub enum NormalAction {
     IncreaseWorkers,
     DecreaseWorkers,
     ToggleMode,
+    Retry,
+    MoveUp,
+    MoveDown,
+    Search,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +40,7 @@ pub enum ViewAction {
     Interact,
     ToggleAutoscroll,
     KillWorker,
+    Export,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,11 +49,18 @@ pub enum InteractAction {
     Send,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterAction {
+    Confirm,
+    Cancel,
+}
+
 pub struct Keymap {
     pub normal: HashMap<KeyCode, NormalAction>,
     pub insert: HashMap<KeyCode, InsertAction>,
     pub view: HashMap<KeyCode, ViewAction>,
     pub interact: HashMap<KeyCode, InteractAction>,
+    pub filter: HashMap<KeyCode, FilterAction>,
 }
 
 impl Default for Keymap {
@@ -66,6 +78,10 @@ impl Default for Keymap {
         normal.insert(KeyCode::Char('='), NormalAction::IncreaseWorkers);
         normal.insert(KeyCode::Char('-'), NormalAction::DecreaseWorkers);
         normal.insert(KeyCode::Char('m'), NormalAction::ToggleMode);
+        normal.insert(KeyCode::Char('r'), NormalAction::Retry);
+        normal.insert(KeyCode::Char('J'), NormalAction::MoveDown);
+        normal.insert(KeyCode::Char('K'), NormalAction::MoveUp);
+        normal.insert(KeyCode::Char('/'), NormalAction::Search);
 
         let mut insert = HashMap::new();
         insert.insert(KeyCode::Esc, InsertAction::Cancel);
@@ -84,16 +100,22 @@ impl Default for Keymap {
         view.insert(KeyCode::Char('s'), ViewAction::Interact);
         view.insert(KeyCode::Char('f'), ViewAction::ToggleAutoscroll);
         view.insert(KeyCode::Char('x'), ViewAction::KillWorker);
+        view.insert(KeyCode::Char('w'), ViewAction::Export);
 
         let mut interact = HashMap::new();
         interact.insert(KeyCode::Esc, InteractAction::Back);
         interact.insert(KeyCode::Enter, InteractAction::Send);
+
+        let mut filter = HashMap::new();
+        filter.insert(KeyCode::Esc, FilterAction::Cancel);
+        filter.insert(KeyCode::Enter, FilterAction::Confirm);
 
         Self {
             normal,
             insert,
             view,
             interact,
+            filter,
         }
     }
 }
@@ -106,6 +128,7 @@ struct TomlConfig {
     insert: Option<TomlInsertBindings>,
     view: Option<TomlViewBindings>,
     interact: Option<TomlInteractBindings>,
+    filter: Option<TomlFilterBindings>,
 }
 
 #[derive(Deserialize, Default)]
@@ -119,6 +142,10 @@ struct TomlNormalBindings {
     increase_workers: Option<Vec<String>>,
     decrease_workers: Option<Vec<String>>,
     toggle_mode: Option<Vec<String>>,
+    retry: Option<Vec<String>>,
+    move_up: Option<Vec<String>>,
+    move_down: Option<Vec<String>>,
+    search: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -138,12 +165,19 @@ struct TomlViewBindings {
     interact: Option<Vec<String>>,
     toggle_autoscroll: Option<Vec<String>>,
     kill_worker: Option<Vec<String>>,
+    export: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
 struct TomlInteractBindings {
     back: Option<Vec<String>>,
     send: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlFilterBindings {
+    confirm: Option<Vec<String>>,
+    cancel: Option<Vec<String>>,
 }
 
 fn parse_key(s: &str) -> Option<KeyCode> {
@@ -215,6 +249,10 @@ impl Keymap {
                 normal.decrease_workers,
             );
             apply_bindings(&mut keymap.normal, NormalAction::ToggleMode, normal.toggle_mode);
+            apply_bindings(&mut keymap.normal, NormalAction::Retry, normal.retry);
+            apply_bindings(&mut keymap.normal, NormalAction::MoveUp, normal.move_up);
+            apply_bindings(&mut keymap.normal, NormalAction::MoveDown, normal.move_down);
+            apply_bindings(&mut keymap.normal, NormalAction::Search, normal.search);
         }
 
         if let Some(insert) = config.insert {
@@ -248,11 +286,17 @@ impl Keymap {
                 view.toggle_autoscroll,
             );
             apply_bindings(&mut keymap.view, ViewAction::KillWorker, view.kill_worker);
+            apply_bindings(&mut keymap.view, ViewAction::Export, view.export);
         }
 
         if let Some(interact) = config.interact {
             apply_bindings(&mut keymap.interact, InteractAction::Back, interact.back);
             apply_bindings(&mut keymap.interact, InteractAction::Send, interact.send);
+        }
+
+        if let Some(filter) = config.filter {
+            apply_bindings(&mut keymap.filter, FilterAction::Confirm, filter.confirm);
+            apply_bindings(&mut keymap.filter, FilterAction::Cancel, filter.cancel);
         }
 
         keymap
@@ -328,6 +372,10 @@ impl Keymap {
             (NormalAction::SelectPrev, "prev"),
             (NormalAction::ViewOutput, "view"),
             (NormalAction::Interact, "interact"),
+            (NormalAction::Retry, "retry"),
+            (NormalAction::Search, "search"),
+            (NormalAction::MoveUp, "move up"),
+            (NormalAction::MoveDown, "move down"),
             (NormalAction::IncreaseWorkers, "more wkrs"),
             (NormalAction::DecreaseWorkers, "less wkrs"),
             (NormalAction::ToggleMode, "mode"),
@@ -352,6 +400,7 @@ impl Keymap {
             (ViewAction::Interact, "interact"),
             (ViewAction::ToggleAutoscroll, "auto-scroll"),
             (ViewAction::KillWorker, "kill"),
+            (ViewAction::Export, "export"),
         ];
         self.build_help(&self.view, entries)
     }
@@ -362,6 +411,14 @@ impl Keymap {
             (InteractAction::Back, "back"),
         ];
         self.build_help(&self.interact, entries)
+    }
+
+    pub fn filter_help(&self) -> Vec<(String, &'static str)> {
+        let entries: &[(FilterAction, &str)] = &[
+            (FilterAction::Confirm, "apply"),
+            (FilterAction::Cancel, "cancel"),
+        ];
+        self.build_help(&self.filter, entries)
     }
 
     /// Look up the first key bound to a NormalAction for display in hints.
