@@ -42,3 +42,12 @@ send = ["Enter"]
 [filter]
 confirm = ["Enter"]
 cancel = ["Esc"]
+
+# Quick prompts — send a predefined message with a single keypress in view mode.
+# Keys here must not conflict with [view] bindings (view bindings take priority).
+# Only works when the selected prompt is running or idle.
+# [quick_prompts]
+# g = "let's go"
+# c = "continue"
+# y = "yes"
+# n = "no"

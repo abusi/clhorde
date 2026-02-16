@@ -61,6 +61,7 @@ pub struct Keymap {
     pub view: HashMap<KeyCode, ViewAction>,
     pub interact: HashMap<KeyCode, InteractAction>,
     pub filter: HashMap<KeyCode, FilterAction>,
+    pub quick_prompts: HashMap<KeyCode, String>,
 }
 
 impl Default for Keymap {
@@ -116,6 +117,7 @@ impl Default for Keymap {
             view,
             interact,
             filter,
+            quick_prompts: HashMap::new(),
         }
     }
 }
@@ -129,6 +131,7 @@ struct TomlConfig {
     view: Option<TomlViewBindings>,
     interact: Option<TomlInteractBindings>,
     filter: Option<TomlFilterBindings>,
+    quick_prompts: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -297,6 +300,14 @@ impl Keymap {
         if let Some(filter) = config.filter {
             apply_bindings(&mut keymap.filter, FilterAction::Confirm, filter.confirm);
             apply_bindings(&mut keymap.filter, FilterAction::Cancel, filter.cancel);
+        }
+
+        if let Some(qp) = config.quick_prompts {
+            for (key_str, message) in qp {
+                if let Some(kc) = parse_key(&key_str) {
+                    keymap.quick_prompts.insert(kc, message);
+                }
+            }
         }
 
         keymap
@@ -681,5 +692,51 @@ quit = ["Q"]
         let km = Keymap::default();
         assert_eq!(km.normal_key_hint(NormalAction::Insert), "i");
         assert_eq!(km.view_key_hint(ViewAction::ToggleAutoscroll), "f");
+    }
+
+    // ── quick_prompts ──
+
+    #[test]
+    fn default_has_no_quick_prompts() {
+        let km = Keymap::default();
+        assert!(km.quick_prompts.is_empty());
+    }
+
+    #[test]
+    fn from_toml_parses_quick_prompts() {
+        let toml_str = r#"
+[quick_prompts]
+g = "let's go"
+c = "continue"
+"#;
+        let config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let km = Keymap::from_toml(config);
+
+        assert_eq!(km.quick_prompts.len(), 2);
+        assert_eq!(
+            km.quick_prompts.get(&KeyCode::Char('g')),
+            Some(&"let's go".to_string())
+        );
+        assert_eq!(
+            km.quick_prompts.get(&KeyCode::Char('c')),
+            Some(&"continue".to_string())
+        );
+    }
+
+    #[test]
+    fn from_toml_quick_prompts_ignores_invalid_keys() {
+        let toml_str = r#"
+[quick_prompts]
+g = "go"
+InvalidKey = "nope"
+"#;
+        let config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let km = Keymap::from_toml(config);
+
+        assert_eq!(km.quick_prompts.len(), 1);
+        assert_eq!(
+            km.quick_prompts.get(&KeyCode::Char('g')),
+            Some(&"go".to_string())
+        );
     }
 }

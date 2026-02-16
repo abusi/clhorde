@@ -487,7 +487,10 @@ impl App {
     }
 
     fn handle_view_key(&mut self, key: KeyEvent) {
+        // View actions take priority
         let Some(action) = self.keymap.view.get(&key.code) else {
+            // Fallback: check quick prompts
+            self.try_quick_prompt(&key);
             return;
         };
         match action {
@@ -615,6 +618,33 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn try_quick_prompt(&mut self, key: &KeyEvent) {
+        let Some(message) = self.keymap.quick_prompts.get(&key.code) else {
+            return;
+        };
+        let Some(idx) = self.list_state.selected() else {
+            return;
+        };
+        let Some(prompt) = self.prompts.get_mut(idx) else {
+            return;
+        };
+        if prompt.status != PromptStatus::Running && prompt.status != PromptStatus::Idle {
+            return;
+        }
+        let id = prompt.id;
+        let Some(sender) = self.worker_inputs.get(&id) else {
+            return;
+        };
+        let echo = format!("\n\n> {message}\n\n");
+        match &mut prompt.output {
+            Some(existing) => existing.push_str(&echo),
+            None => prompt.output = Some(echo),
+        }
+        let mut send_text = message.clone();
+        send_text.push('\n');
+        let _ = sender.send(WorkerInput::SendInput(send_text));
     }
 
     fn select_next(&mut self) {

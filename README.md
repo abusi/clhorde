@@ -139,6 +139,22 @@ select_prev = ["Up"]
 
 Key names: single characters (`"q"`, `"+"`) or special names (`"Enter"`, `"Esc"`, `"Tab"`, `"Up"`, `"Down"`, `"Left"`, `"Right"`, `"Space"`, `"Backspace"`).
 
+## Quick prompts
+
+Send predefined messages to a running worker with a single keypress in view mode. Add a `[quick_prompts]` section to your `keymap.toml`:
+
+```toml
+[quick_prompts]
+g = "let's go"
+c = "continue"
+y = "yes"
+n = "no"
+```
+
+When viewing a running or idle prompt, pressing `g` immediately sends `"let's go"` to the worker — no need to enter interact mode. The message is echoed in the output panel just like a regular follow-up.
+
+Quick prompt keys must not conflict with view mode bindings (`j`, `k`, `q`, `s`, `f`, `x`, `w`, `Esc`, arrows). If they do, the view binding takes priority.
+
 ## Prompt templates
 
 Define reusable prompt snippets in `~/.config/clhorde/templates.toml`:
