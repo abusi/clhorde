@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod keymap;
 mod prompt;
+mod pty_worker;
 mod ui;
 mod worker;
 
@@ -16,7 +17,7 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use app::App;
-use worker::{WorkerInput, WorkerMessage};
+use worker::{SpawnResult, WorkerInput, WorkerMessage};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -74,6 +75,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, restore:
     loop {
         terminal.draw(|f| ui::render(f, &mut app))?;
 
+        // After draw: check if output panel size changed, resize PTY workers
+        if let Some(panel_size) = app.output_panel_size {
+            if app.last_pty_size != Some(panel_size) && panel_size.0 > 0 && panel_size.1 > 0 {
+                app.resize_pty_workers(panel_size.0, panel_size.1);
+            }
+        }
+
         // Dispatch pending prompts to workers
         while app.active_workers < app.max_workers {
             if let Some(idx) = app.next_pending_prompt_index() {
@@ -84,10 +92,29 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, restore:
                 let mode = prompt.mode;
                 app.mark_running(idx);
                 app.active_workers += 1;
-                if let Some(input_sender) =
-                    worker::spawn_worker(id, text, cwd, mode, worker_tx.clone())
+                let pty_size = app.output_panel_size;
+                match worker::spawn_worker(id, text, cwd, mode, worker_tx.clone(), pty_size)
                 {
-                    app.worker_inputs.insert(id, input_sender);
+                    SpawnResult::Pty {
+                        input_sender,
+                        pty_handle,
+                    } => {
+                        app.worker_inputs.insert(id, input_sender);
+                        // Store PTY state on the prompt
+                        if let Some(p) = app.prompts.iter_mut().find(|p| p.id == id) {
+                            p.pty_state = Some(pty_handle.state.clone());
+                        }
+                        app.pty_handles.insert(id, pty_handle);
+                    }
+                    SpawnResult::OneShot => {
+                        // No input sender for one-shot
+                    }
+                    SpawnResult::Error(e) => {
+                        app.apply_message(WorkerMessage::SpawnError {
+                            prompt_id: id,
+                            error: e,
+                        });
+                    }
                 }
             } else {
                 break;
@@ -96,11 +123,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, restore:
 
         tokio::select! {
             Some(ev) = event_rx.recv() => {
-                if let Event::Key(key) = ev {
-                    // Only handle key press events (not release/repeat)
-                    if key.kind == KeyEventKind::Press {
+                match ev {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
                         app.handle_key(key);
                     }
+                    Event::Resize(_, _) => {
+                        // Terminal resized — next draw will update output_panel_size
+                        // and resize_pty_workers will be called
+                    }
+                    _ => {}
                 }
             }
             Some(msg) = worker_rx.recv() => {
@@ -120,6 +151,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, restore:
             for (_id, sender) in app.worker_inputs.drain() {
                 let _ = sender.send(WorkerInput::Kill);
             }
+            // Clear PTY handles (drops masters → children get SIGHUP)
+            app.pty_handles.clear();
             // Brief sleep for cleanup
             tokio::time::sleep(Duration::from_millis(100)).await;
             return Ok(());

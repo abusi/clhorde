@@ -48,7 +48,6 @@ impl PromptStatus {
     }
 }
 
-#[derive(Debug)]
 pub struct Prompt {
     pub id: usize,
     pub text: String,
@@ -63,6 +62,8 @@ pub struct Prompt {
     pub seen: bool,
     /// Saved elapsed seconds (used when restoring from session).
     pub saved_elapsed: Option<f64>,
+    /// Live PTY terminal state (only for running interactive/PTY workers).
+    pub pty_state: Option<crate::pty_worker::SharedPtyState>,
 }
 
 impl Prompt {
@@ -79,6 +80,7 @@ impl Prompt {
             finished_at: None,
             seen: false,
             saved_elapsed: None,
+            pty_state: None,
         }
     }
 
@@ -139,6 +141,7 @@ impl SerializablePrompt {
             finished_at: None,
             seen: true, // restored prompts are considered seen
             saved_elapsed: self.elapsed_secs,
+            pty_state: None,
         }
     }
 }

@@ -12,6 +12,7 @@ use crate::keymap::{
     FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction,
 };
 use crate::prompt::{Prompt, PromptMode, PromptStatus, SerializablePrompt};
+use crate::pty_worker::{self, PtyHandle};
 use crate::worker::{WorkerInput, WorkerMessage};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +21,8 @@ pub enum AppMode {
     Insert,
     ViewOutput,
     Interact,
+    /// Raw keystroke forwarding to PTY worker.
+    PtyInteract,
     Filter,
 }
 
@@ -66,6 +69,12 @@ pub struct App {
     pub template_suggestion_index: usize,
     /// Whether the quick prompts popup is visible (toggled by Ctrl+P in view mode).
     pub show_quick_prompts_popup: bool,
+    /// PTY handles for interactive workers (keyed by prompt_id).
+    pub pty_handles: HashMap<usize, PtyHandle>,
+    /// Size of the output panel (cols, rows) from last render.
+    pub output_panel_size: Option<(u16, u16)>,
+    /// Last PTY size sent to workers (for change detection).
+    pub last_pty_size: Option<(u16, u16)>,
 }
 
 impl App {
@@ -104,6 +113,9 @@ impl App {
             template_suggestions: Vec::new(),
             template_suggestion_index: 0,
             show_quick_prompts_popup: false,
+            pty_handles: HashMap::new(),
+            output_panel_size: None,
+            last_pty_size: None,
         }
     }
 
@@ -247,14 +259,27 @@ impl App {
                     }
                 }
             }
+            WorkerMessage::PtyUpdate { .. } => {
+                // No-op: redraw happens on next loop iteration
+            }
             WorkerMessage::Finished {
                 prompt_id,
                 exit_code,
             } => {
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
-                    if let Some(output) = &mut prompt.output {
+                    // For PTY workers: extract text from terminal grid before clearing state
+                    if prompt.pty_state.is_some() {
+                        let text = pty_worker::extract_text_from_term(
+                            prompt.pty_state.as_ref().unwrap(),
+                        );
+                        if !text.is_empty() {
+                            prompt.output = Some(text);
+                        }
+                        prompt.pty_state = None;
+                    } else if let Some(output) = &mut prompt.output {
                         output.push('\n');
                     }
+
                     prompt.finished_at = Some(Instant::now());
                     if exit_code == Some(0) || exit_code.is_none() {
                         prompt.status = PromptStatus::Completed;
@@ -265,15 +290,27 @@ impl App {
                         }
                     }
                 }
+                self.pty_handles.remove(&prompt_id);
                 self.worker_inputs.remove(&prompt_id);
                 self.active_workers = self.active_workers.saturating_sub(1);
+
+                // If we're in PtyInteract for this prompt, go back to ViewOutput
+                if self.mode == AppMode::PtyInteract {
+                    if let Some(prompt) = self.selected_prompt() {
+                        if prompt.id == prompt_id {
+                            self.mode = AppMode::ViewOutput;
+                        }
+                    }
+                }
             }
             WorkerMessage::SpawnError { prompt_id, error } => {
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
                     prompt.status = PromptStatus::Failed;
                     prompt.finished_at = Some(Instant::now());
                     prompt.error = Some(error);
+                    prompt.pty_state = None;
                 }
+                self.pty_handles.remove(&prompt_id);
                 self.worker_inputs.remove(&prompt_id);
                 self.active_workers = self.active_workers.saturating_sub(1);
             }
@@ -322,6 +359,7 @@ impl App {
             AppMode::Insert => self.handle_insert_key(key),
             AppMode::ViewOutput => self.handle_view_key(key),
             AppMode::Interact => self.handle_interact_key(key),
+            AppMode::PtyInteract => self.handle_pty_interact_key(key),
             AppMode::Filter => self.handle_filter_key(key),
         }
     }
@@ -367,14 +405,23 @@ impl App {
                 }
             }
             NormalAction::Interact => {
-                if let Some(prompt) = self.selected_prompt() {
-                    if prompt.status == PromptStatus::Running
-                        || prompt.status == PromptStatus::Idle
-                    {
-                        self.interact_input.clear();
-                        self.scroll_offset = 0;
-                        self.mode = AppMode::Interact;
+                let target_mode = self.selected_prompt().and_then(|p| {
+                    if p.status == PromptStatus::Running || p.status == PromptStatus::Idle {
+                        if p.pty_state.is_some() {
+                            Some(AppMode::PtyInteract)
+                        } else {
+                            Some(AppMode::Interact)
+                        }
+                    } else {
+                        None
                     }
+                });
+                if let Some(mode) = target_mode {
+                    self.scroll_offset = 0;
+                    if mode == AppMode::Interact {
+                        self.interact_input.clear();
+                    }
+                    self.mode = mode;
                 }
             }
             NormalAction::IncreaseWorkers => {
@@ -525,28 +572,43 @@ impl App {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
             }
             ViewAction::Interact => {
-                if let Some(prompt) = self.selected_prompt() {
-                    if prompt.status == PromptStatus::Running
-                        || prompt.status == PromptStatus::Idle
-                    {
-                        self.show_quick_prompts_popup = false;
-                        self.interact_input.clear();
-                        self.mode = AppMode::Interact;
+                let target_mode = self.selected_prompt().and_then(|p| {
+                    if p.status == PromptStatus::Running || p.status == PromptStatus::Idle {
+                        if p.pty_state.is_some() {
+                            Some(AppMode::PtyInteract)
+                        } else {
+                            Some(AppMode::Interact)
+                        }
+                    } else {
+                        None
                     }
+                });
+                if let Some(mode) = target_mode {
+                    self.show_quick_prompts_popup = false;
+                    if mode == AppMode::Interact {
+                        self.interact_input.clear();
+                    }
+                    self.mode = mode;
                 }
             }
             ViewAction::ToggleAutoscroll => {
                 self.auto_scroll = !self.auto_scroll;
             }
             ViewAction::KillWorker => {
-                if let Some(prompt) = self.selected_prompt() {
-                    let id = prompt.id;
-                    if prompt.status == PromptStatus::Running
-                        || prompt.status == PromptStatus::Idle
-                    {
-                        if let Some(sender) = self.worker_inputs.get(&id) {
-                            let _ = sender.send(WorkerInput::Kill);
-                        }
+                let kill_id = self.selected_prompt().and_then(|p| {
+                    if p.status == PromptStatus::Running || p.status == PromptStatus::Idle {
+                        Some(p.id)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(id) = kill_id {
+                    if let Some(sender) = self.worker_inputs.get(&id) {
+                        let _ = sender.send(WorkerInput::Kill);
+                    }
+                    // Kill the child process and drop the PTY handle
+                    if let Some(mut handle) = self.pty_handles.remove(&id) {
+                        let _ = handle.child.kill();
                     }
                 }
             }
@@ -641,6 +703,34 @@ impl App {
         }
     }
 
+    fn handle_pty_interact_key(&mut self, key: KeyEvent) {
+        // Esc exits PTY interact mode back to view
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+            self.mode = AppMode::ViewOutput;
+            return;
+        }
+
+        // If prompt is no longer running, exit back to view
+        if let Some(prompt) = self.selected_prompt() {
+            if prompt.status != PromptStatus::Running && prompt.status != PromptStatus::Idle {
+                self.mode = AppMode::ViewOutput;
+                return;
+            }
+        }
+
+        // Forward all other keys to PTY as raw bytes
+        let bytes = pty_worker::key_event_to_bytes(key);
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(prompt) = self.selected_prompt() {
+            let id = prompt.id;
+            if let Some(sender) = self.worker_inputs.get(&id) {
+                let _ = sender.send(WorkerInput::SendBytes(bytes));
+            }
+        }
+    }
+
     fn try_quick_prompt(&mut self, key: &KeyEvent) {
         let Some(message) = self.keymap.quick_prompts.get(&key.code) else {
             return;
@@ -658,14 +748,24 @@ impl App {
         let Some(sender) = self.worker_inputs.get(&id) else {
             return;
         };
-        let echo = format!("\n\n> {message}\n\n");
-        match &mut prompt.output {
-            Some(existing) => existing.push_str(&echo),
-            None => prompt.output = Some(echo),
+
+        if prompt.pty_state.is_some() {
+            // PTY worker: send message as typed text + Enter (no echo needed,
+            // the PTY terminal will show it)
+            let mut bytes = message.as_bytes().to_vec();
+            bytes.push(b'\n');
+            let _ = sender.send(WorkerInput::SendBytes(bytes));
+        } else {
+            // Stream-json worker: echo and send as structured input
+            let echo = format!("\n\n> {message}\n\n");
+            match &mut prompt.output {
+                Some(existing) => existing.push_str(&echo),
+                None => prompt.output = Some(echo),
+            }
+            let mut send_text = message.clone();
+            send_text.push('\n');
+            let _ = sender.send(WorkerInput::SendInput(send_text));
         }
-        let mut send_text = message.clone();
-        send_text.push('\n');
-        let _ = sender.send(WorkerInput::SendInput(send_text));
     }
 
     fn select_next(&mut self) {
@@ -713,6 +813,15 @@ impl App {
             };
             self.list_state.select(Some(i));
         }
+    }
+
+    // ── PTY resize ──
+
+    pub fn resize_pty_workers(&mut self, cols: u16, rows: u16) {
+        for handle in self.pty_handles.values() {
+            pty_worker::resize_pty(handle, cols, rows);
+        }
+        self.last_pty_size = Some((cols, rows));
     }
 
     // ── Feature 1: Export ──

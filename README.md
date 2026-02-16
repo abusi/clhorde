@@ -12,22 +12,22 @@ clhorde takes a fundamentally different approach:
 
 | | clhorde | tmux-based tools |
 |---|---|---|
-| **Architecture** | Direct subprocess control via `--stream-json` | Wraps interactive sessions in tmux panes |
+| **Architecture** | Hybrid: PTY for interactive + stream-json for one-shot | Wraps interactive sessions in tmux panes |
 | **Work model** | Prompt queue + worker pool | N independent sessions |
 | **Concurrency** | Queue any number of prompts, workers pull from queue | Fixed number of parallel sessions |
 | **Dependencies** | Single binary (just needs `claude` in PATH) | Requires tmux, git worktrees |
 | **Code isolation** | Each worker is a fresh subprocess—no shared state | Git worktrees per session |
-| **Interaction** | Send follow-up messages to running workers | Full interactive terminal per session |
-| **Binary size** | ~900 lines of Rust | Go/Python projects with larger dependency trees |
+| **Interaction** | Full Claude TUI embedded via PTY + terminal emulator | Full interactive terminal per session |
+| **Binary size** | ~1500 lines of Rust | Go/Python projects with larger dependency trees |
 | **Runtime** | Native async (tokio) + OS threads | tmux + shell processes |
 
 ### The queue model
 
 Most multi-Claude tools give you N parallel sessions and you manually assign work to each one. clhorde works differently: you queue up as many prompts as you want, and a configurable pool of workers (1–20) pulls from the queue automatically. This means you can batch 50 prompts and walk away—workers will chew through them at whatever concurrency you set.
 
-### Direct protocol integration
+### Direct integration—no tmux
 
-Instead of wrapping an interactive terminal, clhorde communicates with Claude directly through the `stream-json` protocol. It spawns `claude` with `--input-format stream-json --output-format stream-json`, parses streaming deltas in real time, and pipes follow-up messages as structured JSON. No terminal emulation layer, no tmux, no screen scraping.
+clhorde uses a hybrid approach: interactive workers run in a real PTY with the full Claude Code TUI rendered via an embedded terminal emulator (`alacritty_terminal`). One-shot workers use the lighter `stream-json` protocol for text-only output. No tmux, no screen scraping—just direct subprocess control with proper terminal emulation where it matters.
 
 ### Truly zero dependencies (beyond `claude`)
 
@@ -36,10 +36,11 @@ No tmux. No git worktrees. No Python. No Node. Just a single Rust binary and the
 ## Features
 
 - **Worker pool with queue** — queue unlimited prompts, configure 1–20 concurrent workers with `+`/`-`
+- **Embedded PTY terminal** — interactive workers render the full Claude Code TUI (colors, tool use, formatting) via `alacritty_terminal`
 - **Real-time streaming** — output streams token-by-token as Claude generates it
-- **Interactive follow-ups** — send messages to running workers mid-conversation
-- **One-shot & interactive modes** — toggle with `m`: one-shot prompts complete and exit, interactive prompts stay alive for follow-ups
-- **Vim-style modal interface** — Normal, Insert, View, Interact, and Filter modes
+- **Interactive follow-ups** — send messages to running workers mid-conversation, or enter PTY mode for full keyboard control
+- **One-shot & interactive modes** — toggle with `m`: one-shot prompts use stream-json, interactive prompts get a full embedded PTY
+- **Vim-style modal interface** — Normal, Insert, View, Interact, PtyInteract, and Filter modes
 - **Live status dashboard** — active workers, queue depth, completed count, per-prompt elapsed time
 - **Auto-scroll** — follows output in real time, toggleable with `f`
 - **Kill workers** — terminate a running prompt with `x`
@@ -144,11 +145,17 @@ clhorde config edit           # open config in $EDITOR (or vi)
 | `x` | Kill running worker |
 | `Esc` / `q` | Back to normal mode |
 
-### Interact mode
+### Interact mode (one-shot workers)
 | Key | Action |
 |-----|--------|
 | `Enter` | Send follow-up message to worker |
 | `Esc` | Back to normal mode |
+
+### PTY Interact mode (interactive workers)
+| Key | Action |
+|-----|--------|
+| *all keys* | Forwarded directly to the PTY |
+| `Esc` | Back to view mode |
 
 ### Filter mode
 | Key | Action |
@@ -223,24 +230,26 @@ Completed and failed prompts are restored as-is. Running/idle prompts (whose pro
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    main.rs                          │
-│  Terminal setup, tokio::select! event loop          │
-│  Dispatches queued prompts → worker pool            │
-├─────────────┬───────────────────┬───────────────────┤
-│   app.rs    │     ui.rs         │    worker.rs      │
-│  State +    │  Stateless        │  Subprocess mgmt  │
-│  keybinds   │  ratatui render   │  stream-json I/O  │
-├─────────────┴───────────────────┴───────────────────┤
-│                  prompt.rs                          │
-│  Data model: id, text, status, output, timing       │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                       main.rs                            │
+│  Terminal setup, tokio::select! event loop               │
+│  Dispatches queued prompts → worker pool                 │
+├─────────────┬───────────────┬──────────────┬─────────────┤
+│   app.rs    │    ui.rs      │  worker.rs   │pty_worker.rs│
+│  State +    │  Stateless    │  Dispatch +  │ PTY spawn,  │
+│  keybinds   │  ratatui +    │  one-shot    │ alacritty   │
+│  modes      │  PTY grid     │  stream-json │ term grid   │
+├─────────────┴───────────────┴──────────────┴─────────────┤
+│                       prompt.rs                          │
+│  Data model: id, text, status, output, timing, pty_state │
+└──────────────────────────────────────────────────────────┘
 ```
 
 - **Event handling** — Crossterm events are read on a dedicated OS thread (not async) and forwarded via channel, so the tokio runtime never blocks.
 - **Worker threads** — Each `claude` subprocess runs in `std::thread` with separate reader and writer threads for stdout parsing and stdin writing.
-- **Communication** — Workers send `WorkerMessage` variants (OutputChunk, Finished, SpawnError) back to the app via `tokio::sync::mpsc`. The app sends `WorkerInput` (SendInput, Kill) to workers.
-- **Clean shutdown** — Dropping the stdin writer signals EOF to the `claude` process, which exits gracefully. No SIGKILL needed.
+- **Dual architecture** — Interactive workers run in a real PTY (`portable-pty`) with terminal emulation (`alacritty_terminal`). One-shot workers use `stream-json` for lightweight text streaming.
+- **Communication** — Workers send `WorkerMessage` variants (OutputChunk, PtyUpdate, Finished, SpawnError) back to the app via `tokio::sync::mpsc`. The app sends `WorkerInput` (SendInput, SendBytes, Kill) to workers.
+- **Clean shutdown** — PTY workers are terminated by dropping the master PTY (child gets SIGHUP). One-shot workers exit when stdin is closed.
 
 ## UI Layout
 
@@ -269,7 +278,7 @@ Completed and failed prompts are restored as-is. Running/idle prompts (whose pro
 
 clhorde supports two prompt modes, toggled with `m` in Normal mode:
 
-- **Interactive** (default) — spawns `claude -p --input-format stream-json --output-format stream-json`. The initial prompt is sent via stdin JSON. The process stays alive after responding (Idle state), allowing follow-up messages with `s`.
+- **Interactive** (default) — spawns `claude "prompt" --dangerously-skip-permissions` in a real PTY. The right panel renders the full Claude Code TUI with colors, tool use, and formatting via `alacritty_terminal`. Press `s` to enter PTY Interact mode and type directly into the Claude session. When the process exits, the terminal output is extracted and stored for export/session persistence.
 - **One-shot** — spawns `claude -p "prompt text" --output-format stream-json`. The prompt is passed as a CLI argument. No stdin writer, no follow-ups. The process exits after responding and goes directly to Completed.
 
 The current default mode is shown in the status bar (`[interactive]` or `[one-shot]`). Each prompt remembers the mode it was created with.
@@ -279,11 +288,11 @@ The current default mode is shown in the status bar (`[interactive]` or `[one-sh
 1. You type a prompt → it's added to the queue as `Pending` with the current default mode
 2. The event loop checks: `active_workers < max_workers`?
 3. If yes, the next pending prompt is dispatched to a new worker
-4. **Interactive mode:** the worker spawns `claude -p --stream-json` with the prompt as a JSON user message via stdin
-5. **One-shot mode:** the worker spawns `claude -p "prompt"` with the prompt as a CLI argument, no stdin
-6. A reader thread parses streaming deltas and sends them back as `OutputChunk` messages
-7. The UI renders chunks in real time with auto-scroll
-8. When Claude finishes, the worker sends `Finished` and the prompt moves to `Completed`
+4. **Interactive mode:** a PTY is allocated via `portable-pty`, and `claude "prompt" --dangerously-skip-permissions` is spawned inside it. A reader thread feeds PTY output into an `alacritty_terminal` grid. The UI renders the grid with full color and formatting support.
+5. **One-shot mode:** the worker spawns `claude -p "prompt" --output-format stream-json` and a reader thread parses streaming deltas as `OutputChunk` messages
+6. The UI renders output in real time with auto-scroll
+7. When Claude finishes (PTY EOF or process exit), the worker sends `Finished` and the prompt moves to `Completed`
+8. For PTY workers, the terminal text is extracted from the grid and stored for export/session persistence
 9. The next queued prompt is automatically dispatched
 
 ## License

@@ -4,26 +4,29 @@ A TUI tool for orchestrating multiple Claude Code CLI instances in parallel. Bui
 
 ## What it does
 
-clhorde lets you queue up multiple prompts and run them concurrently across a pool of `claude` CLI workers. Each worker spawns a `claude` subprocess using `stream-json` input/output format, streams results back in real-time, and supports interactive follow-up messages.
+clhorde lets you queue up multiple prompts and run them concurrently across a pool of `claude` CLI workers. Interactive workers run in a real PTY with the full Claude Code TUI embedded via `alacritty_terminal`, while one-shot workers use `stream-json` for lightweight text streaming.
 
 ## Architecture
 
 ```
 src/
-├── main.rs     # Entry point, terminal setup, event loop (crossterm + tokio::select!)
-├── app.rs      # App state, mode handling, keybindings (vim-style: Normal/Insert/View/Interact/Filter)
-├── prompt.rs   # Prompt data model (id, text, status, output, timing)
-├── ui.rs       # ratatui rendering (status bar, prompt list, output viewer, input bar, help bar)
-└── worker.rs   # Worker subprocess management (spawns `claude -p --stream-json`, reader/writer threads)
+├── main.rs       # Entry point, terminal setup, event loop (crossterm + tokio::select!)
+├── app.rs        # App state, mode handling, keybindings (vim-style: Normal/Insert/View/Interact/PtyInteract/Filter)
+├── prompt.rs     # Prompt data model (id, text, status, output, timing, pty_state)
+├── ui.rs         # ratatui rendering (status bar, prompt list, output viewer, PTY grid renderer, input bar, help bar)
+├── worker.rs     # Worker dispatch (routes interactive→PTY, one-shot→stream-json)
+└── pty_worker.rs # PTY worker lifecycle (portable-pty spawn, alacritty_terminal grid, key encoding, resize)
 ```
 
 ### Key design decisions
 
 - **Event handling**: Crossterm events are read on a dedicated OS thread (not async) and forwarded via `mpsc` channel to avoid blocking the tokio runtime.
 - **Worker threads**: Each `claude` subprocess runs in a std::thread (not tokio task) with separate reader/writer threads for stdout parsing and stdin writing.
-- **Communication**: Workers send `WorkerMessage` variants (OutputChunk, Finished, SpawnError) back to the app via `tokio::sync::mpsc`. The app sends `WorkerInput` (SendInput, Kill) to workers.
+- **Communication**: Workers send `WorkerMessage` variants (OutputChunk, PtyUpdate, Finished, SpawnError) back to the app via `tokio::sync::mpsc`. The app sends `WorkerInput` (SendInput, SendBytes, Kill) to workers.
+- **Dual architecture (PTY + stream-json)**: Interactive workers run in a real PTY via `portable-pty`, with the full Claude Code TUI rendered through `alacritty_terminal`. One-shot workers use the lighter `stream-json` protocol for text-only output. This hybrid gives interactive prompts the full Claude experience (tool use visibility, permission prompts, rich formatting) while keeping one-shot prompts lightweight.
+- **PTY terminal emulation**: The `alacritty_terminal` crate provides a headless terminal emulator. PTY output bytes are fed to `Processor::advance()` which updates a `Term` grid. The UI reads this grid each frame, mapping alacritty cell colors/flags to ratatui styles.
 - **Claude CLI integration**: Two spawn strategies based on prompt mode:
-  - **Interactive**: `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --dangerously-skip-permissions` — initial prompt sent via stdin JSON, process stays alive for follow-ups.
+  - **Interactive (PTY)**: `claude "prompt" --dangerously-skip-permissions` — runs in a real PTY, full TUI embedded in the right panel. Keystrokes forwarded in PtyInteract mode.
   - **One-shot**: `claude -p "prompt" --output-format stream-json --verbose --include-partial-messages --dangerously-skip-permissions` — prompt as CLI arg, no stdin writer, process exits after responding.
   - Removes `CLAUDECODE` env var to avoid nesting issues.
 
@@ -37,6 +40,8 @@ src/
 - `toml` 0.8 — config file parsing
 - `dirs` 6 — XDG data/config directory resolution
 - `chrono` 0.4 — timestamps for export filenames
+- `alacritty_terminal` 0.25 — headless terminal emulator for PTY grid rendering
+- `portable-pty` 0.9 — cross-platform PTY allocation and subprocess management
 
 ## Building and running
 
@@ -77,9 +82,13 @@ Requires `claude` CLI to be installed and available in PATH.
 - `x` — kill running worker
 - `Esc`/`q` — back to normal
 
-### Interact mode
+### Interact mode (one-shot workers)
 - `Enter` — send message to running worker
 - `Esc` — back to normal
+
+### PTY Interact mode (interactive workers)
+- All keystrokes forwarded directly to the PTY
+- `Esc` — back to view mode
 
 ### Filter mode
 - Type to filter prompts (live filtering, case-insensitive)

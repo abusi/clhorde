@@ -1,3 +1,7 @@
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line as ALine};
+use alacritty_terminal::term::cell::Flags as CellFlags;
+use alacritty_terminal::vte::ansi::{Color as AColor, NamedColor};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -7,6 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use crate::app::{App, AppMode};
 use crate::keymap::{NormalAction, ViewAction};
 use crate::prompt::{PromptMode, PromptStatus};
+use crate::pty_worker::SharedPtyState;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -26,7 +31,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_suggestions(f, app, chunks[2]);
     render_template_suggestions(f, app, chunks[2]);
 
-    if app.show_quick_prompts_popup && app.mode == AppMode::ViewOutput {
+    if app.show_quick_prompts_popup
+        && (app.mode == AppMode::ViewOutput || app.mode == AppMode::PtyInteract)
+    {
         render_quick_prompts_popup(f, app, chunks[1]);
     }
 
@@ -41,6 +48,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         AppMode::Insert => ("INSERT", Color::Green),
         AppMode::ViewOutput => ("VIEW", Color::Yellow),
         AppMode::Interact => ("INTERACT", Color::Magenta),
+        AppMode::PtyInteract => ("PTY", Color::Green),
         AppMode::Filter => ("FILTER", Color::Cyan),
     };
 
@@ -272,6 +280,192 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
 }
 
 fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    // Check if we should render the PTY grid
+    if let Some(prompt) = app.selected_prompt() {
+        if prompt.pty_state.is_some() {
+            let pty_state = prompt.pty_state.clone().unwrap();
+            let id = prompt.id;
+            let cwd_str = prompt.cwd.as_deref().unwrap_or(".").to_string();
+            let is_pty_interact = app.mode == AppMode::PtyInteract;
+            render_pty_output_viewer(f, app, &pty_state, area, id, &cwd_str, is_pty_interact);
+            return;
+        }
+    }
+    render_text_output_viewer(f, app, area);
+}
+
+fn render_pty_output_viewer(
+    f: &mut Frame,
+    app: &mut App,
+    pty_state: &SharedPtyState,
+    area: Rect,
+    id: usize,
+    cwd_str: &str,
+    is_pty_interact: bool,
+) {
+    let title = format!(" PTY: #{id} [{cwd_str}] ");
+    let live_indicator = if is_pty_interact {
+        Span::styled(" [LIVE] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    } else {
+        Span::raw("")
+    };
+
+    // Status message indicator
+    let status_indicator = if let Some((ref msg, _)) = app.status_message {
+        Span::styled(
+            format!(" {msg} "),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("")
+    };
+
+    let border_color = if is_pty_interact {
+        Color::Green
+    } else {
+        Color::Cyan
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(vec![
+            Span::styled(
+                title,
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            live_indicator,
+            status_indicator,
+        ]);
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Update output panel size for PTY resize tracking
+    app.output_panel_size = Some((inner.width, inner.height));
+
+    // Render PTY grid content
+    render_pty_grid(f, pty_state, inner);
+}
+
+fn render_pty_grid(f: &mut Frame, pty_state: &SharedPtyState, area: Rect) {
+    let Ok(pty) = pty_state.lock() else {
+        return;
+    };
+    let grid = pty.term.grid();
+    let screen_lines = grid.screen_lines();
+    let cols = grid.columns();
+
+    let render_rows = (area.height as usize).min(screen_lines);
+    let render_cols = (area.width as usize).min(cols);
+
+    for row in 0..render_rows {
+        let line = ALine(row as i32);
+        let mut spans: Vec<Span> = Vec::new();
+        let mut current_text = String::new();
+        let mut current_style = Style::default();
+
+        for col in 0..render_cols {
+            let cell = &grid[line][Column(col)];
+
+            // Skip wide char spacers
+            if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+
+            let style = cell_style(cell.fg, cell.bg, cell.flags);
+
+            if style == current_style {
+                current_text.push(cell.c);
+            } else {
+                if !current_text.is_empty() {
+                    spans.push(Span::styled(current_text.clone(), current_style));
+                    current_text.clear();
+                }
+                current_style = style;
+                current_text.push(cell.c);
+            }
+        }
+        if !current_text.is_empty() {
+            spans.push(Span::styled(current_text, current_style));
+        }
+
+        let line_widget = Line::from(spans);
+        let row_area = Rect {
+            x: area.x,
+            y: area.y + row as u16,
+            width: area.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(line_widget), row_area);
+    }
+}
+
+fn cell_style(fg: AColor, bg: AColor, flags: CellFlags) -> Style {
+    let mut style = Style::default();
+    style = style.fg(convert_color(fg, false));
+    style = style.bg(convert_color(bg, true));
+    style = style.add_modifier(convert_flags(flags));
+    style
+}
+
+fn convert_color(color: AColor, _is_bg: bool) -> Color {
+    match color {
+        AColor::Spec(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
+        AColor::Indexed(n) => Color::Indexed(n),
+        AColor::Named(name) => match name {
+            NamedColor::Black | NamedColor::DimBlack => Color::Black,
+            NamedColor::Red | NamedColor::DimRed => Color::Red,
+            NamedColor::Green | NamedColor::DimGreen => Color::Green,
+            NamedColor::Yellow | NamedColor::DimYellow => Color::Yellow,
+            NamedColor::Blue | NamedColor::DimBlue => Color::Blue,
+            NamedColor::Magenta | NamedColor::DimMagenta => Color::Magenta,
+            NamedColor::Cyan | NamedColor::DimCyan => Color::Cyan,
+            NamedColor::White | NamedColor::DimWhite => Color::White,
+            NamedColor::BrightBlack => Color::DarkGray,
+            NamedColor::BrightRed => Color::LightRed,
+            NamedColor::BrightGreen => Color::LightGreen,
+            NamedColor::BrightYellow => Color::LightYellow,
+            NamedColor::BrightBlue => Color::LightBlue,
+            NamedColor::BrightMagenta => Color::LightMagenta,
+            NamedColor::BrightCyan => Color::LightCyan,
+            NamedColor::BrightWhite => Color::White,
+            NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::DimForeground => {
+                Color::Reset
+            }
+            NamedColor::Background => Color::Reset,
+            NamedColor::Cursor => Color::Reset,
+        },
+    }
+}
+
+fn convert_flags(flags: CellFlags) -> Modifier {
+    let mut modifier = Modifier::empty();
+    if flags.contains(CellFlags::BOLD) {
+        modifier |= Modifier::BOLD;
+    }
+    if flags.contains(CellFlags::ITALIC) {
+        modifier |= Modifier::ITALIC;
+    }
+    if flags.contains(CellFlags::UNDERLINE) {
+        modifier |= Modifier::UNDERLINED;
+    }
+    if flags.contains(CellFlags::DIM) {
+        modifier |= Modifier::DIM;
+    }
+    if flags.contains(CellFlags::INVERSE) {
+        modifier |= Modifier::REVERSED;
+    }
+    if flags.contains(CellFlags::STRIKEOUT) {
+        modifier |= Modifier::CROSSED_OUT;
+    }
+    if flags.contains(CellFlags::HIDDEN) {
+        modifier |= Modifier::HIDDEN;
+    }
+    modifier
+}
+
+fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let (title, content) = match app.selected_prompt() {
         Some(prompt) => {
             let cwd_str = prompt.cwd.as_deref().unwrap_or(".");
@@ -394,6 +588,12 @@ fn render_input_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             app.filter_input.clone(),
             Style::default().fg(Color::White),
             Color::Cyan,
+        ),
+        AppMode::PtyInteract => (
+            " PTY Interactive (Esc to exit) ".to_string(),
+            String::new(),
+            Style::default().fg(Color::DarkGray),
+            Color::Green,
         ),
         _ => {
             let key = app.keymap.normal_key_hint(NormalAction::Insert);
@@ -661,6 +861,7 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         AppMode::Insert => app.keymap.insert_help(),
         AppMode::ViewOutput => app.keymap.view_help(),
         AppMode::Interact => app.keymap.interact_help(),
+        AppMode::PtyInteract => vec![("Esc".to_string(), "exit PTY mode")],
         AppMode::Filter => app.keymap.filter_help(),
     };
 
