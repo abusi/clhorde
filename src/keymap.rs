@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 
 use crossterm::event::KeyCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NormalAction {
@@ -124,66 +125,101 @@ impl Default for Keymap {
 
 // TOML deserialization types
 
-#[derive(Deserialize, Default)]
-struct TomlConfig {
-    normal: Option<TomlNormalBindings>,
-    insert: Option<TomlInsertBindings>,
-    view: Option<TomlViewBindings>,
-    interact: Option<TomlInteractBindings>,
-    filter: Option<TomlFilterBindings>,
-    quick_prompts: Option<HashMap<String, String>>,
+#[derive(Deserialize, Serialize, Default)]
+pub(crate) struct TomlConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) normal: Option<TomlNormalBindings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) insert: Option<TomlInsertBindings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) view: Option<TomlViewBindings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) interact: Option<TomlInteractBindings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) filter: Option<TomlFilterBindings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) quick_prompts: Option<HashMap<String, String>>,
 }
 
-#[derive(Deserialize, Default)]
-struct TomlNormalBindings {
-    quit: Option<Vec<String>>,
-    insert: Option<Vec<String>>,
-    select_next: Option<Vec<String>>,
-    select_prev: Option<Vec<String>>,
-    view_output: Option<Vec<String>>,
-    interact: Option<Vec<String>>,
-    increase_workers: Option<Vec<String>>,
-    decrease_workers: Option<Vec<String>>,
-    toggle_mode: Option<Vec<String>>,
-    retry: Option<Vec<String>>,
-    move_up: Option<Vec<String>>,
-    move_down: Option<Vec<String>>,
-    search: Option<Vec<String>>,
+#[derive(Deserialize, Serialize, Default)]
+pub(crate) struct TomlNormalBindings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) quit: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) insert: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) select_next: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) select_prev: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) view_output: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) interact: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) increase_workers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) decrease_workers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) toggle_mode: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) retry: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) move_up: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) move_down: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) search: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Default)]
-struct TomlInsertBindings {
-    cancel: Option<Vec<String>>,
-    submit: Option<Vec<String>>,
-    accept_suggestion: Option<Vec<String>>,
-    next_suggestion: Option<Vec<String>>,
-    prev_suggestion: Option<Vec<String>>,
+#[derive(Deserialize, Serialize, Default)]
+pub(crate) struct TomlInsertBindings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cancel: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) submit: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) accept_suggestion: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_suggestion: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prev_suggestion: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Default)]
-struct TomlViewBindings {
-    back: Option<Vec<String>>,
-    scroll_down: Option<Vec<String>>,
-    scroll_up: Option<Vec<String>>,
-    interact: Option<Vec<String>>,
-    toggle_autoscroll: Option<Vec<String>>,
-    kill_worker: Option<Vec<String>>,
-    export: Option<Vec<String>>,
+#[derive(Deserialize, Serialize, Default)]
+pub(crate) struct TomlViewBindings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) back: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scroll_down: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scroll_up: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) interact: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) toggle_autoscroll: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) kill_worker: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) export: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Default)]
-struct TomlInteractBindings {
-    back: Option<Vec<String>>,
-    send: Option<Vec<String>>,
+#[derive(Deserialize, Serialize, Default)]
+pub(crate) struct TomlInteractBindings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) back: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) send: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Default)]
-struct TomlFilterBindings {
-    confirm: Option<Vec<String>>,
-    cancel: Option<Vec<String>>,
+#[derive(Deserialize, Serialize, Default)]
+pub(crate) struct TomlFilterBindings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) confirm: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cancel: Option<Vec<String>>,
 }
 
-fn parse_key(s: &str) -> Option<KeyCode> {
+pub(crate) fn parse_key(s: &str) -> Option<KeyCode> {
     match s {
         "Enter" => Some(KeyCode::Enter),
         "Esc" => Some(KeyCode::Esc),
@@ -199,7 +235,7 @@ fn parse_key(s: &str) -> Option<KeyCode> {
     }
 }
 
-fn config_path() -> Option<PathBuf> {
+pub(crate) fn config_path() -> Option<PathBuf> {
     let config_dir = env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .ok()
@@ -314,6 +350,89 @@ impl Keymap {
     }
 }
 
+/// Load the raw TOML config (not the resolved Keymap). Returns Default if file missing.
+pub(crate) fn load_toml_config() -> TomlConfig {
+    let path = match config_path() {
+        Some(p) => p,
+        None => return TomlConfig::default(),
+    };
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return TomlConfig::default(),
+    };
+    toml::from_str(&content).unwrap_or_default()
+}
+
+/// Save a TomlConfig to the config file, creating parent dirs as needed.
+pub(crate) fn save_toml_config(config: &TomlConfig) -> io::Result<()> {
+    let path = config_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cannot determine config path"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = toml::to_string_pretty(config)
+        .map_err(io::Error::other)?;
+    fs::write(&path, content)
+}
+
+/// Return a TomlConfig with all defaults populated (for `config init`).
+pub(crate) fn default_toml_config() -> TomlConfig {
+    let km = Keymap::default();
+
+    fn keys_to_strings<A: PartialEq>(map: &HashMap<KeyCode, A>, action: A) -> Vec<String> {
+        let mut keys: Vec<_> = map
+            .iter()
+            .filter(|(_, a)| **a == action)
+            .map(|(k, _)| key_display(k))
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    TomlConfig {
+        normal: Some(TomlNormalBindings {
+            quit: Some(keys_to_strings(&km.normal, NormalAction::Quit)),
+            insert: Some(keys_to_strings(&km.normal, NormalAction::Insert)),
+            select_next: Some(keys_to_strings(&km.normal, NormalAction::SelectNext)),
+            select_prev: Some(keys_to_strings(&km.normal, NormalAction::SelectPrev)),
+            view_output: Some(keys_to_strings(&km.normal, NormalAction::ViewOutput)),
+            interact: Some(keys_to_strings(&km.normal, NormalAction::Interact)),
+            increase_workers: Some(keys_to_strings(&km.normal, NormalAction::IncreaseWorkers)),
+            decrease_workers: Some(keys_to_strings(&km.normal, NormalAction::DecreaseWorkers)),
+            toggle_mode: Some(keys_to_strings(&km.normal, NormalAction::ToggleMode)),
+            retry: Some(keys_to_strings(&km.normal, NormalAction::Retry)),
+            move_up: Some(keys_to_strings(&km.normal, NormalAction::MoveUp)),
+            move_down: Some(keys_to_strings(&km.normal, NormalAction::MoveDown)),
+            search: Some(keys_to_strings(&km.normal, NormalAction::Search)),
+        }),
+        insert: Some(TomlInsertBindings {
+            cancel: Some(keys_to_strings(&km.insert, InsertAction::Cancel)),
+            submit: Some(keys_to_strings(&km.insert, InsertAction::Submit)),
+            accept_suggestion: Some(keys_to_strings(&km.insert, InsertAction::AcceptSuggestion)),
+            next_suggestion: Some(keys_to_strings(&km.insert, InsertAction::NextSuggestion)),
+            prev_suggestion: Some(keys_to_strings(&km.insert, InsertAction::PrevSuggestion)),
+        }),
+        view: Some(TomlViewBindings {
+            back: Some(keys_to_strings(&km.view, ViewAction::Back)),
+            scroll_down: Some(keys_to_strings(&km.view, ViewAction::ScrollDown)),
+            scroll_up: Some(keys_to_strings(&km.view, ViewAction::ScrollUp)),
+            interact: Some(keys_to_strings(&km.view, ViewAction::Interact)),
+            toggle_autoscroll: Some(keys_to_strings(&km.view, ViewAction::ToggleAutoscroll)),
+            kill_worker: Some(keys_to_strings(&km.view, ViewAction::KillWorker)),
+            export: Some(keys_to_strings(&km.view, ViewAction::Export)),
+        }),
+        interact: Some(TomlInteractBindings {
+            back: Some(keys_to_strings(&km.interact, InteractAction::Back)),
+            send: Some(keys_to_strings(&km.interact, InteractAction::Send)),
+        }),
+        filter: Some(TomlFilterBindings {
+            confirm: Some(keys_to_strings(&km.filter, FilterAction::Confirm)),
+            cancel: Some(keys_to_strings(&km.filter, FilterAction::Cancel)),
+        }),
+        quick_prompts: None,
+    }
+}
+
 /// Remove all existing bindings for `action`, then insert new ones from `keys`.
 /// If `keys` is None, keep defaults.
 fn apply_bindings<A: PartialEq + Copy>(
@@ -339,7 +458,7 @@ fn apply_bindings<A: PartialEq + Copy>(
 
 // Help bar generation
 
-fn key_display(kc: &KeyCode) -> String {
+pub(crate) fn key_display(kc: &KeyCode) -> String {
     match kc {
         KeyCode::Char(' ') => "Space".to_string(),
         KeyCode::Char(c) => c.to_string(),

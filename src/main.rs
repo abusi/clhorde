@@ -1,4 +1,5 @@
 mod app;
+mod cli;
 mod keymap;
 mod prompt;
 mod ui;
@@ -19,7 +20,12 @@ use worker::{WorkerInput, WorkerMessage};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let restore = std::env::args().any(|a| a == "--restore");
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = cli::run(&args) {
+        std::process::exit(code);
+    }
+
+    let restore = args.iter().any(|a| a == "--restore");
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();

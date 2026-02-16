@@ -1,0 +1,793 @@
+use std::collections::HashMap;
+
+use crossterm::event::KeyCode;
+
+use crate::keymap::{
+    self, FilterAction, InsertAction, InteractAction, Keymap, NormalAction, TomlConfig,
+    TomlFilterBindings, TomlInsertBindings, TomlInteractBindings, TomlNormalBindings,
+    TomlViewBindings, ViewAction,
+};
+
+/// Returns Some(exit_code) if a CLI subcommand was handled, None to continue to TUI.
+pub fn run(args: &[String]) -> Option<i32> {
+    let cmd = args.get(1).map(|s| s.as_str())?;
+    match cmd {
+        "help" | "--help" | "-h" => Some(cmd_help()),
+        "qp" => Some(cmd_qp(&args[2..])),
+        "keys" => Some(cmd_keys(&args[2..])),
+        "config" => Some(cmd_config(&args[2..])),
+        _ => None,
+    }
+}
+
+fn cmd_help() -> i32 {
+    println!("clhorde {}", env!("CARGO_PKG_VERSION"));
+    println!("A TUI for orchestrating multiple Claude Code CLI instances in parallel.");
+    println!();
+    println!("Usage: clhorde [command] [options]");
+    println!();
+    println!("Commands:");
+    println!("  (none)              Launch the TUI");
+    println!("  --restore           Launch the TUI and restore previous session");
+    println!("  qp                  Manage quick prompts");
+    println!("    list              List all quick prompts");
+    println!("    add <key> <msg>   Add a quick prompt");
+    println!("    remove <key>      Remove a quick prompt");
+    println!("  keys                Manage keybindings");
+    println!("    list [mode]       List keybindings (all or by mode)");
+    println!("    set <mode> <action> <key1...>");
+    println!("                      Set keys for an action");
+    println!("    reset <mode> [action]");
+    println!("                      Reset bindings to defaults");
+    println!("  config              Manage config file");
+    println!("    path              Print config file path");
+    println!("    edit              Open config in $EDITOR");
+    println!("    init [--force]    Create config with defaults");
+    println!();
+    println!("Modes: normal, insert, view, interact, filter");
+    println!();
+    println!("Examples:");
+    println!("  clhorde qp add g \"let's go\"");
+    println!("  clhorde keys set normal quit Q");
+    println!("  clhorde keys list normal");
+    println!("  clhorde config init");
+    0
+}
+
+// ── qp subcommands ──
+
+fn cmd_qp(args: &[String]) -> i32 {
+    match args.first().map(|s| s.as_str()) {
+        Some("list") => qp_list(),
+        Some("add") => qp_add(&args[1..]),
+        Some("remove") => qp_remove(&args[1..]),
+        _ => {
+            eprintln!("Usage: clhorde qp <list|add|remove>");
+            eprintln!("  list              List all quick prompts");
+            eprintln!("  add <key> <msg>   Add a quick prompt");
+            eprintln!("  remove <key>      Remove a quick prompt");
+            1
+        }
+    }
+}
+
+fn qp_list() -> i32 {
+    let config = keymap::load_toml_config();
+    match config.quick_prompts {
+        Some(ref qp) if !qp.is_empty() => {
+            let mut entries: Vec<_> = qp.iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            for (key, message) in entries {
+                println!("{key} = \"{message}\"");
+            }
+        }
+        _ => println!("No quick prompts configured."),
+    }
+    0
+}
+
+fn qp_add(args: &[String]) -> i32 {
+    if args.len() < 2 {
+        eprintln!("Usage: clhorde qp add <key> <message...>");
+        return 1;
+    }
+    let key_str = &args[0];
+    if keymap::parse_key(key_str).is_none() {
+        eprintln!("Invalid key: {key_str}");
+        eprintln!("Valid keys: single characters (a-z, A-Z, 0-9, symbols) or Enter, Esc, Tab, Space, Up, Down, Left, Right, Backspace");
+        return 1;
+    }
+    let message = args[1..].join(" ");
+
+    let mut config = keymap::load_toml_config();
+    let qp = config.quick_prompts.get_or_insert_with(HashMap::new);
+    qp.insert(key_str.clone(), message.clone());
+
+    if let Err(e) = keymap::save_toml_config(&config) {
+        eprintln!("Failed to save config: {e}");
+        return 1;
+    }
+    println!("Added quick prompt: {key_str} = \"{message}\"");
+    0
+}
+
+fn qp_remove(args: &[String]) -> i32 {
+    if args.is_empty() {
+        eprintln!("Usage: clhorde qp remove <key>");
+        return 1;
+    }
+    let key_str = &args[0];
+
+    let mut config = keymap::load_toml_config();
+    let removed = config
+        .quick_prompts
+        .as_mut()
+        .and_then(|qp| qp.remove(key_str));
+    if removed.is_none() {
+        eprintln!("Quick prompt '{key_str}' not found.");
+        return 1;
+    }
+
+    if let Err(e) = keymap::save_toml_config(&config) {
+        eprintln!("Failed to save config: {e}");
+        return 1;
+    }
+    println!("Removed quick prompt: {key_str}");
+    0
+}
+
+// ── keys subcommands ──
+
+fn cmd_keys(args: &[String]) -> i32 {
+    match args.first().map(|s| s.as_str()) {
+        Some("list") => keys_list(args.get(1).map(|s| s.as_str())),
+        Some("set") => keys_set(&args[1..]),
+        Some("reset") => keys_reset(&args[1..]),
+        _ => {
+            eprintln!("Usage: clhorde keys <list|set|reset>");
+            eprintln!("  list [mode]                     List keybindings");
+            eprintln!("  set <mode> <action> <key1...>   Set keybinding");
+            eprintln!("  reset <mode> [action]           Reset to defaults");
+            1
+        }
+    }
+}
+
+fn keys_list(mode: Option<&str>) -> i32 {
+    let km = Keymap::load();
+
+    match mode {
+        Some("normal") => print_mode_bindings("normal", &invert_normal(&km)),
+        Some("insert") => print_mode_bindings("insert", &invert_insert(&km)),
+        Some("view") => print_mode_bindings("view", &invert_view(&km)),
+        Some("interact") => print_mode_bindings("interact", &invert_interact(&km)),
+        Some("filter") => print_mode_bindings("filter", &invert_filter(&km)),
+        Some(m) => {
+            eprintln!("Unknown mode: {m}");
+            eprintln!("Valid modes: normal, insert, view, interact, filter");
+            return 1;
+        }
+        None => {
+            print_mode_bindings("normal", &invert_normal(&km));
+            println!();
+            print_mode_bindings("insert", &invert_insert(&km));
+            println!();
+            print_mode_bindings("view", &invert_view(&km));
+            println!();
+            print_mode_bindings("interact", &invert_interact(&km));
+            println!();
+            print_mode_bindings("filter", &invert_filter(&km));
+        }
+    }
+    0
+}
+
+fn print_mode_bindings(mode: &str, bindings: &[(String, Vec<String>)]) {
+    println!("[{mode}]");
+    for (action, keys) in bindings {
+        let keys_str: Vec<String> = keys.iter().map(|k| format!("\"{k}\"")).collect();
+        println!("{action} = [{}]", keys_str.join(", "));
+    }
+}
+
+/// Invert a KeyCode->Action hashmap to Action->Vec<key_display_string>, sorted by action name.
+fn invert_map<A: Eq + Copy>(
+    map: &HashMap<KeyCode, A>,
+    action_names: &[(A, &str)],
+) -> Vec<(String, Vec<String>)> {
+    let mut result = Vec::new();
+    for &(action, name) in action_names {
+        let mut keys: Vec<String> = map
+            .iter()
+            .filter(|(_, a)| **a == action)
+            .map(|(k, _)| keymap::key_display(k))
+            .collect();
+        keys.sort();
+        result.push((name.to_string(), keys));
+    }
+    result
+}
+
+fn invert_normal(km: &Keymap) -> Vec<(String, Vec<String>)> {
+    invert_map(
+        &km.normal,
+        &[
+            (NormalAction::Quit, "quit"),
+            (NormalAction::Insert, "insert"),
+            (NormalAction::SelectNext, "select_next"),
+            (NormalAction::SelectPrev, "select_prev"),
+            (NormalAction::ViewOutput, "view_output"),
+            (NormalAction::Interact, "interact"),
+            (NormalAction::IncreaseWorkers, "increase_workers"),
+            (NormalAction::DecreaseWorkers, "decrease_workers"),
+            (NormalAction::ToggleMode, "toggle_mode"),
+            (NormalAction::Retry, "retry"),
+            (NormalAction::MoveUp, "move_up"),
+            (NormalAction::MoveDown, "move_down"),
+            (NormalAction::Search, "search"),
+        ],
+    )
+}
+
+fn invert_insert(km: &Keymap) -> Vec<(String, Vec<String>)> {
+    invert_map(
+        &km.insert,
+        &[
+            (InsertAction::Cancel, "cancel"),
+            (InsertAction::Submit, "submit"),
+            (InsertAction::AcceptSuggestion, "accept_suggestion"),
+            (InsertAction::NextSuggestion, "next_suggestion"),
+            (InsertAction::PrevSuggestion, "prev_suggestion"),
+        ],
+    )
+}
+
+fn invert_view(km: &Keymap) -> Vec<(String, Vec<String>)> {
+    invert_map(
+        &km.view,
+        &[
+            (ViewAction::Back, "back"),
+            (ViewAction::ScrollDown, "scroll_down"),
+            (ViewAction::ScrollUp, "scroll_up"),
+            (ViewAction::Interact, "interact"),
+            (ViewAction::ToggleAutoscroll, "toggle_autoscroll"),
+            (ViewAction::KillWorker, "kill_worker"),
+            (ViewAction::Export, "export"),
+        ],
+    )
+}
+
+fn invert_interact(km: &Keymap) -> Vec<(String, Vec<String>)> {
+    invert_map(
+        &km.interact,
+        &[
+            (InteractAction::Back, "back"),
+            (InteractAction::Send, "send"),
+        ],
+    )
+}
+
+fn invert_filter(km: &Keymap) -> Vec<(String, Vec<String>)> {
+    invert_map(
+        &km.filter,
+        &[
+            (FilterAction::Confirm, "confirm"),
+            (FilterAction::Cancel, "cancel"),
+        ],
+    )
+}
+
+fn keys_set(args: &[String]) -> i32 {
+    if args.len() < 3 {
+        eprintln!("Usage: clhorde keys set <mode> <action> <key1> [key2...]");
+        return 1;
+    }
+    let mode = &args[0];
+    let action = &args[1];
+    let keys: Vec<String> = args[2..].to_vec();
+
+    // Validate all keys
+    for k in &keys {
+        if keymap::parse_key(k).is_none() {
+            eprintln!("Invalid key: {k}");
+            return 1;
+        }
+    }
+
+    let mut config = keymap::load_toml_config();
+    if let Err(e) = set_toml_action(&mut config, mode, action, keys.clone()) {
+        eprintln!("{e}");
+        return 1;
+    }
+
+    if let Err(e) = keymap::save_toml_config(&config) {
+        eprintln!("Failed to save config: {e}");
+        return 1;
+    }
+
+    let keys_display: Vec<String> = keys.iter().map(|k| format!("\"{k}\"")).collect();
+    println!("Set {mode}.{action} = [{}]", keys_display.join(", "));
+    0
+}
+
+fn keys_reset(args: &[String]) -> i32 {
+    if args.is_empty() {
+        eprintln!("Usage: clhorde keys reset <mode> [action]");
+        return 1;
+    }
+    let mode = &args[0];
+    let action = args.get(1).map(|s| s.as_str());
+
+    let mut config = keymap::load_toml_config();
+    if let Err(e) = reset_toml_action(&mut config, mode, action) {
+        eprintln!("{e}");
+        return 1;
+    }
+
+    if let Err(e) = keymap::save_toml_config(&config) {
+        eprintln!("Failed to save config: {e}");
+        return 1;
+    }
+
+    match action {
+        Some(a) => println!("Reset {mode}.{a} to default."),
+        None => println!("Reset all {mode} bindings to defaults."),
+    }
+    0
+}
+
+// ── config subcommands ──
+
+fn cmd_config(args: &[String]) -> i32 {
+    match args.first().map(|s| s.as_str()) {
+        Some("path") => config_path(),
+        Some("edit") => config_edit(),
+        Some("init") => config_init(args.get(1).map(|s| s.as_str()) == Some("--force")),
+        _ => {
+            eprintln!("Usage: clhorde config <path|edit|init>");
+            eprintln!("  path          Print config file path");
+            eprintln!("  edit          Open config in $EDITOR");
+            eprintln!("  init [--force] Create config with defaults");
+            1
+        }
+    }
+}
+
+fn config_path() -> i32 {
+    match keymap::config_path() {
+        Some(p) => {
+            println!("{}", p.display());
+            0
+        }
+        None => {
+            eprintln!("Cannot determine config path.");
+            1
+        }
+    }
+}
+
+fn config_edit() -> i32 {
+    let path = match keymap::config_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("Cannot determine config path.");
+            return 1;
+        }
+    };
+
+    // Create file with defaults if it doesn't exist
+    if !path.exists() {
+        let config = keymap::default_toml_config();
+        if let Err(e) = keymap::save_toml_config(&config) {
+            eprintln!("Failed to create config file: {e}");
+            return 1;
+        }
+    }
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    match std::process::Command::new(&editor)
+        .arg(&path)
+        .status()
+    {
+        Ok(status) => {
+            if status.success() {
+                0
+            } else {
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to open editor '{editor}': {e}");
+            1
+        }
+    }
+}
+
+fn config_init(force: bool) -> i32 {
+    let path = match keymap::config_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("Cannot determine config path.");
+            return 1;
+        }
+    };
+
+    if path.exists() && !force {
+        eprintln!("Config file already exists: {}", path.display());
+        eprintln!("Use --force to overwrite.");
+        return 1;
+    }
+
+    let config = keymap::default_toml_config();
+    if let Err(e) = keymap::save_toml_config(&config) {
+        eprintln!("Failed to write config: {e}");
+        return 1;
+    }
+    println!("Created config: {}", path.display());
+    0
+}
+
+// ── helpers ──
+
+fn action_names_for_mode(mode: &str) -> Option<Vec<&'static str>> {
+    match mode {
+        "normal" => Some(vec![
+            "quit",
+            "insert",
+            "select_next",
+            "select_prev",
+            "view_output",
+            "interact",
+            "increase_workers",
+            "decrease_workers",
+            "toggle_mode",
+            "retry",
+            "move_up",
+            "move_down",
+            "search",
+        ]),
+        "insert" => Some(vec![
+            "cancel",
+            "submit",
+            "accept_suggestion",
+            "next_suggestion",
+            "prev_suggestion",
+        ]),
+        "view" => Some(vec![
+            "back",
+            "scroll_down",
+            "scroll_up",
+            "interact",
+            "toggle_autoscroll",
+            "kill_worker",
+            "export",
+        ]),
+        "interact" => Some(vec!["back", "send"]),
+        "filter" => Some(vec!["confirm", "cancel"]),
+        _ => None,
+    }
+}
+
+fn set_toml_action(
+    config: &mut TomlConfig,
+    mode: &str,
+    action: &str,
+    keys: Vec<String>,
+) -> Result<(), String> {
+    let valid = action_names_for_mode(mode)
+        .ok_or_else(|| format!("Unknown mode: {mode}\nValid modes: normal, insert, view, interact, filter"))?;
+    if !valid.contains(&action) {
+        return Err(format!(
+            "Unknown action '{action}' for mode '{mode}'.\nValid actions: {}",
+            valid.join(", ")
+        ));
+    }
+
+    let keys = Some(keys);
+
+    match mode {
+        "normal" => {
+            let b = config.normal.get_or_insert_with(TomlNormalBindings::default);
+            match action {
+                "quit" => b.quit = keys,
+                "insert" => b.insert = keys,
+                "select_next" => b.select_next = keys,
+                "select_prev" => b.select_prev = keys,
+                "view_output" => b.view_output = keys,
+                "interact" => b.interact = keys,
+                "increase_workers" => b.increase_workers = keys,
+                "decrease_workers" => b.decrease_workers = keys,
+                "toggle_mode" => b.toggle_mode = keys,
+                "retry" => b.retry = keys,
+                "move_up" => b.move_up = keys,
+                "move_down" => b.move_down = keys,
+                "search" => b.search = keys,
+                _ => unreachable!(),
+            }
+        }
+        "insert" => {
+            let b = config.insert.get_or_insert_with(TomlInsertBindings::default);
+            match action {
+                "cancel" => b.cancel = keys,
+                "submit" => b.submit = keys,
+                "accept_suggestion" => b.accept_suggestion = keys,
+                "next_suggestion" => b.next_suggestion = keys,
+                "prev_suggestion" => b.prev_suggestion = keys,
+                _ => unreachable!(),
+            }
+        }
+        "view" => {
+            let b = config.view.get_or_insert_with(TomlViewBindings::default);
+            match action {
+                "back" => b.back = keys,
+                "scroll_down" => b.scroll_down = keys,
+                "scroll_up" => b.scroll_up = keys,
+                "interact" => b.interact = keys,
+                "toggle_autoscroll" => b.toggle_autoscroll = keys,
+                "kill_worker" => b.kill_worker = keys,
+                "export" => b.export = keys,
+                _ => unreachable!(),
+            }
+        }
+        "interact" => {
+            let b = config.interact.get_or_insert_with(TomlInteractBindings::default);
+            match action {
+                "back" => b.back = keys,
+                "send" => b.send = keys,
+                _ => unreachable!(),
+            }
+        }
+        "filter" => {
+            let b = config.filter.get_or_insert_with(TomlFilterBindings::default);
+            match action {
+                "confirm" => b.confirm = keys,
+                "cancel" => b.cancel = keys,
+                _ => unreachable!(),
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn reset_toml_action(
+    config: &mut TomlConfig,
+    mode: &str,
+    action: Option<&str>,
+) -> Result<(), String> {
+    if let Some(action) = action {
+        let valid = action_names_for_mode(mode)
+            .ok_or_else(|| format!("Unknown mode: {mode}\nValid modes: normal, insert, view, interact, filter"))?;
+        if !valid.contains(&action) {
+            return Err(format!(
+                "Unknown action '{action}' for mode '{mode}'.\nValid actions: {}",
+                valid.join(", ")
+            ));
+        }
+    } else {
+        // Validate mode even when resetting all
+        if action_names_for_mode(mode).is_none() {
+            return Err(format!(
+                "Unknown mode: {mode}\nValid modes: normal, insert, view, interact, filter"
+            ));
+        }
+    }
+
+    match (mode, action) {
+        ("normal", None) => config.normal = None,
+        ("normal", Some(a)) => {
+            if let Some(b) = config.normal.as_mut() {
+                match a {
+                    "quit" => b.quit = None,
+                    "insert" => b.insert = None,
+                    "select_next" => b.select_next = None,
+                    "select_prev" => b.select_prev = None,
+                    "view_output" => b.view_output = None,
+                    "interact" => b.interact = None,
+                    "increase_workers" => b.increase_workers = None,
+                    "decrease_workers" => b.decrease_workers = None,
+                    "toggle_mode" => b.toggle_mode = None,
+                    "retry" => b.retry = None,
+                    "move_up" => b.move_up = None,
+                    "move_down" => b.move_down = None,
+                    "search" => b.search = None,
+                    _ => unreachable!(),
+                }
+            }
+        }
+        ("insert", None) => config.insert = None,
+        ("insert", Some(a)) => {
+            if let Some(b) = config.insert.as_mut() {
+                match a {
+                    "cancel" => b.cancel = None,
+                    "submit" => b.submit = None,
+                    "accept_suggestion" => b.accept_suggestion = None,
+                    "next_suggestion" => b.next_suggestion = None,
+                    "prev_suggestion" => b.prev_suggestion = None,
+                    _ => unreachable!(),
+                }
+            }
+        }
+        ("view", None) => config.view = None,
+        ("view", Some(a)) => {
+            if let Some(b) = config.view.as_mut() {
+                match a {
+                    "back" => b.back = None,
+                    "scroll_down" => b.scroll_down = None,
+                    "scroll_up" => b.scroll_up = None,
+                    "interact" => b.interact = None,
+                    "toggle_autoscroll" => b.toggle_autoscroll = None,
+                    "kill_worker" => b.kill_worker = None,
+                    "export" => b.export = None,
+                    _ => unreachable!(),
+                }
+            }
+        }
+        ("interact", None) => config.interact = None,
+        ("interact", Some(a)) => {
+            if let Some(b) = config.interact.as_mut() {
+                match a {
+                    "back" => b.back = None,
+                    "send" => b.send = None,
+                    _ => unreachable!(),
+                }
+            }
+        }
+        ("filter", None) => config.filter = None,
+        ("filter", Some(a)) => {
+            if let Some(b) = config.filter.as_mut() {
+                match a {
+                    "confirm" => b.confirm = None,
+                    "cancel" => b.cancel = None,
+                    _ => unreachable!(),
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_names_for_all_modes() {
+        assert!(action_names_for_mode("normal").is_some());
+        assert!(action_names_for_mode("insert").is_some());
+        assert!(action_names_for_mode("view").is_some());
+        assert!(action_names_for_mode("interact").is_some());
+        assert!(action_names_for_mode("filter").is_some());
+        assert!(action_names_for_mode("bogus").is_none());
+    }
+
+    #[test]
+    fn set_toml_action_normal() {
+        let mut config = TomlConfig::default();
+        set_toml_action(&mut config, "normal", "quit", vec!["Q".into()]).unwrap();
+        assert_eq!(
+            config.normal.as_ref().unwrap().quit,
+            Some(vec!["Q".into()])
+        );
+    }
+
+    #[test]
+    fn set_toml_action_invalid_mode() {
+        let mut config = TomlConfig::default();
+        let err = set_toml_action(&mut config, "bogus", "quit", vec!["q".into()]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn set_toml_action_invalid_action() {
+        let mut config = TomlConfig::default();
+        let err = set_toml_action(&mut config, "normal", "bogus", vec!["q".into()]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn set_toml_action_all_modes() {
+        let mut config = TomlConfig::default();
+        set_toml_action(&mut config, "insert", "cancel", vec!["Esc".into()]).unwrap();
+        assert_eq!(
+            config.insert.as_ref().unwrap().cancel,
+            Some(vec!["Esc".into()])
+        );
+
+        set_toml_action(&mut config, "view", "back", vec!["Esc".into(), "q".into()]).unwrap();
+        assert_eq!(
+            config.view.as_ref().unwrap().back,
+            Some(vec!["Esc".into(), "q".into()])
+        );
+
+        set_toml_action(&mut config, "interact", "send", vec!["Enter".into()]).unwrap();
+        assert_eq!(
+            config.interact.as_ref().unwrap().send,
+            Some(vec!["Enter".into()])
+        );
+
+        set_toml_action(&mut config, "filter", "confirm", vec!["Enter".into()]).unwrap();
+        assert_eq!(
+            config.filter.as_ref().unwrap().confirm,
+            Some(vec!["Enter".into()])
+        );
+    }
+
+    #[test]
+    fn reset_toml_action_single() {
+        let mut config = TomlConfig::default();
+        set_toml_action(&mut config, "normal", "quit", vec!["Q".into()]).unwrap();
+        assert!(config.normal.as_ref().unwrap().quit.is_some());
+
+        reset_toml_action(&mut config, "normal", Some("quit")).unwrap();
+        assert!(config.normal.as_ref().unwrap().quit.is_none());
+    }
+
+    #[test]
+    fn reset_toml_action_whole_mode() {
+        let mut config = TomlConfig::default();
+        set_toml_action(&mut config, "normal", "quit", vec!["Q".into()]).unwrap();
+        assert!(config.normal.is_some());
+
+        reset_toml_action(&mut config, "normal", None).unwrap();
+        assert!(config.normal.is_none());
+    }
+
+    #[test]
+    fn reset_toml_action_invalid_mode() {
+        let mut config = TomlConfig::default();
+        let err = reset_toml_action(&mut config, "bogus", None);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn reset_toml_action_invalid_action() {
+        let mut config = TomlConfig::default();
+        let err = reset_toml_action(&mut config, "normal", Some("bogus"));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn roundtrip_serialization() {
+        let config = keymap::default_toml_config();
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: TomlConfig = toml::from_str(&serialized).unwrap();
+
+        // Verify normal mode round-trips
+        let orig_normal = config.normal.as_ref().unwrap();
+        let deser_normal = deserialized.normal.as_ref().unwrap();
+        assert_eq!(orig_normal.quit, deser_normal.quit);
+        assert_eq!(orig_normal.insert, deser_normal.insert);
+        assert_eq!(orig_normal.select_next, deser_normal.select_next);
+
+        // Verify view mode round-trips
+        let orig_view = config.view.as_ref().unwrap();
+        let deser_view = deserialized.view.as_ref().unwrap();
+        assert_eq!(orig_view.back, deser_view.back);
+        assert_eq!(orig_view.scroll_down, deser_view.scroll_down);
+    }
+
+    #[test]
+    fn run_returns_none_for_tui_args() {
+        // No subcommand -> None (proceed to TUI)
+        assert!(run(&["clhorde".into()]).is_none());
+        // --restore is not a subcommand
+        assert!(run(&["clhorde".into(), "--restore".into()]).is_none());
+    }
+
+    #[test]
+    fn run_dispatches_subcommands() {
+        // These should return Some (handled), even if the subcommand fails
+        assert!(run(&["clhorde".into(), "qp".into()]).is_some());
+        assert!(run(&["clhorde".into(), "keys".into()]).is_some());
+        assert!(run(&["clhorde".into(), "config".into()]).is_some());
+    }
+
+    #[test]
+    fn run_dispatches_help() {
+        assert_eq!(run(&["clhorde".into(), "help".into()]), Some(0));
+        assert_eq!(run(&["clhorde".into(), "--help".into()]), Some(0));
+        assert_eq!(run(&["clhorde".into(), "-h".into()]), Some(0));
+    }
+}

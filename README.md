@@ -71,9 +71,44 @@ Requires:
 ```bash
 clhorde              # fresh session
 clhorde --restore    # restore previous session
+clhorde --help       # show help
 ```
 
 That's it. You'll see the TUI. Press `i` to start typing a prompt.
+
+## CLI commands
+
+clhorde includes subcommands for managing configuration without hand-editing TOML files.
+
+### Quick prompts
+
+```bash
+clhorde qp list              # list all quick prompts
+clhorde qp add g "let's go"  # add a quick prompt on key 'g'
+clhorde qp remove g          # remove a quick prompt
+```
+
+### Keybindings
+
+```bash
+clhorde keys list             # list all keybindings
+clhorde keys list normal      # list normal mode only
+clhorde keys set normal quit Q          # set quit to Q
+clhorde keys set view back Esc q        # set multiple keys
+clhorde keys reset normal quit          # reset one action to default
+clhorde keys reset normal               # reset entire mode to defaults
+```
+
+Valid modes: `normal`, `insert`, `view`, `interact`, `filter`.
+
+### Config file
+
+```bash
+clhorde config path           # print config file path
+clhorde config init           # create config with all defaults
+clhorde config init --force   # overwrite existing config
+clhorde config edit           # open config in $EDITOR (or vi)
+```
 
 ## Keybindings
 
