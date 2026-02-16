@@ -1343,6 +1343,7 @@ mod tests {
     #[test]
     fn history_empty_is_noop() {
         let mut app = App::new();
+        app.history.clear();
         app.input = "current".to_string();
         app.history_prev();
         assert_eq!(app.input, "current");
