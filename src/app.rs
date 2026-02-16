@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 
@@ -64,6 +64,8 @@ pub struct App {
     pub template_suggestions: Vec<String>,
     /// Selected template suggestion index.
     pub template_suggestion_index: usize,
+    /// Whether the quick prompts popup is visible (toggled by Ctrl+P in view mode).
+    pub show_quick_prompts_popup: bool,
 }
 
 impl App {
@@ -101,6 +103,7 @@ impl App {
             templates,
             template_suggestions: Vec::new(),
             template_suggestion_index: 0,
+            show_quick_prompts_popup: false,
         }
     }
 
@@ -487,6 +490,22 @@ impl App {
     }
 
     fn handle_view_key(&mut self, key: KeyEvent) {
+        // Ctrl+P toggles quick prompts popup
+        if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.show_quick_prompts_popup = !self.show_quick_prompts_popup;
+            return;
+        }
+
+        // When popup is visible, any other key closes it
+        if self.show_quick_prompts_popup {
+            self.show_quick_prompts_popup = false;
+            // If it's Esc, consume it (don't also leave view mode)
+            if key.code == KeyCode::Esc {
+                return;
+            }
+            // Otherwise fall through to normal view mode handling (including quick prompt dispatch)
+        }
+
         // View actions take priority
         let Some(action) = self.keymap.view.get(&key.code) else {
             // Fallback: check quick prompts
@@ -495,6 +514,7 @@ impl App {
         };
         match action {
             ViewAction::Back => {
+                self.show_quick_prompts_popup = false;
                 self.mode = AppMode::Normal;
                 self.scroll_offset = 0;
             }
@@ -509,6 +529,7 @@ impl App {
                     if prompt.status == PromptStatus::Running
                         || prompt.status == PromptStatus::Idle
                     {
+                        self.show_quick_prompts_popup = false;
                         self.interact_input.clear();
                         self.mode = AppMode::Interact;
                     }

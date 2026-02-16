@@ -26,6 +26,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_suggestions(f, app, chunks[2]);
     render_template_suggestions(f, app, chunks[2]);
 
+    if app.show_quick_prompts_popup && app.mode == AppMode::ViewOutput {
+        render_quick_prompts_popup(f, app, chunks[1]);
+    }
+
     if app.confirm_quit {
         render_quit_confirmation(f, f.area());
     }
@@ -576,6 +580,81 @@ fn render_quit_confirmation(f: &mut Frame, area: Rect) {
     f.render_widget(paragraph, popup_area);
 }
 
+fn render_quick_prompts_popup(f: &mut Frame, app: &App, main_area: Rect) {
+    let qp = app.keymap.quick_prompt_help();
+
+    // Compute the output panel area (right 60% of main_area)
+    let output_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(main_area)[1];
+
+    let lines: Vec<Line> = if qp.is_empty() {
+        vec![Line::from(Span::styled(
+            "  No quick prompts configured.",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        qp.iter()
+            .map(|(key, msg)| {
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{key:>3}"),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(msg.as_str(), Style::default().fg(Color::Gray)),
+                ])
+            })
+            .collect()
+    };
+
+    let content_height = lines.len() as u16 + 2; // +2 for borders
+    let max_width: u16 = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.len() as u16).sum::<u16>())
+        .max()
+        .unwrap_or(30)
+        + 4; // padding
+    let width = max_width.min(60).min(output_area.width.saturating_sub(4));
+    let height = content_height.min(output_area.height.saturating_sub(2));
+
+    // Center in the output panel
+    let x = output_area.x + (output_area.width.saturating_sub(width)) / 2;
+    let y = output_area.y + (output_area.height.saturating_sub(height)) / 2;
+
+    let popup_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(Span::styled(
+                    " Quick Prompts ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .title_bottom(Line::from(Span::styled(
+                    " Esc to close ",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+        )
+        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(paragraph, popup_area);
+}
+
 fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let bindings: Vec<(String, &str)> = match app.mode {
         AppMode::Normal => app.keymap.normal_help(),
@@ -596,6 +675,58 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ));
         spans.push(Span::styled(
             format!(":{desc}"),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
+    // In view mode, append quick prompt hints and Ctrl+P
+    if app.mode == AppMode::ViewOutput {
+        let qp = app.keymap.quick_prompt_help();
+        if !qp.is_empty() {
+            spans.push(Span::styled(
+                " \u{2502} ",
+                Style::default().fg(Color::Rgb(60, 60, 60)),
+            ));
+            let show_count = qp.len().min(3);
+            for (i, (key, msg)) in qp.iter().take(show_count).enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(
+                        "  ",
+                        Style::default().fg(Color::Rgb(60, 60, 60)),
+                    ));
+                }
+                spans.push(Span::styled(
+                    key.clone(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                let display_msg = if msg.len() > 15 {
+                    format!(":{}…", &msg[..14])
+                } else {
+                    format!(":{msg}")
+                };
+                spans.push(Span::styled(display_msg, Style::default().fg(Color::Gray)));
+            }
+            if qp.len() > 3 {
+                spans.push(Span::styled(
+                    format!(" +{}", qp.len() - 3),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+        spans.push(Span::styled(
+            " \u{2502} ",
+            Style::default().fg(Color::Rgb(60, 60, 60)),
+        ));
+        spans.push(Span::styled(
+            "C-p",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            ":all prompts",
             Style::default().fg(Color::Gray),
         ));
     }

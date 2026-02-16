@@ -571,6 +571,17 @@ impl Keymap {
         }
     }
 
+    /// Return quick prompts sorted by key display, as (key_display, message) pairs.
+    pub fn quick_prompt_help(&self) -> Vec<(String, String)> {
+        let mut entries: Vec<_> = self
+            .quick_prompts
+            .iter()
+            .map(|(kc, msg)| (key_display(kc), msg.clone()))
+            .collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        entries
+    }
+
     fn build_help<A: PartialEq + Copy>(
         &self,
         map: &HashMap<KeyCode, A>,
@@ -840,6 +851,30 @@ c = "continue"
             km.quick_prompts.get(&KeyCode::Char('c')),
             Some(&"continue".to_string())
         );
+    }
+
+    #[test]
+    fn quick_prompt_help_sorted() {
+        let toml_str = r#"
+[quick_prompts]
+y = "yes"
+c = "continue"
+g = "let's go"
+"#;
+        let config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let km = Keymap::from_toml(config);
+
+        let help = km.quick_prompt_help();
+        assert_eq!(help.len(), 3);
+        assert_eq!(help[0], ("c".to_string(), "continue".to_string()));
+        assert_eq!(help[1], ("g".to_string(), "let's go".to_string()));
+        assert_eq!(help[2], ("y".to_string(), "yes".to_string()));
+    }
+
+    #[test]
+    fn quick_prompt_help_empty() {
+        let km = Keymap::default();
+        assert!(km.quick_prompt_help().is_empty());
     }
 
     #[test]
