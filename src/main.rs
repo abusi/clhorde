@@ -27,6 +27,7 @@ async fn main() -> io::Result<()> {
     }
 
     let restore = args.iter().any(|a| a == "--restore");
+    let fresh = args.iter().any(|a| a == "--fresh");
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -34,7 +35,7 @@ async fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, restore).await;
+    let result = run_app(&mut terminal, restore, fresh).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -47,11 +48,17 @@ async fn main() -> io::Result<()> {
     Ok(())
 }
 
-async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, restore: bool) -> io::Result<()> {
+async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, restore: bool, fresh: bool) -> io::Result<()> {
     let mut app = App::new();
 
-    if restore {
+    if fresh {
+        // Clear cache on startup
+        app.clear_cache();
+    } else if restore {
         app.load_session();
+    } else {
+        // Always load cache (prompt history)
+        app.load_cache();
     }
 
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<WorkerMessage>();
@@ -144,7 +151,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, restore:
         }
 
         if app.should_quit {
-            // Save session before quitting
+            // Save cache before quitting
+            app.save_cache();
+            // Also save session for backward compatibility
             app.save_session();
 
             // Send Kill to all active workers

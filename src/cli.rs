@@ -29,6 +29,7 @@ fn cmd_help() -> i32 {
     println!("Commands:");
     println!("  (none)              Launch the TUI");
     println!("  --restore           Launch the TUI and restore previous session");
+    println!("  --fresh             Launch the TUI with cleared cache (no history)");
     println!("  qp                  Manage quick prompts");
     println!("    list              List all quick prompts");
     println!("    add <key> <msg>   Add a quick prompt");
@@ -225,6 +226,9 @@ fn invert_normal(km: &Keymap) -> Vec<(String, Vec<String>)> {
             (NormalAction::MoveUp, "move_up"),
             (NormalAction::MoveDown, "move_down"),
             (NormalAction::Search, "search"),
+            (NormalAction::StartPending, "start_pending"),
+            (NormalAction::ClearHistory, "clear_history"),
+            (NormalAction::RemovePrompt, "remove_prompt"),
         ],
     )
 }
@@ -445,6 +449,9 @@ fn action_names_for_mode(mode: &str) -> Option<Vec<&'static str>> {
             "move_up",
             "move_down",
             "search",
+            "start_pending",
+            "clear_history",
+            "remove_prompt",
         ]),
         "insert" => Some(vec![
             "cancel",
@@ -502,6 +509,9 @@ fn set_toml_action(
                 "move_up" => b.move_up = keys,
                 "move_down" => b.move_down = keys,
                 "search" => b.search = keys,
+                "start_pending" => b.start_pending = keys,
+                "clear_history" => b.clear_history = keys,
+                "remove_prompt" => b.remove_prompt = keys,
                 _ => unreachable!(),
             }
         }
@@ -591,6 +601,9 @@ fn reset_toml_action(
                     "move_up" => b.move_up = None,
                     "move_down" => b.move_down = None,
                     "search" => b.search = None,
+                    "start_pending" => b.start_pending = None,
+                    "clear_history" => b.clear_history = None,
+                    "remove_prompt" => b.remove_prompt = None,
                     _ => unreachable!(),
                 }
             }

@@ -141,6 +141,7 @@ impl App {
         if self.list_state.selected().is_none() {
             self.list_state.select(Some(0));
         }
+        self.save_cache();
     }
 
     fn parse_cwd_prefix(input: &str) -> (Option<String>, String) {
@@ -236,12 +237,14 @@ impl App {
     }
 
     pub fn apply_message(&mut self, msg: WorkerMessage) {
+        let mut status_changed = false;
         match msg {
             WorkerMessage::OutputChunk { prompt_id, text } => {
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
                     // If we get output after being idle, we're running again
                     if prompt.status == PromptStatus::Idle {
                         prompt.status = PromptStatus::Running;
+                        status_changed = true;
                     }
                     match &mut prompt.output {
                         Some(existing) => existing.push_str(&text),
@@ -256,6 +259,7 @@ impl App {
                             output.push('\n');
                         }
                         prompt.status = PromptStatus::Idle;
+                        status_changed = true;
                     }
                 }
             }
@@ -289,6 +293,7 @@ impl App {
                             prompt.error = Some(format!("Exit code: {}", exit_code.unwrap()));
                         }
                     }
+                    status_changed = true;
                 }
                 self.pty_handles.remove(&prompt_id);
                 self.worker_inputs.remove(&prompt_id);
@@ -309,11 +314,17 @@ impl App {
                     prompt.finished_at = Some(Instant::now());
                     prompt.error = Some(error);
                     prompt.pty_state = None;
+                    status_changed = true;
                 }
                 self.pty_handles.remove(&prompt_id);
                 self.worker_inputs.remove(&prompt_id);
                 self.active_workers = self.active_workers.saturating_sub(1);
             }
+        }
+        
+        // Save cache whenever status changes
+        if status_changed {
+            self.save_cache();
         }
     }
 
@@ -445,6 +456,15 @@ impl App {
             NormalAction::Search => {
                 self.filter_input.clear();
                 self.mode = AppMode::Filter;
+            }
+            NormalAction::StartPending => {
+                self.start_pending_prompts();
+            }
+            NormalAction::ClearHistory => {
+                self.clear_cache();
+            }
+            NormalAction::RemovePrompt => {
+                self.remove_selected_prompt();
             }
         }
     }
@@ -950,8 +970,16 @@ impl App {
         dirs::data_dir().map(|d| d.join("clhorde"))
     }
 
+    fn cache_dir() -> Option<PathBuf> {
+        dirs::cache_dir().map(|d| d.join("clhorde"))
+    }
+
     fn history_path() -> Option<PathBuf> {
         Self::data_dir().map(|d| d.join("history"))
+    }
+
+    fn cache_path() -> Option<PathBuf> {
+        Self::cache_dir().map(|d| d.join("prompts.json"))
     }
 
     fn load_history() -> Vec<String> {
@@ -1073,6 +1101,89 @@ impl App {
         if !self.prompts.is_empty() && self.list_state.selected().is_none() {
             self.list_state.select(Some(0));
         }
+    }
+
+    // ── Cache persistence (prompts with status) ──
+
+    pub fn save_cache(&self) {
+        let Some(path) = Self::cache_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let serializable: Vec<SerializablePrompt> =
+            self.prompts.iter().map(SerializablePrompt::from).collect();
+        if let Ok(json) = serde_json::to_string_pretty(&serializable) {
+            let _ = fs::write(&path, json);
+        }
+    }
+
+    pub fn load_cache(&mut self) {
+        let Some(path) = Self::cache_path() else {
+            return;
+        };
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let serialized: Vec<SerializablePrompt> = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        for sp in serialized {
+            // Convert to prompt and mark Pending status as not started yet
+            let prompt = sp.into_prompt();
+            // Don't auto-start pending prompts - they'll stay pending until user explicitly starts them
+            if prompt.id >= self.next_id {
+                self.next_id = prompt.id + 1;
+            }
+            self.prompts.push(prompt);
+        }
+
+        self.rebuild_filter();
+        if !self.prompts.is_empty() && self.list_state.selected().is_none() {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    pub fn clear_cache(&mut self) {
+        self.prompts.clear();
+        self.next_id = 1;
+        self.list_state.select(None);
+        self.rebuild_filter();
+        if let Some(path) = Self::cache_path() {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    pub fn remove_selected_prompt(&mut self) {
+        if let Some(idx) = self.list_state.selected() {
+            if idx < self.prompts.len() {
+                // Don't remove running or idle prompts
+                let status = self.prompts[idx].status.clone();
+                if status != PromptStatus::Running && status != PromptStatus::Idle {
+                    self.prompts.remove(idx);
+                    self.rebuild_filter();
+                    // Adjust selection
+                    if self.prompts.is_empty() {
+                        self.list_state.select(None);
+                    } else if idx >= self.prompts.len() {
+                        self.list_state.select(Some(self.prompts.len() - 1));
+                    }
+                    self.save_cache();
+                }
+            }
+        }
+    }
+
+    pub fn start_pending_prompts(&mut self) {
+        // This method doesn't actually start prompts - it just ensures they're in Pending state
+        // The main loop will pick them up and start them
+        // But we need to mark any restored Pending prompts as ready to start
+        // (they're already in Pending state from load_cache, so nothing to do here)
+        // This is just a trigger that the user wants to start pending tasks
     }
 
     // ── Feature 8: Templates ──

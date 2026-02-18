@@ -22,6 +22,9 @@ pub enum NormalAction {
     MoveUp,
     MoveDown,
     Search,
+    StartPending,
+    ClearHistory,
+    RemovePrompt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +87,9 @@ impl Default for Keymap {
         normal.insert(KeyCode::Char('J'), NormalAction::MoveDown);
         normal.insert(KeyCode::Char('K'), NormalAction::MoveUp);
         normal.insert(KeyCode::Char('/'), NormalAction::Search);
+        normal.insert(KeyCode::Char('p'), NormalAction::StartPending);
+        normal.insert(KeyCode::Char('C'), NormalAction::ClearHistory);
+        normal.insert(KeyCode::Char('d'), NormalAction::RemovePrompt);
 
         let mut insert = HashMap::new();
         insert.insert(KeyCode::Esc, InsertAction::Cancel);
@@ -169,6 +175,12 @@ pub(crate) struct TomlNormalBindings {
     pub(crate) move_down: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) search: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) start_pending: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) clear_history: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) remove_prompt: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -292,6 +304,9 @@ impl Keymap {
             apply_bindings(&mut keymap.normal, NormalAction::MoveUp, normal.move_up);
             apply_bindings(&mut keymap.normal, NormalAction::MoveDown, normal.move_down);
             apply_bindings(&mut keymap.normal, NormalAction::Search, normal.search);
+            apply_bindings(&mut keymap.normal, NormalAction::StartPending, normal.start_pending);
+            apply_bindings(&mut keymap.normal, NormalAction::ClearHistory, normal.clear_history);
+            apply_bindings(&mut keymap.normal, NormalAction::RemovePrompt, normal.remove_prompt);
         }
 
         if let Some(insert) = config.insert {
@@ -404,6 +419,9 @@ pub(crate) fn default_toml_config() -> TomlConfig {
             move_up: Some(keys_to_strings(&km.normal, NormalAction::MoveUp)),
             move_down: Some(keys_to_strings(&km.normal, NormalAction::MoveDown)),
             search: Some(keys_to_strings(&km.normal, NormalAction::Search)),
+            start_pending: Some(keys_to_strings(&km.normal, NormalAction::StartPending)),
+            clear_history: Some(keys_to_strings(&km.normal, NormalAction::ClearHistory)),
+            remove_prompt: Some(keys_to_strings(&km.normal, NormalAction::RemovePrompt)),
         }),
         insert: Some(TomlInsertBindings {
             cancel: Some(keys_to_strings(&km.insert, InsertAction::Cancel)),
