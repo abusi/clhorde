@@ -50,6 +50,8 @@ No tmux. No git worktrees. No Python. No Node. Just a single Rust binary and the
 - **Search/filter** — press `/` to live-filter prompts by text
 - **Prompt history** — `Up`/`Down` in insert mode cycles through previously submitted prompts
 - **Session persistence** — auto-saves on quit, restore with `--restore`
+- **Persistent cache** — all prompts saved to `~/.cache/clhorde/prompts.json`, auto-loaded on startup (pending tasks don't auto-start)
+- **History management** — press `p` to start pending prompts, `C` to clear all history, `d` to remove selected prompt
 - **Prompt templates** — define reusable prompt snippets, expand with `:name` + Tab
 - **Quit confirmation** — warns before quitting with active workers
 - **Graceful shutdown** — sends EOF to all workers on quit, no orphaned processes
@@ -70,8 +72,9 @@ Requires:
 ## Usage
 
 ```bash
-clhorde              # fresh session
+clhorde              # load cached prompts (no auto-start)
 clhorde --restore    # restore previous session
+clhorde --fresh      # start with cleared cache
 clhorde --help       # show help
 ```
 
@@ -123,6 +126,9 @@ clhorde config edit           # open config in $EDITOR (or vi)
 | `r` | Retry selected completed/failed prompt |
 | `J` / `K` | Move selected pending prompt down/up in queue |
 | `/` | Enter filter mode (search prompts) |
+| `p` | Start all pending prompts |
+| `d` | Remove selected prompt from history |
+| `C` | Clear all prompt history |
 | `+` / `-` | Increase / decrease max workers (1–20) |
 | `m` | Toggle prompt mode (interactive / one-shot) |
 | `q` | Quit (confirms if workers active) |

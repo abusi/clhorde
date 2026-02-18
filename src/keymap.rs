@@ -527,6 +527,9 @@ impl Keymap {
             (NormalAction::IncreaseWorkers, "more wkrs"),
             (NormalAction::DecreaseWorkers, "less wkrs"),
             (NormalAction::ToggleMode, "mode"),
+            (NormalAction::StartPending, "start pend"),
+            (NormalAction::ClearHistory, "clear all"),
+            (NormalAction::RemovePrompt, "remove"),
         ];
         self.build_help(&self.normal, entries)
     }
