@@ -49,7 +49,6 @@ No tmux. No git worktrees. No Python. No Node. Just a single Rust binary and the
 - **Reorder queue** — move pending prompts up/down with `J`/`K`
 - **Search/filter** — press `/` to live-filter prompts by text
 - **Prompt history** — `Up`/`Down` in insert mode cycles through previously submitted prompts
-- **Session persistence** — auto-saves on quit, restore with `--restore`
 - **Persistent cache** — all prompts saved to `~/.cache/clhorde/prompts.json`, auto-loaded on startup (pending tasks don't auto-start)
 - **History management** — press `p` to start pending prompts, `C` to clear all history, `d` to remove selected prompt
 - **Prompt templates** — define reusable prompt snippets, expand with `:name` + Tab
@@ -73,7 +72,6 @@ Requires:
 
 ```bash
 clhorde              # load cached prompts (no auto-start)
-clhorde --restore    # restore previous session
 clhorde --fresh      # start with cleared cache
 clhorde --help       # show help
 ```
@@ -223,15 +221,19 @@ This is especially useful when combined with working directories. For example, t
 /path/to/project: Review this code for bugs and security issues:
 ```
 
-## Session persistence
+## Prompt history and cache
 
-clhorde automatically saves your session (all prompts and their outputs) to `~/.local/share/clhorde/session.json` when you quit. To restore a previous session:
+clhorde automatically saves all prompts (with their status and output) to `~/.cache/clhorde/prompts.json` when you quit or when a prompt's status changes. On startup, the cache is loaded automatically, but pending prompts won't start until you press `p`.
 
-```bash
-clhorde --restore
-```
+### Cache behavior
 
-Completed and failed prompts are restored as-is. Running/idle prompts (whose processes are gone) are restored as completed. Pending prompts are re-queued and will be dispatched to workers.
+- **Auto-saved**: Whenever a prompt changes status (completed, failed, etc.) or when you quit
+- **Auto-loaded**: On startup (unless you use `--fresh`)
+- **Pending prompts**: Restored in Pending state, but NOT auto-started
+- **Manual control**: Press `p` in Normal mode to start all pending prompts
+- **Cleanup**: Press `C` to clear all history, or `d` to remove a selected prompt
+
+The cache gives you persistent state across sessions without the overhead of a traditional session file. You can quit at any time and your work is preserved.
 
 ## Architecture
 
@@ -284,7 +286,7 @@ Completed and failed prompts are restored as-is. Running/idle prompts (whose pro
 
 clhorde supports two prompt modes, toggled with `m` in Normal mode:
 
-- **Interactive** (default) — spawns `claude "prompt" --dangerously-skip-permissions` in a real PTY. The right panel renders the full Claude Code TUI with colors, tool use, and formatting via `alacritty_terminal`. Press `s` to enter PTY Interact mode and type directly into the Claude session. When the process exits, the terminal output is extracted and stored for export/session persistence.
+- **Interactive** (default) — spawns `claude "prompt" --dangerously-skip-permissions` in a real PTY. The right panel renders the full Claude Code TUI with colors, tool use, and formatting via `alacritty_terminal`. Press `s` to enter PTY Interact mode and type directly into the Claude session. When the process exits, the terminal output is extracted and stored for export.
 - **One-shot** — spawns `claude -p "prompt text" --output-format stream-json`. The prompt is passed as a CLI argument. No stdin writer, no follow-ups. The process exits after responding and goes directly to Completed.
 
 The current default mode is shown in the status bar (`[interactive]` or `[one-shot]`). Each prompt remembers the mode it was created with.
@@ -298,7 +300,7 @@ The current default mode is shown in the status bar (`[interactive]` or `[one-sh
 5. **One-shot mode:** the worker spawns `claude -p "prompt" --output-format stream-json` and a reader thread parses streaming deltas as `OutputChunk` messages
 6. The UI renders output in real time with auto-scroll
 7. When Claude finishes (PTY EOF or process exit), the worker sends `Finished` and the prompt moves to `Completed`
-8. For PTY workers, the terminal text is extracted from the grid and stored for export/session persistence
+8. For PTY workers, the terminal text is extracted from the grid and stored for export
 9. The next queued prompt is automatically dispatched
 
 ## License

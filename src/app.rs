@@ -1056,53 +1056,6 @@ impl App {
         }
     }
 
-    // ── Feature 7: Session persistence ──
-
-    fn session_path() -> Option<PathBuf> {
-        Self::data_dir().map(|d| d.join("session.json"))
-    }
-
-    pub fn save_session(&self) {
-        let Some(path) = Self::session_path() else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let serializable: Vec<SerializablePrompt> =
-            self.prompts.iter().map(SerializablePrompt::from).collect();
-        if let Ok(json) = serde_json::to_string_pretty(&serializable) {
-            let _ = fs::write(&path, json);
-        }
-    }
-
-    pub fn load_session(&mut self) {
-        let Some(path) = Self::session_path() else {
-            return;
-        };
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let serialized: Vec<SerializablePrompt> = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-
-        for sp in serialized {
-            let prompt = sp.into_prompt();
-            if prompt.id >= self.next_id {
-                self.next_id = prompt.id + 1;
-            }
-            self.prompts.push(prompt);
-        }
-
-        self.rebuild_filter();
-        if !self.prompts.is_empty() && self.list_state.selected().is_none() {
-            self.list_state.select(Some(0));
-        }
-    }
-
     // ── Cache persistence (prompts with status) ──
 
     pub fn save_cache(&self) {
