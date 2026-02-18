@@ -100,7 +100,7 @@ Requires `claude` CLI to be installed and available in PATH.
 - `~/.config/clhorde/keymap.toml` — custom keybindings (see `keymap_example.toml`)
 - `~/.config/clhorde/templates.toml` — prompt templates
 - `~/.local/share/clhorde/history` — prompt history (auto-managed)
-- `~/.cache/clhorde/prompts.json` — prompt cache with full state (auto-saved on quit and status changes)
+- `~/.local/share/clhorde/prompts.json` — prompt cache with full state (auto-saved on quit and status changes)
 
 ### Templates format
 

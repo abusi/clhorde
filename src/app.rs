@@ -970,16 +970,12 @@ impl App {
         dirs::data_dir().map(|d| d.join("clhorde"))
     }
 
-    fn cache_dir() -> Option<PathBuf> {
-        dirs::cache_dir().map(|d| d.join("clhorde"))
-    }
-
     fn history_path() -> Option<PathBuf> {
         Self::data_dir().map(|d| d.join("history"))
     }
 
     fn cache_path() -> Option<PathBuf> {
-        Self::cache_dir().map(|d| d.join("prompts.json"))
+        Self::data_dir().map(|d| d.join("prompts.json"))
     }
 
     fn load_history() -> Vec<String> {

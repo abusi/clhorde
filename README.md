@@ -49,7 +49,7 @@ No tmux. No git worktrees. No Python. No Node. Just a single Rust binary and the
 - **Reorder queue** — move pending prompts up/down with `J`/`K`
 - **Search/filter** — press `/` to live-filter prompts by text
 - **Prompt history** — `Up`/`Down` in insert mode cycles through previously submitted prompts
-- **Persistent cache** — all prompts saved to `~/.cache/clhorde/prompts.json`, auto-loaded on startup (pending tasks don't auto-start)
+- **Persistent cache** — all prompts saved to `~/.local/share/clhorde/prompts.json`, auto-loaded on startup (pending tasks don't auto-start)
 - **History management** — press `p` to start pending prompts, `C` to clear all history, `d` to remove selected prompt
 - **Prompt templates** — define reusable prompt snippets, expand with `:name` + Tab
 - **Quit confirmation** — warns before quitting with active workers
@@ -223,7 +223,7 @@ This is especially useful when combined with working directories. For example, t
 
 ## Prompt history and cache
 
-clhorde automatically saves all prompts (with their status and output) to `~/.cache/clhorde/prompts.json` when you quit or when a prompt's status changes. On startup, the cache is loaded automatically, but pending prompts won't start until you press `p`.
+clhorde automatically saves all prompts (with their status and output) to `~/.local/share/clhorde/prompts.json` when you quit or when a prompt's status changes. On startup, the cache is loaded automatically, but pending prompts won't start until you press `p`.
 
 ### Cache behavior
 
