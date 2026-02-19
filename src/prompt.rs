@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PromptMode {
     Interactive,
     OneShot,
@@ -22,7 +22,7 @@ impl PromptMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PromptStatus {
     Pending,
     Running,
@@ -58,6 +58,14 @@ pub struct Prompt {
     pub seen: bool,
     /// Live PTY terminal state (only for running interactive/PTY workers).
     pub pty_state: Option<crate::pty_worker::SharedPtyState>,
+    /// UUID v7 for persistence (unique file name).
+    pub uuid: String,
+    /// Ordering rank for persistence/restore.
+    pub queue_rank: f64,
+    /// Claude session ID (captured from stream-json init message).
+    pub session_id: Option<String>,
+    /// Whether this prompt should resume an existing claude session.
+    pub resume: bool,
 }
 
 impl Prompt {
@@ -74,6 +82,10 @@ impl Prompt {
             finished_at: None,
             seen: false,
             pty_state: None,
+            uuid: uuid::Uuid::now_v7().to_string(),
+            queue_rank: 0.0,
+            session_id: None,
+            resume: false,
         }
     }
 

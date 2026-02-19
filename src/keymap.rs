@@ -19,6 +19,7 @@ pub enum NormalAction {
     DecreaseWorkers,
     ToggleMode,
     Retry,
+    Resume,
     MoveUp,
     MoveDown,
     Search,
@@ -81,6 +82,7 @@ impl Default for Keymap {
         normal.insert(KeyCode::Char('-'), NormalAction::DecreaseWorkers);
         normal.insert(KeyCode::Char('m'), NormalAction::ToggleMode);
         normal.insert(KeyCode::Char('r'), NormalAction::Retry);
+        normal.insert(KeyCode::Char('R'), NormalAction::Resume);
         normal.insert(KeyCode::Char('J'), NormalAction::MoveDown);
         normal.insert(KeyCode::Char('K'), NormalAction::MoveUp);
         normal.insert(KeyCode::Char('/'), NormalAction::Search);
@@ -128,6 +130,8 @@ impl Default for Keymap {
 #[derive(Deserialize, Serialize, Default)]
 pub(crate) struct TomlConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) settings: Option<TomlSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) normal: Option<TomlNormalBindings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) insert: Option<TomlInsertBindings>,
@@ -139,6 +143,12 @@ pub(crate) struct TomlConfig {
     pub(crate) filter: Option<TomlFilterBindings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) quick_prompts: Option<HashMap<String, String>>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+pub(crate) struct TomlSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_saved_prompts: Option<usize>,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -163,6 +173,8 @@ pub(crate) struct TomlNormalBindings {
     pub(crate) toggle_mode: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) retry: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) resume: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) move_up: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -289,6 +301,7 @@ impl Keymap {
             );
             apply_bindings(&mut keymap.normal, NormalAction::ToggleMode, normal.toggle_mode);
             apply_bindings(&mut keymap.normal, NormalAction::Retry, normal.retry);
+            apply_bindings(&mut keymap.normal, NormalAction::Resume, normal.resume);
             apply_bindings(&mut keymap.normal, NormalAction::MoveUp, normal.move_up);
             apply_bindings(&mut keymap.normal, NormalAction::MoveDown, normal.move_down);
             apply_bindings(&mut keymap.normal, NormalAction::Search, normal.search);
@@ -350,6 +363,12 @@ impl Keymap {
     }
 }
 
+/// Load settings from the config file.
+pub(crate) fn load_settings() -> TomlSettings {
+    let config = load_toml_config();
+    config.settings.unwrap_or_default()
+}
+
 /// Load the raw TOML config (not the resolved Keymap). Returns Default if file missing.
 pub(crate) fn load_toml_config() -> TomlConfig {
     let path = match config_path() {
@@ -390,6 +409,7 @@ pub(crate) fn default_toml_config() -> TomlConfig {
     }
 
     TomlConfig {
+        settings: None,
         normal: Some(TomlNormalBindings {
             quit: Some(keys_to_strings(&km.normal, NormalAction::Quit)),
             insert: Some(keys_to_strings(&km.normal, NormalAction::Insert)),
@@ -401,6 +421,7 @@ pub(crate) fn default_toml_config() -> TomlConfig {
             decrease_workers: Some(keys_to_strings(&km.normal, NormalAction::DecreaseWorkers)),
             toggle_mode: Some(keys_to_strings(&km.normal, NormalAction::ToggleMode)),
             retry: Some(keys_to_strings(&km.normal, NormalAction::Retry)),
+            resume: Some(keys_to_strings(&km.normal, NormalAction::Resume)),
             move_up: Some(keys_to_strings(&km.normal, NormalAction::MoveUp)),
             move_down: Some(keys_to_strings(&km.normal, NormalAction::MoveDown)),
             search: Some(keys_to_strings(&km.normal, NormalAction::Search)),
@@ -503,6 +524,7 @@ impl Keymap {
             (NormalAction::ViewOutput, "view"),
             (NormalAction::Interact, "interact"),
             (NormalAction::Retry, "retry"),
+            (NormalAction::Resume, "resume"),
             (NormalAction::Search, "search"),
             (NormalAction::MoveUp, "move up"),
             (NormalAction::MoveDown, "move down"),

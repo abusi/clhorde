@@ -13,6 +13,7 @@ pub enum WorkerMessage {
     Finished { prompt_id: usize, exit_code: Option<i32> },
     SpawnError { prompt_id: usize, error: String },
     PtyUpdate { #[allow(dead_code)] prompt_id: usize },
+    SessionId { prompt_id: usize, session_id: String },
 }
 
 pub enum WorkerInput {
@@ -43,6 +44,7 @@ pub fn spawn_worker(
     mode: PromptMode,
     tx: mpsc::UnboundedSender<WorkerMessage>,
     pty_size: Option<(u16, u16)>,
+    resume_session_id: Option<String>,
 ) -> SpawnResult {
     match mode {
         PromptMode::Interactive => {
@@ -54,6 +56,7 @@ pub fn spawn_worker(
                 cols,
                 rows,
                 tx,
+                resume_session_id,
             ) {
                 Ok((input_sender, pty_handle)) => {
                     SpawnResult::Pty { input_sender, pty_handle }
@@ -62,7 +65,7 @@ pub fn spawn_worker(
             }
         }
         PromptMode::OneShot => {
-            spawn_oneshot(prompt_id, prompt_text, cwd, tx);
+            spawn_oneshot(prompt_id, prompt_text, cwd, tx, resume_session_id);
             SpawnResult::OneShot
         }
     }
@@ -73,6 +76,7 @@ fn spawn_oneshot(
     prompt_text: String,
     cwd: Option<String>,
     tx: mpsc::UnboundedSender<WorkerMessage>,
+    resume_session_id: Option<String>,
 ) {
     std::thread::spawn(move || {
         let mut cmd = Command::new("claude");
@@ -86,6 +90,13 @@ fn spawn_oneshot(
                 "--dangerously-skip-permissions",
             ])
             .env_remove("CLAUDECODE");
+        if let Some(ref session_id) = resume_session_id {
+            if session_id.is_empty() {
+                cmd.arg("--resume");
+            } else {
+                cmd.args(["--resume", session_id]);
+            }
+        }
         if let Some(ref dir) = cwd {
             cmd.current_dir(dir);
         }
@@ -147,6 +158,16 @@ fn read_stream_json(
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        // Capture session_id from init message
+        if json["type"] == "system" {
+            if let Some(session_id) = json["session_id"].as_str() {
+                let _ = tx.send(WorkerMessage::SessionId {
+                    prompt_id,
+                    session_id: session_id.to_string(),
+                });
+            }
+        }
 
         // Extract streaming text deltas
         if json["type"] == "stream_event" {

@@ -51,6 +51,7 @@ pub fn spawn_pty_worker(
     cols: u16,
     rows: u16,
     tx: mpsc::UnboundedSender<WorkerMessage>,
+    resume_session_id: Option<String>,
 ) -> Result<(mpsc::UnboundedSender<WorkerInput>, PtyHandle), String> {
     let pty_system = native_pty_system();
 
@@ -64,7 +65,16 @@ pub fn spawn_pty_worker(
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
     let mut cmd = CommandBuilder::new("claude");
-    cmd.arg(&prompt_text);
+    if let Some(ref session_id) = resume_session_id {
+        if session_id.is_empty() {
+            cmd.arg("--resume");
+        } else {
+            cmd.arg("--resume");
+            cmd.arg(session_id);
+        }
+    } else {
+        cmd.arg(&prompt_text);
+    }
     cmd.arg("--dangerously-skip-permissions");
     cmd.env_remove("CLAUDECODE");
     if let Some(ref dir) = cwd {

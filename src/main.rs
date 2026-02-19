@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod keymap;
+mod persistence;
 mod prompt;
 mod pty_worker;
 mod ui;
@@ -84,10 +85,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 let text = prompt.text.clone();
                 let cwd = prompt.cwd.clone();
                 let mode = prompt.mode;
+                let resume_session_id = if prompt.resume {
+                    // Use session_id if known, otherwise signal resume with empty string
+                    // which the worker interprets as "resume last session in cwd"
+                    Some(prompt.session_id.clone().unwrap_or_default())
+                } else {
+                    None
+                };
                 app.mark_running(idx);
                 app.active_workers += 1;
                 let pty_size = app.output_panel_size;
-                match worker::spawn_worker(id, text, cwd, mode, worker_tx.clone(), pty_size)
+                match worker::spawn_worker(id, text, cwd, mode, worker_tx.clone(), pty_size, resume_session_id)
                 {
                     SpawnResult::Pty {
                         input_sender,
