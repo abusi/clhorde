@@ -37,8 +37,49 @@ pub fn repo_name(root: &Path) -> String {
         .unwrap_or_else(|| "repo".to_string())
 }
 
+/// Check if a path is a registered git worktree of the given repo.
+pub fn worktree_exists(repo_root: &Path, worktree_path: &Path) -> bool {
+    if !worktree_path.is_dir() {
+        return false;
+    }
+    let output = match Command::new("git")
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "worktree",
+            "list",
+            "--porcelain",
+        ])
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let canonical = worktree_path.canonicalize().ok();
+    for line in stdout.lines() {
+        if let Some(listed) = line.strip_prefix("worktree ") {
+            let listed_path = Path::new(listed);
+            if listed_path == worktree_path {
+                return true;
+            }
+            if let Some(ref canon) = canonical {
+                if let Ok(listed_canon) = listed_path.canonicalize() {
+                    if listed_canon == *canon {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Create a detached worktree: git worktree add --detach <path> HEAD
-/// Returns the worktree path on success.
+/// Returns the worktree path on success. If the worktree already exists
+/// (e.g. when resuming a prompt), it is reused.
 pub fn create_worktree(repo_root: &Path, prompt_id: usize) -> Result<PathBuf, String> {
     let name = repo_name(repo_root);
     let wt_dir = format!("{name}-wt-{prompt_id}");
@@ -46,6 +87,10 @@ pub fn create_worktree(repo_root: &Path, prompt_id: usize) -> Result<PathBuf, St
         .parent()
         .ok_or_else(|| "Cannot determine parent directory of repo root".to_string())?;
     let wt_path = parent.join(&wt_dir);
+
+    if worktree_exists(repo_root, &wt_path) {
+        return Ok(wt_path);
+    }
 
     let output = Command::new("git")
         .args([
@@ -97,6 +142,7 @@ pub fn remove_worktree(repo_root: &Path, worktree_path: &Path) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn repo_name_extracts_dirname() {
@@ -117,5 +163,64 @@ mod tests {
     #[test]
     fn repo_root_none_for_non_repo() {
         assert!(repo_root(Path::new("/tmp")).is_none());
+    }
+
+    /// Helper: create a throwaway git repo inside a temp dir and return
+    /// (temp_dir_handle, repo_path).  The temp dir is cleaned up when the
+    /// returned `TempDir` is dropped.
+    fn make_temp_repo() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let repo = tmp.path().join("testrepo");
+        fs::create_dir(&repo).unwrap();
+        Command::new("git")
+            .args(["init", &repo.to_string_lossy()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git init");
+        // Need at least one commit for worktrees to work.
+        Command::new("git")
+            .args(["-C", &repo.to_string_lossy(), "commit", "--allow-empty", "-m", "init"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git commit");
+        (tmp, repo)
+    }
+
+    #[test]
+    fn create_worktree_then_reuse_on_second_call() {
+        let (_tmp, repo) = make_temp_repo();
+        let prompt_id = 42;
+
+        // First call: creates the worktree.
+        let wt = create_worktree(&repo, prompt_id).expect("first create");
+        assert!(wt.is_dir(), "worktree directory should exist");
+
+        // Second call with the same id: should succeed by reusing.
+        let wt2 = create_worktree(&repo, prompt_id).expect("second create (reuse)");
+        assert_eq!(wt, wt2);
+    }
+
+    #[test]
+    fn worktree_exists_false_for_non_worktree() {
+        let (_tmp, repo) = make_temp_repo();
+        let bogus = repo.parent().unwrap().join("not-a-worktree");
+        fs::create_dir(&bogus).unwrap();
+        assert!(!worktree_exists(&repo, &bogus));
+    }
+
+    #[test]
+    fn worktree_exists_true_after_creation() {
+        let (_tmp, repo) = make_temp_repo();
+        let wt = create_worktree(&repo, 99).expect("create");
+        assert!(worktree_exists(&repo, &wt));
+    }
+
+    #[test]
+    fn worktree_exists_false_for_missing_dir() {
+        let (_tmp, repo) = make_temp_repo();
+        let missing = repo.parent().unwrap().join("does-not-exist");
+        assert!(!worktree_exists(&repo, &missing));
     }
 }
