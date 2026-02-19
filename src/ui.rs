@@ -120,9 +120,24 @@ fn render_main_area(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     render_output_viewer(f, app, chunks[1]);
 }
 
+fn truncate_prompt(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        text.to_string()
+    } else if max_chars <= 3 {
+        text.chars().take(max_chars).collect()
+    } else {
+        let truncated: String = text.chars().take(max_chars - 3).collect();
+        format!("{truncated}...")
+    }
+}
+
 fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let tick = app.tick;
     let visible_indices = app.visible_prompt_indices().to_vec();
+
+    // Available width for content: area minus borders (2) minus highlight symbol "▶ " (2)
+    let content_width = (area.width as usize).saturating_sub(4);
 
     let items: Vec<ListItem> = visible_indices
         .iter()
@@ -145,11 +160,28 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                 PromptStatus::Failed => Style::default().fg(Color::Red),
             };
 
-            let truncated = if prompt.text.len() > 30 {
-                format!("{}...", &prompt.text[..27])
-            } else {
-                prompt.text.clone()
-            };
+            // Calculate display width of all non-text spans to give remaining space to prompt text
+            // Status emoji (2 display cols) + space (1) = 3
+            let id_str = format!("#{} ", prompt.id);
+            let mut overhead = 3 + id_str.len() + elapsed.len();
+
+            if prompt.worktree {
+                overhead += 5; // " [WT]"
+            }
+
+            if let Some(ref dir) = prompt.cwd {
+                // Matches the cwd_hint formatting below
+                overhead += if dir.len() > 20 { 22 } else { dir.len() + 3 };
+            }
+
+            if prompt.status == PromptStatus::Idle {
+                overhead += 7; // " " + " IDLE "
+            } else if is_unseen_done {
+                overhead += if prompt.status == PromptStatus::Completed { 8 } else { 9 };
+            }
+
+            let max_text_chars = content_width.saturating_sub(overhead).max(8);
+            let truncated = truncate_prompt(&prompt.text, max_text_chars);
 
             let cwd_hint = prompt.cwd.as_ref().map(|dir| {
                 let display = if dir.len() > 20 {
@@ -207,7 +239,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                     status_style,
                 ),
                 Span::styled(
-                    format!("#{} ", prompt.id),
+                    id_str,
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::raw(truncated),
