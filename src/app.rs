@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use crate::keymap::{
     self, FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction,
 };
+use crate::worktree;
 use crate::persistence;
 use crate::prompt::{Prompt, PromptMode, PromptStatus};
 use crate::pty_worker::{self, PtyHandle};
@@ -25,6 +26,12 @@ pub enum AppMode {
     /// Raw keystroke forwarding to PTY worker.
     PtyInteract,
     Filter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WorktreeCleanup {
+    Manual,
+    Auto,
 }
 
 pub struct App {
@@ -81,6 +88,10 @@ pub struct App {
     pub max_saved_prompts: usize,
     /// Directory for prompt persistence files (None = persistence disabled).
     pub prompts_dir: Option<PathBuf>,
+    /// Whether the next submitted prompt should use a git worktree.
+    pub worktree_pending: bool,
+    /// Worktree cleanup policy.
+    pub worktree_cleanup: WorktreeCleanup,
 }
 
 impl App {
@@ -91,6 +102,10 @@ impl App {
         let history = Self::load_history();
         let settings = keymap::load_settings();
         let max_saved_prompts = settings.max_saved_prompts.unwrap_or(100);
+        let worktree_cleanup = match settings.worktree_cleanup.as_deref() {
+            Some("auto") => WorktreeCleanup::Auto,
+            _ => WorktreeCleanup::Manual,
+        };
 
         let prompts_dir = persistence::default_prompts_dir();
 
@@ -113,6 +128,8 @@ impl App {
                 prompt.uuid = uuid.clone();
                 prompt.queue_rank = pf.queue_rank;
                 prompt.session_id = pf.session_id.clone();
+                prompt.worktree = pf.options.worktree.unwrap_or(false);
+                prompt.worktree_path = pf.worktree_path.clone();
                 prompt.status = status;
                 prompt.seen = true;
                 prompts.push(prompt);
@@ -163,6 +180,8 @@ impl App {
             last_pty_size: None,
             max_saved_prompts,
             prompts_dir,
+            worktree_pending: false,
+            worktree_cleanup,
         }
     }
 
@@ -194,8 +213,9 @@ impl App {
             .count()
     }
 
-    pub fn add_prompt(&mut self, text: String, cwd: Option<String>) {
+    pub fn add_prompt(&mut self, text: String, cwd: Option<String>, worktree: bool) {
         let mut prompt = Prompt::new(self.next_id, text, cwd, self.default_mode);
+        prompt.worktree = worktree;
         let max_rank = self.prompts.iter().map(|p| p.queue_rank).fold(0.0_f64, f64::max);
         prompt.queue_rank = max_rank + 1.0;
         self.next_id += 1;
@@ -369,6 +389,7 @@ impl App {
                     }
                 }
                 self.persist_prompt_by_id(prompt_id);
+                self.maybe_cleanup_worktree(prompt_id);
                 self.pty_handles.remove(&prompt_id);
                 self.worker_inputs.remove(&prompt_id);
                 self.active_workers = self.active_workers.saturating_sub(1);
@@ -390,6 +411,7 @@ impl App {
                     prompt.pty_state = None;
                 }
                 self.persist_prompt_by_id(prompt_id);
+                self.maybe_cleanup_worktree(prompt_id);
                 self.pty_handles.remove(&prompt_id);
                 self.worker_inputs.remove(&prompt_id);
                 self.active_workers = self.active_workers.saturating_sub(1);
@@ -466,6 +488,7 @@ impl App {
                 self.history_stash.clear();
                 self.template_suggestions.clear();
                 self.template_suggestion_index = 0;
+                self.worktree_pending = false;
             }
             NormalAction::SelectNext => {
                 self.select_next();
@@ -533,6 +556,12 @@ impl App {
     }
 
     fn handle_insert_key(&mut self, key: KeyEvent) {
+        // Ctrl+W toggles worktree mode for the current prompt
+        if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.worktree_pending = !self.worktree_pending;
+            return;
+        }
+
         if let Some(action) = self.keymap.insert.get(&key.code) {
             match action {
                 InsertAction::Cancel => {
@@ -544,13 +573,14 @@ impl App {
                     self.history_stash.clear();
                     self.template_suggestions.clear();
                     self.template_suggestion_index = 0;
+                    self.worktree_pending = false;
                 }
                 InsertAction::Submit => {
                     let text = self.input.trim().to_string();
                     if !text.is_empty() {
                         let (cwd, prompt_text) = Self::parse_cwd_prefix(&text);
                         if !prompt_text.is_empty() {
-                            self.add_prompt(prompt_text.clone(), cwd);
+                            self.add_prompt(prompt_text.clone(), cwd, self.worktree_pending);
                             self.append_history(&text);
                         }
                     }
@@ -561,6 +591,7 @@ impl App {
                     self.history_stash.clear();
                     self.template_suggestions.clear();
                     self.template_suggestion_index = 0;
+                    self.worktree_pending = false;
                     self.mode = AppMode::Normal;
                 }
                 InsertAction::AcceptSuggestion => {
@@ -907,6 +938,47 @@ impl App {
         self.last_pty_size = Some((cols, rows));
     }
 
+    // ── Worktree cleanup ──
+
+    fn maybe_cleanup_worktree(&mut self, prompt_id: usize) {
+        if self.worktree_cleanup != WorktreeCleanup::Auto {
+            return;
+        }
+        let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) else {
+            return;
+        };
+        let Some(wt_path) = prompt.worktree_path.take() else {
+            return;
+        };
+        // Persist the cleared worktree_path
+        if let Some(ref dir) = self.prompts_dir {
+            if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
+                persistence::save_prompt(dir, &prompt.uuid, &persistence::PromptFile::from_prompt(prompt));
+            }
+        }
+        // Spawn a background thread for cleanup to avoid blocking
+        let wt_path = PathBuf::from(&wt_path);
+        std::thread::spawn(move || {
+            // Try to find repo root from the worktree path's parent
+            if let Some(parent) = wt_path.parent() {
+                // Look for the main repo among siblings
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() && path != wt_path
+                            && worktree::is_git_repo(&path)
+                        {
+                            if let Some(root) = worktree::repo_root(&path) {
+                                let _ = worktree::remove_worktree(&root, &wt_path);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // ── Feature 1: Export ──
 
     fn export_selected_output(&mut self) {
@@ -954,7 +1026,9 @@ impl App {
         let text = prompt.text.clone();
         let cwd = prompt.cwd.clone();
         let mode = prompt.mode;
+        let wt = prompt.worktree;
         let mut new_prompt = Prompt::new(self.next_id, text, cwd, mode);
+        new_prompt.worktree = wt;
         let max_rank = self.prompts.iter().map(|p| p.queue_rank).fold(0.0_f64, f64::max);
         new_prompt.queue_rank = max_rank + 1.0;
         self.next_id += 1;
@@ -1282,6 +1356,8 @@ mod tests {
             last_pty_size: None,
             max_saved_prompts: 100,
             prompts_dir: None,
+            worktree_pending: false,
+            worktree_cleanup: WorktreeCleanup::Manual,
         }
     }
 
@@ -1308,9 +1384,9 @@ mod tests {
     #[test]
     fn add_prompt_increments_id() {
         let mut app = new_test_app();
-        app.add_prompt("first".to_string(), None);
-        app.add_prompt("second".to_string(), None);
-        app.add_prompt("third".to_string(), None);
+        app.add_prompt("first".to_string(), None, false);
+        app.add_prompt("second".to_string(), None, false);
+        app.add_prompt("third".to_string(), None, false);
 
         assert_eq!(app.prompts.len(), 3);
         assert_eq!(app.prompts[0].id, 1);
@@ -1323,16 +1399,16 @@ mod tests {
     fn add_prompt_selects_first() {
         let mut app = new_test_app();
         assert!(app.list_state.selected().is_none());
-        app.add_prompt("test".to_string(), None);
+        app.add_prompt("test".to_string(), None, false);
         assert_eq!(app.list_state.selected(), Some(0));
     }
 
     #[test]
     fn pending_and_completed_counts() {
         let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None);
-        app.add_prompt("b".to_string(), None);
-        app.add_prompt("c".to_string(), None);
+        app.add_prompt("a".to_string(), None, false);
+        app.add_prompt("b".to_string(), None, false);
+        app.add_prompt("c".to_string(), None, false);
 
         assert_eq!(app.pending_count(), 3);
         assert_eq!(app.completed_count(), 0);
@@ -1363,8 +1439,8 @@ mod tests {
     #[test]
     fn select_next_clamps_to_end() {
         let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None);
-        app.add_prompt("b".to_string(), None);
+        app.add_prompt("a".to_string(), None, false);
+        app.add_prompt("b".to_string(), None, false);
         app.list_state.select(Some(1));
 
         app.select_next();
@@ -1374,8 +1450,8 @@ mod tests {
     #[test]
     fn select_prev_clamps_to_start() {
         let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None);
-        app.add_prompt("b".to_string(), None);
+        app.add_prompt("a".to_string(), None, false);
+        app.add_prompt("b".to_string(), None, false);
         app.list_state.select(Some(0));
 
         app.select_prev();
@@ -1385,9 +1461,9 @@ mod tests {
     #[test]
     fn select_next_advances() {
         let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None);
-        app.add_prompt("b".to_string(), None);
-        app.add_prompt("c".to_string(), None);
+        app.add_prompt("a".to_string(), None, false);
+        app.add_prompt("b".to_string(), None, false);
+        app.add_prompt("c".to_string(), None, false);
         app.list_state.select(Some(0));
 
         app.select_next();
@@ -1399,8 +1475,8 @@ mod tests {
     #[test]
     fn select_prev_goes_back() {
         let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None);
-        app.add_prompt("b".to_string(), None);
+        app.add_prompt("a".to_string(), None, false);
+        app.add_prompt("b".to_string(), None, false);
         app.list_state.select(Some(1));
 
         app.select_prev();
@@ -1412,7 +1488,7 @@ mod tests {
     fn app_with_prompts(texts: &[&str]) -> App {
         let mut app = new_test_app();
         for t in texts {
-            app.add_prompt(t.to_string(), None);
+            app.add_prompt(t.to_string(), None, false);
         }
         app
     }

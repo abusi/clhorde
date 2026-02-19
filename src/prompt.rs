@@ -66,6 +66,10 @@ pub struct Prompt {
     pub session_id: Option<String>,
     /// Whether this prompt should resume an existing claude session.
     pub resume: bool,
+    /// Whether this prompt should run in a git worktree.
+    pub worktree: bool,
+    /// Path to the created worktree directory (for cleanup).
+    pub worktree_path: Option<String>,
 }
 
 impl Prompt {
@@ -86,6 +90,8 @@ impl Prompt {
             queue_rank: 0.0,
             session_id: None,
             resume: false,
+            worktree: false,
+            worktree_path: None,
         }
     }
 
