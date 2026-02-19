@@ -178,6 +178,18 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .expect("git init");
+        // Configure identity so commits work in CI (no global git config).
+        for args in [
+            &["-C", &*repo.to_string_lossy(), "config", "user.email", "test@test"][..],
+            &["-C", &*repo.to_string_lossy(), "config", "user.name", "test"][..],
+        ] {
+            Command::new("git")
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("git config");
+        }
         // Need at least one commit for worktrees to work.
         Command::new("git")
             .args(["-C", &repo.to_string_lossy(), "commit", "--allow-empty", "-m", "init"])
