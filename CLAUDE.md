@@ -10,19 +10,21 @@ clhorde lets you queue up multiple prompts and run them concurrently across a po
 
 ```
 src/
-├── main.rs       # Entry point, terminal setup, event loop (crossterm + tokio::select!)
-├── app.rs        # App state, mode handling, keybindings (vim-style: Normal/Insert/View/Interact/PtyInteract/Filter)
-├── prompt.rs     # Prompt data model (id, text, status, output, timing, pty_state)
-├── ui.rs         # ratatui rendering (status bar, prompt list, output viewer, PTY grid renderer, input bar, help bar)
-├── worker.rs     # Worker dispatch (routes interactive→PTY, one-shot→stream-json)
-└── pty_worker.rs # PTY worker lifecycle (portable-pty spawn, alacritty_terminal grid, key encoding, resize)
+├── main.rs         # Entry point, terminal setup, event loop (crossterm + tokio::select!)
+├── app.rs          # App state, mode handling, keybindings (vim-style: Normal/Insert/View/Interact/PtyInteract/Filter)
+├── prompt.rs       # Prompt data model (id, text, status, output, timing, pty_state, uuid, session_id)
+├── persistence.rs  # Per-prompt file persistence (save/load/prune JSON files)
+├── ui.rs           # ratatui rendering (status bar, prompt list, output viewer, PTY grid renderer, input bar, help bar)
+├── worker.rs       # Worker dispatch (routes interactive→PTY, one-shot→stream-json, --resume support)
+└── pty_worker.rs   # PTY worker lifecycle (portable-pty spawn, alacritty_terminal grid, key encoding, resize)
 ```
 
 ### Key design decisions
 
 - **Event handling**: Crossterm events are read on a dedicated OS thread (not async) and forwarded via `mpsc` channel to avoid blocking the tokio runtime.
 - **Worker threads**: Each `claude` subprocess runs in a std::thread (not tokio task) with separate reader/writer threads for stdout parsing and stdin writing.
-- **Communication**: Workers send `WorkerMessage` variants (OutputChunk, PtyUpdate, Finished, SpawnError) back to the app via `tokio::sync::mpsc`. The app sends `WorkerInput` (SendInput, SendBytes, Kill) to workers.
+- **Communication**: Workers send `WorkerMessage` variants (OutputChunk, PtyUpdate, Finished, SpawnError, SessionId) back to the app via `tokio::sync::mpsc`. The app sends `WorkerInput` (SendInput, SendBytes, Kill) to workers.
+- **Persistence**: Each prompt is persisted as a UUID v7-named JSON file in `~/.local/share/clhorde/prompts/`. On startup, all prompt files are loaded and restored (as Completed/Failed — no auto-dispatch). The `[settings]` section in `keymap.toml` controls `max_saved_prompts` (default: 100) for automatic pruning.
 - **Dual architecture (PTY + stream-json)**: Interactive workers run in a real PTY via `portable-pty`, with the full Claude Code TUI rendered through `alacritty_terminal`. One-shot workers use the lighter `stream-json` protocol for text-only output. This hybrid gives interactive prompts the full Claude experience (tool use visibility, permission prompts, rich formatting) while keeping one-shot prompts lightweight.
 - **PTY terminal emulation**: The `alacritty_terminal` crate provides a headless terminal emulator. PTY output bytes are fed to `Processor::advance()` which updates a `Term` grid. The UI reads this grid each frame, mapping alacritty cell colors/flags to ratatui styles.
 - **Claude CLI integration**: Two spawn strategies based on prompt mode:
@@ -42,6 +44,7 @@ src/
 - `chrono` 0.4 — timestamps for export filenames
 - `alacritty_terminal` 0.25 — headless terminal emulator for PTY grid rendering
 - `portable-pty` 0.9 — cross-platform PTY allocation and subprocess management
+- `uuid` 1 (v7 feature) — UUID v7 generation for prompt file names
 
 ## Building and running
 
@@ -61,6 +64,7 @@ Requires `claude` CLI to be installed and available in PATH.
 - `s` — interact with running/idle prompt
 - `m` — toggle prompt mode (interactive / one-shot)
 - `r` — retry selected completed/failed prompt
+- `R` — resume selected completed/failed prompt (uses `--resume` to continue session)
 - `J`/`K` — move selected pending prompt down/up in queue
 - `/` — enter filter mode (search prompts)
 - `+`/`-` — increase/decrease max workers (1–20)
@@ -96,9 +100,10 @@ Requires `claude` CLI to be installed and available in PATH.
 
 ## Config files
 
-- `~/.config/clhorde/keymap.toml` — custom keybindings (see `keymap_example.toml`)
+- `~/.config/clhorde/keymap.toml` — custom keybindings and settings (see `keymap_example.toml`)
 - `~/.config/clhorde/templates.toml` — prompt templates
 - `~/.local/share/clhorde/history` — prompt history (auto-managed)
+- `~/.local/share/clhorde/prompts/` — per-prompt persistence files (UUID v7 JSON, auto-managed)
 
 ### Templates format
 
@@ -110,6 +115,15 @@ refactor = "Refactor this code to be more idiomatic:"
 ```
 
 Type `:review` in insert mode and press Tab to expand.
+
+### Settings
+
+Add a `[settings]` section to `keymap.toml`:
+
+```toml
+[settings]
+max_saved_prompts = 100  # Maximum prompt files to keep (default: 100)
+```
 
 ## Code conventions
 

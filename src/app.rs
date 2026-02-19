@@ -9,8 +9,9 @@ use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 
 use crate::keymap::{
-    FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction,
+    self, FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction,
 };
+use crate::persistence;
 use crate::prompt::{Prompt, PromptMode, PromptStatus};
 use crate::pty_worker::{self, PtyHandle};
 use crate::worker::{WorkerInput, WorkerMessage};
@@ -75,6 +76,11 @@ pub struct App {
     pub output_panel_size: Option<(u16, u16)>,
     /// Last PTY size sent to workers (for change detection).
     pub last_pty_size: Option<(u16, u16)>,
+    /// Maximum number of prompt files to keep on disk.
+    #[allow(dead_code)]
+    pub max_saved_prompts: usize,
+    /// Directory for prompt persistence files (None = persistence disabled).
+    pub prompts_dir: Option<PathBuf>,
 }
 
 impl App {
@@ -83,9 +89,48 @@ impl App {
         list_state.select(None);
         let templates = Self::load_templates();
         let history = Self::load_history();
+        let settings = keymap::load_settings();
+        let max_saved_prompts = settings.max_saved_prompts.unwrap_or(100);
+
+        let prompts_dir = persistence::default_prompts_dir();
+
+        // Restore prompts from disk
+        let mut prompts = Vec::new();
+        let mut next_id: usize = 1;
+        if let Some(ref dir) = prompts_dir {
+            let saved = persistence::load_all_prompts(dir);
+            for (uuid, pf) in &saved {
+                let mode = match pf.options.mode.as_str() {
+                    "one_shot" => PromptMode::OneShot,
+                    _ => PromptMode::Interactive,
+                };
+                // All restored prompts are terminal — processes are dead
+                let status = match pf.state.as_str() {
+                    "failed" => PromptStatus::Failed,
+                    _ => PromptStatus::Completed,
+                };
+                let mut prompt = Prompt::new(next_id, pf.prompt.clone(), pf.options.context.clone(), mode);
+                prompt.uuid = uuid.clone();
+                prompt.queue_rank = pf.queue_rank;
+                prompt.session_id = pf.session_id.clone();
+                prompt.status = status;
+                prompt.seen = true;
+                prompts.push(prompt);
+                next_id += 1;
+            }
+            if !prompts.is_empty() {
+                list_state.select(Some(0));
+            }
+
+            // Prune old prompt files
+            persistence::prune_old_prompts(dir, max_saved_prompts);
+        }
+
+        let filtered_indices: Vec<usize> = (0..prompts.len()).collect();
+
         Self {
-            prompts: Vec::new(),
-            next_id: 1,
+            prompts,
+            next_id,
             max_workers: 3,
             active_workers: 0,
             mode: AppMode::Normal,
@@ -105,7 +150,7 @@ impl App {
             confirm_quit: false,
             filter_text: None,
             filter_input: String::new(),
-            filtered_indices: Vec::new(),
+            filtered_indices,
             history,
             history_index: None,
             history_stash: String::new(),
@@ -116,6 +161,22 @@ impl App {
             pty_handles: HashMap::new(),
             output_panel_size: None,
             last_pty_size: None,
+            max_saved_prompts,
+            prompts_dir,
+        }
+    }
+
+    /// Save a prompt to disk if persistence is enabled.
+    fn persist_prompt(&self, prompt: &Prompt) {
+        if let Some(ref dir) = self.prompts_dir {
+            persistence::save_prompt(dir, &prompt.uuid, &persistence::PromptFile::from_prompt(prompt));
+        }
+    }
+
+    /// Save a prompt by its ID (looks it up in self.prompts).
+    fn persist_prompt_by_id(&self, prompt_id: usize) {
+        if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
+            self.persist_prompt(prompt);
         }
     }
 
@@ -134,8 +195,11 @@ impl App {
     }
 
     pub fn add_prompt(&mut self, text: String, cwd: Option<String>) {
-        let prompt = Prompt::new(self.next_id, text, cwd, self.default_mode);
+        let mut prompt = Prompt::new(self.next_id, text, cwd, self.default_mode);
+        let max_rank = self.prompts.iter().map(|p| p.queue_rank).fold(0.0_f64, f64::max);
+        prompt.queue_rank = max_rank + 1.0;
         self.next_id += 1;
+        self.persist_prompt(&prompt);
         self.prompts.push(prompt);
         self.rebuild_filter();
         if self.list_state.selected().is_none() {
@@ -233,6 +297,9 @@ impl App {
             prompt.status = PromptStatus::Running;
             prompt.started_at = Some(Instant::now());
         }
+        if let Some(prompt) = self.prompts.get(index) {
+            self.persist_prompt(prompt);
+        }
     }
 
     pub fn apply_message(&mut self, msg: WorkerMessage) {
@@ -250,17 +317,28 @@ impl App {
                 }
             }
             WorkerMessage::TurnComplete { prompt_id } => {
+                let mut save = false;
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
                     if prompt.status == PromptStatus::Running {
                         if let Some(output) = &mut prompt.output {
                             output.push('\n');
                         }
                         prompt.status = PromptStatus::Idle;
+                        save = true;
                     }
+                }
+                if save {
+                    self.persist_prompt_by_id(prompt_id);
                 }
             }
             WorkerMessage::PtyUpdate { .. } => {
                 // No-op: redraw happens on next loop iteration
+            }
+            WorkerMessage::SessionId { prompt_id, session_id } => {
+                if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
+                    prompt.session_id = Some(session_id);
+                }
+                self.persist_prompt_by_id(prompt_id);
             }
             WorkerMessage::Finished {
                 prompt_id,
@@ -290,6 +368,7 @@ impl App {
                         }
                     }
                 }
+                self.persist_prompt_by_id(prompt_id);
                 self.pty_handles.remove(&prompt_id);
                 self.worker_inputs.remove(&prompt_id);
                 self.active_workers = self.active_workers.saturating_sub(1);
@@ -310,6 +389,7 @@ impl App {
                     prompt.error = Some(error);
                     prompt.pty_state = None;
                 }
+                self.persist_prompt_by_id(prompt_id);
                 self.pty_handles.remove(&prompt_id);
                 self.worker_inputs.remove(&prompt_id);
                 self.active_workers = self.active_workers.saturating_sub(1);
@@ -435,6 +515,9 @@ impl App {
             }
             NormalAction::Retry => {
                 self.retry_selected();
+            }
+            NormalAction::Resume => {
+                self.resume_selected();
             }
             NormalAction::MoveUp => {
                 self.move_selected_up();
@@ -871,10 +954,37 @@ impl App {
         let text = prompt.text.clone();
         let cwd = prompt.cwd.clone();
         let mode = prompt.mode;
-        let new_prompt = Prompt::new(self.next_id, text, cwd, mode);
+        let mut new_prompt = Prompt::new(self.next_id, text, cwd, mode);
+        let max_rank = self.prompts.iter().map(|p| p.queue_rank).fold(0.0_f64, f64::max);
+        new_prompt.queue_rank = max_rank + 1.0;
         self.next_id += 1;
+        self.persist_prompt(&new_prompt);
         self.prompts.push(new_prompt);
         self.rebuild_filter();
+    }
+
+    fn resume_selected(&mut self) {
+        let Some(idx) = self.list_state.selected() else {
+            return;
+        };
+        let Some(prompt) = self.prompts.get_mut(idx) else {
+            return;
+        };
+        if prompt.status != PromptStatus::Completed && prompt.status != PromptStatus::Failed {
+            return;
+        }
+        // Reset the same prompt to Pending with resume flag
+        prompt.status = PromptStatus::Pending;
+        prompt.resume = true;
+        prompt.output = None;
+        prompt.error = None;
+        prompt.started_at = None;
+        prompt.finished_at = None;
+        prompt.seen = false;
+        prompt.pty_state = None;
+        if let Some(ref dir) = self.prompts_dir {
+            persistence::save_prompt(dir, &self.prompts[idx].uuid, &persistence::PromptFile::from_prompt(&self.prompts[idx]));
+        }
     }
 
     // ── Feature 4: Reorder ──
@@ -890,7 +1000,17 @@ impl App {
         if self.prompts[idx].status != PromptStatus::Pending {
             return;
         }
+        // Swap queue_rank values
+        let rank_a = self.prompts[idx].queue_rank;
+        let rank_b = self.prompts[idx - 1].queue_rank;
+        self.prompts[idx].queue_rank = rank_b;
+        self.prompts[idx - 1].queue_rank = rank_a;
         self.prompts.swap(idx, idx - 1);
+        // Save both to disk
+        if let Some(ref dir) = self.prompts_dir {
+            persistence::save_prompt(dir, &self.prompts[idx].uuid, &persistence::PromptFile::from_prompt(&self.prompts[idx]));
+            persistence::save_prompt(dir, &self.prompts[idx - 1].uuid, &persistence::PromptFile::from_prompt(&self.prompts[idx - 1]));
+        }
         self.list_state.select(Some(idx - 1));
         self.rebuild_filter();
     }
@@ -905,7 +1025,17 @@ impl App {
         if self.prompts[idx].status != PromptStatus::Pending {
             return;
         }
+        // Swap queue_rank values
+        let rank_a = self.prompts[idx].queue_rank;
+        let rank_b = self.prompts[idx + 1].queue_rank;
+        self.prompts[idx].queue_rank = rank_b;
+        self.prompts[idx + 1].queue_rank = rank_a;
         self.prompts.swap(idx, idx + 1);
+        // Save both to disk
+        if let Some(ref dir) = self.prompts_dir {
+            persistence::save_prompt(dir, &self.prompts[idx].uuid, &persistence::PromptFile::from_prompt(&self.prompts[idx]));
+            persistence::save_prompt(dir, &self.prompts[idx + 1].uuid, &persistence::PromptFile::from_prompt(&self.prompts[idx + 1]));
+        }
         self.list_state.select(Some(idx + 1));
         self.rebuild_filter();
     }
@@ -1113,11 +1243,53 @@ mod tests {
     use super::*;
     use crate::worker::WorkerMessage;
 
+    /// Test-only constructor that skips persistence loading.
+    fn new_test_app() -> App {
+        let mut list_state = ListState::default();
+        list_state.select(None);
+        App {
+            prompts: Vec::new(),
+            next_id: 1,
+            max_workers: 3,
+            active_workers: 0,
+            mode: AppMode::Normal,
+            list_state,
+            input: String::new(),
+            scroll_offset: 0,
+            should_quit: false,
+            worker_inputs: HashMap::new(),
+            interact_input: String::new(),
+            auto_scroll: true,
+            suggestions: Vec::new(),
+            suggestion_index: 0,
+            tick: 0,
+            default_mode: PromptMode::Interactive,
+            keymap: Keymap::default(),
+            status_message: None,
+            confirm_quit: false,
+            filter_text: None,
+            filter_input: String::new(),
+            filtered_indices: Vec::new(),
+            history: Vec::new(),
+            history_index: None,
+            history_stash: String::new(),
+            templates: HashMap::new(),
+            template_suggestions: Vec::new(),
+            template_suggestion_index: 0,
+            show_quick_prompts_popup: false,
+            pty_handles: HashMap::new(),
+            output_panel_size: None,
+            last_pty_size: None,
+            max_saved_prompts: 100,
+            prompts_dir: None,
+        }
+    }
+
     // ── App::new defaults ──
 
     #[test]
     fn app_new_defaults() {
-        let app = App::new();
+        let app = new_test_app();
         assert_eq!(app.max_workers, 3);
         assert_eq!(app.active_workers, 0);
         assert_eq!(app.mode, AppMode::Normal);
@@ -1135,7 +1307,7 @@ mod tests {
 
     #[test]
     fn add_prompt_increments_id() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.add_prompt("first".to_string(), None);
         app.add_prompt("second".to_string(), None);
         app.add_prompt("third".to_string(), None);
@@ -1149,7 +1321,7 @@ mod tests {
 
     #[test]
     fn add_prompt_selects_first() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         assert!(app.list_state.selected().is_none());
         app.add_prompt("test".to_string(), None);
         assert_eq!(app.list_state.selected(), Some(0));
@@ -1157,7 +1329,7 @@ mod tests {
 
     #[test]
     fn pending_and_completed_counts() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.add_prompt("a".to_string(), None);
         app.add_prompt("b".to_string(), None);
         app.add_prompt("c".to_string(), None);
@@ -1176,21 +1348,21 @@ mod tests {
 
     #[test]
     fn select_next_empty_list() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.select_next(); // should not panic
         assert!(app.list_state.selected().is_none());
     }
 
     #[test]
     fn select_prev_empty_list() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.select_prev(); // should not panic
         assert!(app.list_state.selected().is_none());
     }
 
     #[test]
     fn select_next_clamps_to_end() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.add_prompt("a".to_string(), None);
         app.add_prompt("b".to_string(), None);
         app.list_state.select(Some(1));
@@ -1201,7 +1373,7 @@ mod tests {
 
     #[test]
     fn select_prev_clamps_to_start() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.add_prompt("a".to_string(), None);
         app.add_prompt("b".to_string(), None);
         app.list_state.select(Some(0));
@@ -1212,7 +1384,7 @@ mod tests {
 
     #[test]
     fn select_next_advances() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.add_prompt("a".to_string(), None);
         app.add_prompt("b".to_string(), None);
         app.add_prompt("c".to_string(), None);
@@ -1226,7 +1398,7 @@ mod tests {
 
     #[test]
     fn select_prev_goes_back() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.add_prompt("a".to_string(), None);
         app.add_prompt("b".to_string(), None);
         app.list_state.select(Some(1));
@@ -1238,7 +1410,7 @@ mod tests {
     // ── move_selected_up / move_selected_down ──
 
     fn app_with_prompts(texts: &[&str]) -> App {
-        let mut app = App::new();
+        let mut app = new_test_app();
         for t in texts {
             app.add_prompt(t.to_string(), None);
         }
@@ -1425,7 +1597,7 @@ mod tests {
 
     #[test]
     fn history_empty_is_noop() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.history.clear();
         app.input = "current".to_string();
         app.history_prev();
@@ -1435,7 +1607,7 @@ mod tests {
 
     #[test]
     fn history_prev_stashes_and_navigates() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.history = vec!["first".to_string(), "second".to_string()];
         app.input = "typing".to_string();
 
@@ -1451,7 +1623,7 @@ mod tests {
 
     #[test]
     fn history_prev_stops_at_beginning() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.history = vec!["only".to_string()];
         app.input = "typing".to_string();
 
@@ -1466,7 +1638,7 @@ mod tests {
 
     #[test]
     fn history_next_restores_stash() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.history = vec!["first".to_string(), "second".to_string()];
         app.input = "typing".to_string();
 
@@ -1478,7 +1650,7 @@ mod tests {
 
     #[test]
     fn history_next_without_navigating_is_noop() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.history = vec!["first".to_string()];
         app.input = "current".to_string();
         app.history_next();
@@ -1487,7 +1659,7 @@ mod tests {
 
     #[test]
     fn history_prev_next_roundtrip() {
-        let mut app = App::new();
+        let mut app = new_test_app();
         app.history = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         app.input = "now".to_string();
 
