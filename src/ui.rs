@@ -129,8 +129,8 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
         .map(|&idx| {
             let prompt = &app.prompts[idx];
             let elapsed = prompt
-                .elapsed_secs()
-                .map(|s| format!(" ({s:.1}s)"))
+                .elapsed_display()
+                .map(|d| format!(" ({d})"))
                 .unwrap_or_default();
 
             let is_unseen_done = !prompt.seen
@@ -483,16 +483,16 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
             let content = match &prompt.status {
                 PromptStatus::Pending => "(pending)".to_string(),
                 PromptStatus::Running => {
-                    let elapsed = prompt.elapsed_secs().unwrap_or(0.0);
+                    let elapsed = prompt.elapsed_display().unwrap_or_else(|| "0.0s".into());
                     match &prompt.output {
                         Some(output) => {
-                            format!("Running... ({elapsed:.1}s)\n\n{output}")
+                            format!("Running... ({elapsed})\n\n{output}")
                         }
-                        None => format!("Running... ({elapsed:.1}s)"),
+                        None => format!("Running... ({elapsed})"),
                     }
                 }
                 PromptStatus::Idle => {
-                    let elapsed = prompt.elapsed_secs().unwrap_or(0.0);
+                    let elapsed = prompt.elapsed_display().unwrap_or_else(|| "0.0s".into());
                     let hint = if prompt.mode == PromptMode::Interactive {
                         let key = app.keymap.view_key_hint(ViewAction::Interact);
                         format!(" — press '{key}' to interact")
@@ -501,9 +501,9 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
                     };
                     match &prompt.output {
                         Some(output) => {
-                            format!("{output}\n\n— Idle ({elapsed:.1}s){hint}")
+                            format!("{output}\n\n— Idle ({elapsed}){hint}")
                         }
-                        None => format!("Idle ({elapsed:.1}s){hint}"),
+                        None => format!("Idle ({elapsed}){hint}"),
                     }
                 }
                 PromptStatus::Completed => {

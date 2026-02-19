@@ -100,6 +100,30 @@ impl Prompt {
         let end = self.finished_at.unwrap_or_else(Instant::now);
         Some(end.duration_since(start).as_secs_f64())
     }
+
+    /// Human-readable elapsed time, e.g. "4.2s", "2m 30s", "1h 5m".
+    pub fn elapsed_display(&self) -> Option<String> {
+        self.elapsed_secs().map(format_duration)
+    }
+}
+
+/// Format seconds into a human-readable duration string.
+/// - Under 60s: "4.2s"
+/// - Under 1h: "2m 30s"
+/// - 1h+: "1h 5m"
+pub fn format_duration(secs: f64) -> String {
+    let total = secs as u64;
+    if total < 60 {
+        format!("{secs:.1}s")
+    } else if total < 3600 {
+        let m = total / 60;
+        let s = total % 60;
+        format!("{m}m {s}s")
+    } else {
+        let h = total / 3600;
+        let m = (total % 3600) / 60;
+        format!("{h}h {m}m")
+    }
 }
 
 #[cfg(test)]
@@ -172,6 +196,29 @@ mod tests {
     fn elapsed_secs_none_when_not_started() {
         let p = Prompt::new(1, "test".to_string(), None, PromptMode::Interactive);
         assert!(p.elapsed_secs().is_none());
+    }
+
+    // ── format_duration ──
+
+    #[test]
+    fn format_duration_under_60s() {
+        assert_eq!(format_duration(0.0), "0.0s");
+        assert_eq!(format_duration(4.23), "4.2s");
+        assert_eq!(format_duration(59.9), "59.9s");
+    }
+
+    #[test]
+    fn format_duration_minutes() {
+        assert_eq!(format_duration(60.0), "1m 0s");
+        assert_eq!(format_duration(150.0), "2m 30s");
+        assert_eq!(format_duration(3599.0), "59m 59s");
+    }
+
+    #[test]
+    fn format_duration_hours() {
+        assert_eq!(format_duration(3600.0), "1h 0m");
+        assert_eq!(format_duration(3900.0), "1h 5m");
+        assert_eq!(format_duration(7261.0), "2h 1m");
     }
 
 }
