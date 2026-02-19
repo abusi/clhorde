@@ -35,7 +35,7 @@ src/
 - `ratatui` 0.30 — TUI framework
 - `crossterm` 0.28 — terminal backend
 - `tokio` 1 (full features) — async runtime
-- `serde` 1 — serialization (session persistence)
+- `serde` 1 — serialization
 - `serde_json` 1 — JSON parsing for claude stream protocol
 - `toml` 0.8 — config file parsing
 - `dirs` 6 — XDG data/config directory resolution
@@ -48,7 +48,6 @@ src/
 ```bash
 cargo build
 cargo run
-cargo run -- --restore   # restore previous session
 ```
 
 Requires `claude` CLI to be installed and available in PATH.
@@ -100,7 +99,6 @@ Requires `claude` CLI to be installed and available in PATH.
 - `~/.config/clhorde/keymap.toml` — custom keybindings (see `keymap_example.toml`)
 - `~/.config/clhorde/templates.toml` — prompt templates
 - `~/.local/share/clhorde/history` — prompt history (auto-managed)
-- `~/.local/share/clhorde/session.json` — session persistence (auto-saved on quit)
 
 ### Templates format
 

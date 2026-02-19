@@ -49,7 +49,6 @@ No tmux. No git worktrees. No Python. No Node. Just a single Rust binary and the
 - **Reorder queue** — move pending prompts up/down with `J`/`K`
 - **Search/filter** — press `/` to live-filter prompts by text
 - **Prompt history** — `Up`/`Down` in insert mode cycles through previously submitted prompts
-- **Session persistence** — auto-saves on quit, restore with `--restore`
 - **Prompt templates** — define reusable prompt snippets, expand with `:name` + Tab
 - **Quit confirmation** — warns before quitting with active workers
 - **Graceful shutdown** — sends EOF to all workers on quit, no orphaned processes
@@ -70,8 +69,7 @@ Requires:
 ## Usage
 
 ```bash
-clhorde              # fresh session
-clhorde --restore    # restore previous session
+clhorde              # launch TUI
 clhorde --help       # show help
 ```
 
@@ -216,16 +214,6 @@ This is especially useful when combined with working directories. For example, t
 ```
 /path/to/project: Review this code for bugs and security issues:
 ```
-
-## Session persistence
-
-clhorde automatically saves your session (all prompts and their outputs) to `~/.local/share/clhorde/session.json` when you quit. To restore a previous session:
-
-```bash
-clhorde --restore
-```
-
-Completed and failed prompts are restored as-is. Running/idle prompts (whose processes are gone) are restored as completed. Pending prompts are re-queued and will be dispatched to workers.
 
 ## Architecture
 

@@ -28,7 +28,6 @@ fn cmd_help() -> i32 {
     println!();
     println!("Commands:");
     println!("  (none)              Launch the TUI");
-    println!("  --restore           Launch the TUI and restore previous session");
     println!("  qp                  Manage quick prompts");
     println!("    list              List all quick prompts");
     println!("    add <key> <msg>   Add a quick prompt");
@@ -772,8 +771,6 @@ mod tests {
     fn run_returns_none_for_tui_args() {
         // No subcommand -> None (proceed to TUI)
         assert!(run(&["clhorde".into()]).is_none());
-        // --restore is not a subcommand
-        assert!(run(&["clhorde".into(), "--restore".into()]).is_none());
     }
 
     #[test]

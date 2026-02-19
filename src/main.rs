@@ -26,15 +26,13 @@ async fn main() -> io::Result<()> {
         std::process::exit(code);
     }
 
-    let restore = args.iter().any(|a| a == "--restore");
-
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, restore).await;
+    let result = run_app(&mut terminal).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -47,12 +45,8 @@ async fn main() -> io::Result<()> {
     Ok(())
 }
 
-async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, restore: bool) -> io::Result<()> {
+async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let mut app = App::new();
-
-    if restore {
-        app.load_session();
-    }
 
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<WorkerMessage>();
 
@@ -144,9 +138,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, restore:
         }
 
         if app.should_quit {
-            // Save session before quitting
-            app.save_session();
-
             // Send Kill to all active workers
             for (_id, sender) in app.worker_inputs.drain() {
                 let _ = sender.send(WorkerInput::Kill);
