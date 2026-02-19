@@ -133,6 +133,7 @@ fn truncate_prompt(text: &str, max_chars: usize) -> String {
 }
 
 fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    app.list_height = area.height;
     let tick = app.tick;
     let visible_indices = app.visible_prompt_indices().to_vec();
 

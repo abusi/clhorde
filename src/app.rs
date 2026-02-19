@@ -92,6 +92,10 @@ pub struct App {
     pub worktree_pending: bool,
     /// Worktree cleanup policy.
     pub worktree_cleanup: WorktreeCleanup,
+    /// Height of the prompt list panel (set during rendering).
+    pub list_height: u16,
+    /// Whether `g` was pressed once (waiting for second `g` for gg → go to top).
+    pub pending_g: bool,
 }
 
 impl App {
@@ -182,6 +186,8 @@ impl App {
             prompts_dir,
             worktree_pending: false,
             worktree_cleanup,
+            list_height: 0,
+            pending_g: false,
         }
     }
 
@@ -467,6 +473,38 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
+        // Handle gg sequence: second g completes go-to-top
+        if self.pending_g {
+            self.pending_g = false;
+            if key.code == KeyCode::Char('g') && key.modifiers == KeyModifiers::NONE {
+                self.select_first();
+                self.mark_selected_seen();
+                return;
+            }
+            // Not a second g — fall through to normal handling
+        }
+
+        // Ctrl+D → half page down
+        if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.select_half_page_down();
+            self.mark_selected_seen();
+            return;
+        }
+        // Ctrl+U → half page up
+        if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.select_half_page_up();
+            self.mark_selected_seen();
+            return;
+        }
+
+        // g starts the gg sequence
+        if key.code == KeyCode::Char('g') && key.modifiers == KeyModifiers::NONE
+            && !self.keymap.normal.contains_key(&KeyCode::Char('g'))
+        {
+            self.pending_g = true;
+            return;
+        }
+
         let Some(action) = self.keymap.normal.get(&key.code) else {
             return;
         };
@@ -551,6 +589,22 @@ impl App {
             NormalAction::Search => {
                 self.filter_input.clear();
                 self.mode = AppMode::Filter;
+            }
+            NormalAction::HalfPageDown => {
+                self.select_half_page_down();
+                self.mark_selected_seen();
+            }
+            NormalAction::HalfPageUp => {
+                self.select_half_page_up();
+                self.mark_selected_seen();
+            }
+            NormalAction::GoToTop => {
+                self.select_first();
+                self.mark_selected_seen();
+            }
+            NormalAction::GoToBottom => {
+                self.select_last();
+                self.mark_selected_seen();
             }
         }
     }
@@ -926,6 +980,83 @@ impl App {
                 None => 0,
             };
             self.list_state.select(Some(i));
+        }
+    }
+
+    fn half_page_size(&self) -> usize {
+        let h = if self.list_height > 2 { self.list_height - 2 } else { 10 };
+        (h as usize / 2).max(1)
+    }
+
+    fn select_half_page_down(&mut self) {
+        if self.prompts.is_empty() {
+            return;
+        }
+        let step = self.half_page_size();
+        if self.filter_text.is_some() && !self.filtered_indices.is_empty() {
+            let current = self.list_state.selected().unwrap_or(0);
+            let current_filter_pos = self
+                .filtered_indices
+                .iter()
+                .position(|&i| i == current)
+                .unwrap_or(0);
+            let next_pos = (current_filter_pos + step).min(self.filtered_indices.len() - 1);
+            self.list_state
+                .select(Some(self.filtered_indices[next_pos]));
+        } else {
+            let i = match self.list_state.selected() {
+                Some(i) => (i + step).min(self.prompts.len() - 1),
+                None => 0,
+            };
+            self.list_state.select(Some(i));
+        }
+    }
+
+    fn select_half_page_up(&mut self) {
+        if self.prompts.is_empty() {
+            return;
+        }
+        let step = self.half_page_size();
+        if self.filter_text.is_some() && !self.filtered_indices.is_empty() {
+            let current = self.list_state.selected().unwrap_or(0);
+            let current_filter_pos = self
+                .filtered_indices
+                .iter()
+                .position(|&i| i == current)
+                .unwrap_or(0);
+            let prev_pos = current_filter_pos.saturating_sub(step);
+            self.list_state
+                .select(Some(self.filtered_indices[prev_pos]));
+        } else {
+            let i = match self.list_state.selected() {
+                Some(i) => i.saturating_sub(step),
+                None => 0,
+            };
+            self.list_state.select(Some(i));
+        }
+    }
+
+    fn select_first(&mut self) {
+        if self.prompts.is_empty() {
+            return;
+        }
+        if self.filter_text.is_some() && !self.filtered_indices.is_empty() {
+            self.list_state
+                .select(Some(self.filtered_indices[0]));
+        } else {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    fn select_last(&mut self) {
+        if self.prompts.is_empty() {
+            return;
+        }
+        if self.filter_text.is_some() && !self.filtered_indices.is_empty() {
+            self.list_state
+                .select(Some(*self.filtered_indices.last().unwrap()));
+        } else {
+            self.list_state.select(Some(self.prompts.len() - 1));
         }
     }
 
@@ -1358,6 +1489,8 @@ mod tests {
             prompts_dir: None,
             worktree_pending: false,
             worktree_cleanup: WorktreeCleanup::Manual,
+            list_height: 0,
+            pending_g: false,
         }
     }
 
@@ -1870,5 +2003,148 @@ mod tests {
         });
 
         assert_eq!(app.prompts[0].status, PromptStatus::Running);
+    }
+
+    // ── select_first / select_last ──
+
+    #[test]
+    fn select_first_goes_to_zero() {
+        let mut app = app_with_prompts(&["a", "b", "c", "d", "e"]);
+        app.list_state.select(Some(3));
+
+        app.select_first();
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn select_last_goes_to_end() {
+        let mut app = app_with_prompts(&["a", "b", "c", "d", "e"]);
+        app.list_state.select(Some(1));
+
+        app.select_last();
+        assert_eq!(app.list_state.selected(), Some(4));
+    }
+
+    #[test]
+    fn select_first_empty_is_noop() {
+        let mut app = new_test_app();
+        app.select_first();
+        assert!(app.list_state.selected().is_none());
+    }
+
+    #[test]
+    fn select_last_empty_is_noop() {
+        let mut app = new_test_app();
+        app.select_last();
+        assert!(app.list_state.selected().is_none());
+    }
+
+    // ── select_half_page_down / select_half_page_up ──
+
+    fn app_with_many_prompts(n: usize) -> App {
+        let mut app = new_test_app();
+        for i in 0..n {
+            app.add_prompt(format!("prompt {i}"), None, false);
+        }
+        app
+    }
+
+    #[test]
+    fn half_page_down_jumps_by_half_list_height() {
+        let mut app = app_with_many_prompts(50);
+        app.list_height = 22; // inner height = 20, half = 10
+        app.list_state.select(Some(0));
+
+        app.select_half_page_down();
+        assert_eq!(app.list_state.selected(), Some(10));
+    }
+
+    #[test]
+    fn half_page_up_jumps_by_half_list_height() {
+        let mut app = app_with_many_prompts(50);
+        app.list_height = 22;
+        app.list_state.select(Some(30));
+
+        app.select_half_page_up();
+        assert_eq!(app.list_state.selected(), Some(20));
+    }
+
+    #[test]
+    fn half_page_down_clamps_to_end() {
+        let mut app = app_with_many_prompts(10);
+        app.list_height = 22;
+        app.list_state.select(Some(5));
+
+        app.select_half_page_down();
+        assert_eq!(app.list_state.selected(), Some(9));
+    }
+
+    #[test]
+    fn half_page_up_clamps_to_start() {
+        let mut app = app_with_many_prompts(10);
+        app.list_height = 22;
+        app.list_state.select(Some(3));
+
+        app.select_half_page_up();
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn half_page_empty_is_noop() {
+        let mut app = new_test_app();
+        app.select_half_page_down();
+        app.select_half_page_up();
+        assert!(app.list_state.selected().is_none());
+    }
+
+    #[test]
+    fn half_page_defaults_to_10_when_no_height() {
+        let mut app = app_with_many_prompts(50);
+        app.list_height = 0; // not rendered yet
+        app.list_state.select(Some(0));
+
+        app.select_half_page_down();
+        // Default fallback: height=10, half=5
+        assert_eq!(app.list_state.selected(), Some(5));
+    }
+
+    // ── filtered navigation for new methods ──
+
+    #[test]
+    fn select_first_with_filter() {
+        let mut app = app_with_prompts(&["foo", "bar", "foo2", "baz", "foo3"]);
+        app.filter_text = Some("foo".to_string());
+        app.rebuild_filter();
+        // filtered_indices = [0, 2, 4]
+        app.list_state.select(Some(4)); // last filtered item
+
+        app.select_first();
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn select_last_with_filter() {
+        let mut app = app_with_prompts(&["foo", "bar", "foo2", "baz", "foo3"]);
+        app.filter_text = Some("foo".to_string());
+        app.rebuild_filter();
+        app.list_state.select(Some(0));
+
+        app.select_last();
+        assert_eq!(app.list_state.selected(), Some(4));
+    }
+
+    #[test]
+    fn half_page_down_with_filter() {
+        let texts: Vec<&str> = (0..30).map(|i| if i % 2 == 0 { "even" } else { "odd" }).collect();
+        let mut app = app_with_prompts(&texts);
+        app.filter_text = Some("even".to_string());
+        app.rebuild_filter();
+        // filtered_indices = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28]
+        app.list_height = 22; // half = 10
+        app.list_state.select(Some(0)); // filter pos 0
+
+        app.select_half_page_down();
+        // jump 10 positions in filtered list: pos 10 → index 20
+        assert_eq!(app.list_state.selected(), Some(20));
     }
 }
