@@ -512,6 +512,10 @@ fn invert_normal(km: &Keymap) -> Vec<(String, Vec<String>)> {
             (NormalAction::MoveUp, "move_up"),
             (NormalAction::MoveDown, "move_down"),
             (NormalAction::Search, "search"),
+            (NormalAction::HalfPageDown, "half_page_down"),
+            (NormalAction::HalfPageUp, "half_page_up"),
+            (NormalAction::GoToTop, "go_to_top"),
+            (NormalAction::GoToBottom, "go_to_bottom"),
         ],
     )
 }
@@ -733,6 +737,10 @@ fn action_names_for_mode(mode: &str) -> Option<Vec<&'static str>> {
             "move_up",
             "move_down",
             "search",
+            "half_page_down",
+            "half_page_up",
+            "go_to_top",
+            "go_to_bottom",
         ]),
         "insert" => Some(vec![
             "cancel",
@@ -791,6 +799,10 @@ fn set_toml_action(
                 "move_up" => b.move_up = keys,
                 "move_down" => b.move_down = keys,
                 "search" => b.search = keys,
+                "half_page_down" => b.half_page_down = keys,
+                "half_page_up" => b.half_page_up = keys,
+                "go_to_top" => b.go_to_top = keys,
+                "go_to_bottom" => b.go_to_bottom = keys,
                 _ => unreachable!(),
             }
         }
@@ -881,6 +893,10 @@ fn reset_toml_action(
                     "move_up" => b.move_up = None,
                     "move_down" => b.move_down = None,
                     "search" => b.search = None,
+                    "half_page_down" => b.half_page_down = None,
+                    "half_page_up" => b.half_page_up = None,
+                    "go_to_top" => b.go_to_top = None,
+                    "go_to_bottom" => b.go_to_bottom = None,
                     _ => unreachable!(),
                 }
             }
