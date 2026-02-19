@@ -96,6 +96,10 @@ pub struct App {
     pub list_height: u16,
     /// Whether `g` was pressed once (waiting for second `g` for gg → go to top).
     pub pending_g: bool,
+    /// Panel split ratio (percentage for list panel, 10–90).
+    pub list_ratio: u16,
+    /// Whether the list panel is collapsed (output maximized).
+    pub list_collapsed: bool,
 }
 
 impl App {
@@ -106,6 +110,7 @@ impl App {
         let history = Self::load_history();
         let settings = keymap::load_settings();
         let max_saved_prompts = settings.max_saved_prompts.unwrap_or(100);
+        let list_ratio = (settings.list_ratio.unwrap_or(40) as u16).clamp(10, 90);
         let worktree_cleanup = match settings.worktree_cleanup.as_deref() {
             Some("auto") => WorktreeCleanup::Auto,
             _ => WorktreeCleanup::Manual,
@@ -188,6 +193,8 @@ impl App {
             worktree_cleanup,
             list_height: 0,
             pending_g: false,
+            list_ratio,
+            list_collapsed: false,
         }
     }
 
@@ -542,6 +549,7 @@ impl App {
                         self.prompts[idx].seen = true;
                         self.scroll_offset = 0;
                         self.mode = AppMode::ViewOutput;
+                        self.list_collapsed = true;
                     }
                 }
             }
@@ -563,6 +571,7 @@ impl App {
                         self.interact_input.clear();
                     }
                     self.mode = mode;
+                    self.list_collapsed = true;
                 }
             }
             NormalAction::IncreaseWorkers => {
@@ -605,6 +614,12 @@ impl App {
             NormalAction::GoToBottom => {
                 self.select_last();
                 self.mark_selected_seen();
+            }
+            NormalAction::ShrinkList => {
+                self.list_ratio = (self.list_ratio.saturating_sub(5)).max(10);
+            }
+            NormalAction::GrowList => {
+                self.list_ratio = (self.list_ratio + 5).min(90);
             }
         }
     }
@@ -732,6 +747,7 @@ impl App {
                 self.show_quick_prompts_popup = false;
                 self.mode = AppMode::Normal;
                 self.scroll_offset = 0;
+                self.list_collapsed = false;
             }
             ViewAction::ScrollDown => {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
@@ -757,6 +773,7 @@ impl App {
                         self.interact_input.clear();
                     }
                     self.mode = mode;
+                    self.list_collapsed = true;
                 }
             }
             ViewAction::ToggleAutoscroll => {
@@ -783,6 +800,9 @@ impl App {
             ViewAction::Export => {
                 self.export_selected_output();
             }
+            ViewAction::ToggleSplit => {
+                self.list_collapsed = !self.list_collapsed;
+            }
         }
     }
 
@@ -792,6 +812,7 @@ impl App {
                 InteractAction::Back => {
                     self.mode = AppMode::Normal;
                     self.interact_input.clear();
+                    self.list_collapsed = false;
                 }
                 InteractAction::Send => {
                     if let Some(idx) = self.list_state.selected() {
@@ -1491,6 +1512,8 @@ mod tests {
             worktree_cleanup: WorktreeCleanup::Manual,
             list_height: 0,
             pending_g: false,
+            list_ratio: 40,
+            list_collapsed: false,
         }
     }
 

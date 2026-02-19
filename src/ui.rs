@@ -111,12 +111,17 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_main_area(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let list_pct = if app.list_collapsed { 0 } else { app.list_ratio };
+    let output_pct = 100 - list_pct;
+
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(list_pct), Constraint::Percentage(output_pct)])
         .split(area);
 
-    render_prompt_list(f, app, chunks[0]);
+    if !app.list_collapsed {
+        render_prompt_list(f, app, chunks[0]);
+    }
     render_output_viewer(f, app, chunks[1]);
 }
 
@@ -829,10 +834,12 @@ fn render_quit_confirmation(f: &mut Frame, area: Rect) {
 fn render_quick_prompts_popup(f: &mut Frame, app: &App, main_area: Rect) {
     let qp = app.keymap.quick_prompt_help();
 
-    // Compute the output panel area (right 60% of main_area)
+    // Compute the output panel area (matches render_main_area split)
+    let list_pct = if app.list_collapsed { 0 } else { app.list_ratio };
+    let output_pct = 100 - list_pct;
     let output_area = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(list_pct), Constraint::Percentage(output_pct)])
         .split(main_area)[1];
 
     let lines: Vec<Line> = if qp.is_empty() {

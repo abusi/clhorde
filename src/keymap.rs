@@ -27,6 +27,8 @@ pub enum NormalAction {
     HalfPageUp,
     GoToTop,
     GoToBottom,
+    ShrinkList,
+    GrowList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +49,7 @@ pub enum ViewAction {
     ToggleAutoscroll,
     KillWorker,
     Export,
+    ToggleSplit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +94,8 @@ impl Default for Keymap {
         normal.insert(KeyCode::Char('K'), NormalAction::MoveUp);
         normal.insert(KeyCode::Char('/'), NormalAction::Search);
         normal.insert(KeyCode::Char('G'), NormalAction::GoToBottom);
+        normal.insert(KeyCode::Char('h'), NormalAction::ShrinkList);
+        normal.insert(KeyCode::Char('l'), NormalAction::GrowList);
 
         let mut insert = HashMap::new();
         insert.insert(KeyCode::Esc, InsertAction::Cancel);
@@ -110,6 +115,7 @@ impl Default for Keymap {
         view.insert(KeyCode::Char('f'), ViewAction::ToggleAutoscroll);
         view.insert(KeyCode::Char('x'), ViewAction::KillWorker);
         view.insert(KeyCode::Char('w'), ViewAction::Export);
+        view.insert(KeyCode::Char('t'), ViewAction::ToggleSplit);
 
         let mut interact = HashMap::new();
         interact.insert(KeyCode::Esc, InteractAction::Back);
@@ -156,6 +162,8 @@ pub(crate) struct TomlSettings {
     pub(crate) max_saved_prompts: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) worktree_cleanup: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) list_ratio: Option<u8>,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -196,6 +204,10 @@ pub(crate) struct TomlNormalBindings {
     pub(crate) go_to_top: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) go_to_bottom: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) shrink_list: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) grow_list: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -228,6 +240,8 @@ pub(crate) struct TomlViewBindings {
     pub(crate) kill_worker: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) export: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) toggle_split: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -324,6 +338,8 @@ impl Keymap {
             apply_bindings(&mut keymap.normal, NormalAction::HalfPageUp, normal.half_page_up);
             apply_bindings(&mut keymap.normal, NormalAction::GoToTop, normal.go_to_top);
             apply_bindings(&mut keymap.normal, NormalAction::GoToBottom, normal.go_to_bottom);
+            apply_bindings(&mut keymap.normal, NormalAction::ShrinkList, normal.shrink_list);
+            apply_bindings(&mut keymap.normal, NormalAction::GrowList, normal.grow_list);
         }
 
         if let Some(insert) = config.insert {
@@ -358,6 +374,7 @@ impl Keymap {
             );
             apply_bindings(&mut keymap.view, ViewAction::KillWorker, view.kill_worker);
             apply_bindings(&mut keymap.view, ViewAction::Export, view.export);
+            apply_bindings(&mut keymap.view, ViewAction::ToggleSplit, view.toggle_split);
         }
 
         if let Some(interact) = config.interact {
@@ -448,6 +465,8 @@ pub(crate) fn default_toml_config() -> TomlConfig {
             half_page_up: Some(keys_to_strings(&km.normal, NormalAction::HalfPageUp)),
             go_to_top: Some(keys_to_strings(&km.normal, NormalAction::GoToTop)),
             go_to_bottom: Some(keys_to_strings(&km.normal, NormalAction::GoToBottom)),
+            shrink_list: Some(keys_to_strings(&km.normal, NormalAction::ShrinkList)),
+            grow_list: Some(keys_to_strings(&km.normal, NormalAction::GrowList)),
         }),
         insert: Some(TomlInsertBindings {
             cancel: Some(keys_to_strings(&km.insert, InsertAction::Cancel)),
@@ -464,6 +483,7 @@ pub(crate) fn default_toml_config() -> TomlConfig {
             toggle_autoscroll: Some(keys_to_strings(&km.view, ViewAction::ToggleAutoscroll)),
             kill_worker: Some(keys_to_strings(&km.view, ViewAction::KillWorker)),
             export: Some(keys_to_strings(&km.view, ViewAction::Export)),
+            toggle_split: Some(keys_to_strings(&km.view, ViewAction::ToggleSplit)),
         }),
         interact: Some(TomlInteractBindings {
             back: Some(keys_to_strings(&km.interact, InteractAction::Back)),
@@ -558,6 +578,8 @@ impl Keymap {
             (NormalAction::IncreaseWorkers, "more wkrs"),
             (NormalAction::DecreaseWorkers, "less wkrs"),
             (NormalAction::ToggleMode, "mode"),
+            (NormalAction::ShrinkList, "shrink"),
+            (NormalAction::GrowList, "grow"),
         ];
         self.build_help(&self.normal, entries)
     }
@@ -580,6 +602,7 @@ impl Keymap {
             (ViewAction::ToggleAutoscroll, "auto-scroll"),
             (ViewAction::KillWorker, "kill"),
             (ViewAction::Export, "export"),
+            (ViewAction::ToggleSplit, "split"),
         ];
         self.build_help(&self.view, entries)
     }
