@@ -149,6 +149,8 @@ pub(crate) struct TomlConfig {
 pub(crate) struct TomlSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_saved_prompts: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worktree_cleanup: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Default)]

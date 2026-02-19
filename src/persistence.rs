@@ -12,12 +12,16 @@ pub struct PromptFile {
     pub state: String,
     pub queue_rank: f64,
     pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct PromptOptions {
     pub mode: String,
     pub context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<bool>,
 }
 
 pub fn default_prompts_dir() -> Option<PathBuf> {
@@ -117,10 +121,12 @@ impl PromptFile {
             options: PromptOptions {
                 mode: mode.to_string(),
                 context: prompt.cwd.clone(),
+                worktree: if prompt.worktree { Some(true) } else { None },
             },
             state: state.to_string(),
             queue_rank: prompt.queue_rank,
             session_id: prompt.session_id.clone(),
+            worktree_path: prompt.worktree_path.clone(),
         }
     }
 }
@@ -146,10 +152,12 @@ mod tests {
             options: PromptOptions {
                 mode: "interactive".to_string(),
                 context: Some("/tmp".to_string()),
+                worktree: None,
             },
             state: "completed".to_string(),
             queue_rank: 1.0,
             session_id: Some("sess-123".to_string()),
+            worktree_path: None,
         };
 
         save_prompt(&dir, &uuid1, &data);
@@ -192,10 +200,12 @@ mod tests {
                 options: PromptOptions {
                     mode: "interactive".to_string(),
                     context: None,
+                    worktree: None,
                 },
                 state: "completed".to_string(),
                 queue_rank: rank,
                 session_id: None,
+                worktree_path: None,
             };
             save_prompt(&dir, &uuid, &data);
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -246,10 +256,12 @@ mod tests {
                 options: PromptOptions {
                     mode: "interactive".to_string(),
                     context: None,
+                    worktree: None,
                 },
                 state: "completed".to_string(),
                 queue_rank: i as f64,
                 session_id: None,
+                worktree_path: None,
             };
             save_prompt(&dir, &uuid, &data);
             uuids.push(uuid);
@@ -279,10 +291,12 @@ mod tests {
             options: PromptOptions {
                 mode: "interactive".to_string(),
                 context: None,
+                worktree: None,
             },
             state: "completed".to_string(),
             queue_rank: 1.0,
             session_id: None,
+            worktree_path: None,
         };
         save_prompt(&dir, &uuid, &data);
 
@@ -302,10 +316,12 @@ mod tests {
             options: PromptOptions {
                 mode: "interactive".to_string(),
                 context: None,
+                worktree: None,
             },
             state: "completed".to_string(),
             queue_rank: 1.0,
             session_id: None,
+            worktree_path: None,
         };
         save_prompt(&dir, &uuid, &data);
         assert_eq!(load_all_prompts(&dir).len(), 1);

@@ -12,11 +12,12 @@ clhorde lets you queue up multiple prompts and run them concurrently across a po
 src/
 ├── main.rs         # Entry point, terminal setup, event loop (crossterm + tokio::select!)
 ├── app.rs          # App state, mode handling, keybindings (vim-style: Normal/Insert/View/Interact/PtyInteract/Filter)
-├── prompt.rs       # Prompt data model (id, text, status, output, timing, pty_state, uuid, session_id)
+├── prompt.rs       # Prompt data model (id, text, status, output, timing, pty_state, uuid, session_id, worktree)
 ├── persistence.rs  # Per-prompt file persistence (save/load/prune JSON files)
 ├── ui.rs           # ratatui rendering (status bar, prompt list, output viewer, PTY grid renderer, input bar, help bar)
 ├── worker.rs       # Worker dispatch (routes interactive→PTY, one-shot→stream-json, --resume support)
-└── pty_worker.rs   # PTY worker lifecycle (portable-pty spawn, alacritty_terminal grid, key encoding, resize)
+├── pty_worker.rs   # PTY worker lifecycle (portable-pty spawn, alacritty_terminal grid, key encoding, resize)
+└── worktree.rs     # Git worktree helpers (create/remove/detect via `git` CLI)
 ```
 
 ### Key design decisions
@@ -25,6 +26,7 @@ src/
 - **Worker threads**: Each `claude` subprocess runs in a std::thread (not tokio task) with separate reader/writer threads for stdout parsing and stdin writing.
 - **Communication**: Workers send `WorkerMessage` variants (OutputChunk, PtyUpdate, Finished, SpawnError, SessionId) back to the app via `tokio::sync::mpsc`. The app sends `WorkerInput` (SendInput, SendBytes, Kill) to workers.
 - **Persistence**: Each prompt is persisted as a UUID v7-named JSON file in `~/.local/share/clhorde/prompts/`. On startup, all prompt files are loaded and restored (as Completed/Failed — no auto-dispatch). The `[settings]` section in `keymap.toml` controls `max_saved_prompts` (default: 100) for automatic pruning.
+- **Git worktree isolation**: Per-prompt opt-in via `Ctrl+W` in Insert mode. When enabled, `main.rs` creates a detached git worktree (`git worktree add --detach ../<repo>-wt-<id> HEAD`) before spawning the worker, and overrides the worker's `cwd` to the worktree. Cleanup is controlled by the `worktree_cleanup` setting (`"manual"` default keeps worktrees, `"auto"` removes them on worker finish/kill). Worktree operations use `std::process::Command` (synchronous `git` CLI), not `git2`. The `worktree.rs` module provides `create_worktree()`, `remove_worktree()`, `repo_root()`, `repo_name()`, `is_git_repo()`. Worktree paths are stored on `Prompt.worktree_path` and persisted in the JSON file.
 - **Dual architecture (PTY + stream-json)**: Interactive workers run in a real PTY via `portable-pty`, with the full Claude Code TUI rendered through `alacritty_terminal`. One-shot workers use the lighter `stream-json` protocol for text-only output. This hybrid gives interactive prompts the full Claude experience (tool use visibility, permission prompts, rich formatting) while keeping one-shot prompts lightweight.
 - **PTY terminal emulation**: The `alacritty_terminal` crate provides a headless terminal emulator. PTY output bytes are fed to `Processor::advance()` which updates a `Term` grid. The UI reads this grid each frame, mapping alacritty cell colors/flags to ratatui styles.
 - **Claude CLI integration**: Two spawn strategies based on prompt mode:
@@ -75,6 +77,7 @@ Requires `claude` CLI to be installed and available in PATH.
 - `Esc` — cancel
 - `Up`/`Down` — cycle through prompt history (when no suggestions visible)
 - `Tab` — accept directory or template suggestion
+- `Ctrl+W` — toggle git worktree isolation for this prompt (shows `[WT]` indicator)
 - Type `:name` to expand a template
 
 ### View mode
@@ -122,7 +125,8 @@ Add a `[settings]` section to `keymap.toml`:
 
 ```toml
 [settings]
-max_saved_prompts = 100  # Maximum prompt files to keep (default: 100)
+max_saved_prompts = 100    # Maximum prompt files to keep (default: 100)
+worktree_cleanup = "manual" # "manual" (default) or "auto" — auto removes worktrees on worker finish
 ```
 
 ## CLI subcommands
@@ -139,6 +143,7 @@ clhorde store drop failed       # Drop failed only
 clhorde store drop pending      # Drop pending only
 clhorde store keep completed    # Keep completed, drop rest
 clhorde store keep failed       # Keep failed, drop rest
+clhorde store clean-worktrees   # Remove lingering git worktrees from completed prompts
 ```
 
 ## Code conventions

@@ -213,6 +213,9 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                 Span::raw(truncated),
                 Span::styled(elapsed, Style::default().fg(Color::DarkGray)),
             ];
+            if prompt.worktree {
+                spans.push(Span::styled(" [WT]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            }
             if let Some(cwd_span) = cwd_hint {
                 spans.push(cwd_span);
             }
@@ -303,7 +306,13 @@ fn render_pty_output_viewer(
     cwd_str: &str,
     is_pty_interact: bool,
 ) {
-    let title = format!(" PTY: #{id} [{cwd_str}] ");
+    // Show [WT] in PTY title if this prompt has a worktree
+    let wt_tag = if app.selected_prompt().is_some_and(|p| p.worktree_path.is_some()) {
+        " [WT]"
+    } else {
+        ""
+    };
+    let title = format!(" PTY: #{id} [{cwd_str}]{wt_tag} ");
     let live_indicator = if is_pty_interact {
         Span::styled(" [LIVE] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
     } else {
@@ -469,7 +478,8 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
     let (title, content) = match app.selected_prompt() {
         Some(prompt) => {
             let cwd_str = prompt.cwd.as_deref().unwrap_or(".");
-            let title = format!(" Output: #{} [{}] ", prompt.id, cwd_str);
+            let wt_tag = if prompt.worktree_path.is_some() { " [WT]" } else { "" };
+            let title = format!(" Output: #{} [{}]{wt_tag} ", prompt.id, cwd_str);
             let content = match &prompt.status {
                 PromptStatus::Pending => "(pending)".to_string(),
                 PromptStatus::Running => {
@@ -571,12 +581,15 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
 
 fn render_input_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let (title, content, style, border_color): (String, String, Style, Color) = match app.mode {
-        AppMode::Insert => (
-            " Input (Enter to submit, Esc to cancel) ".to_string(),
-            app.input.clone(),
-            Style::default().fg(Color::White),
-            Color::Green,
-        ),
+        AppMode::Insert => {
+            let wt_tag = if app.worktree_pending { " [WT]" } else { "" };
+            (
+                format!(" Input (Enter to submit, Esc to cancel){wt_tag} "),
+                app.input.clone(),
+                Style::default().fg(Color::White),
+                if app.worktree_pending { Color::Cyan } else { Color::Green },
+            )
+        }
         AppMode::Interact => (
             " Interact (Enter to send, Esc to cancel) ".to_string(),
             app.interact_input.clone(),
@@ -858,7 +871,11 @@ fn render_quick_prompts_popup(f: &mut Frame, app: &App, main_area: Rect) {
 fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let bindings: Vec<(String, &str)> = match app.mode {
         AppMode::Normal => app.keymap.normal_help(),
-        AppMode::Insert => app.keymap.insert_help(),
+        AppMode::Insert => {
+            let mut help = app.keymap.insert_help();
+            help.push(("C-w".to_string(), "worktree"));
+            help
+        }
         AppMode::ViewOutput => app.keymap.view_help(),
         AppMode::Interact => app.keymap.interact_help(),
         AppMode::PtyInteract => vec![("Esc".to_string(), "exit PTY mode")],

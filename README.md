@@ -16,7 +16,7 @@ clhorde takes a fundamentally different approach:
 | **Work model** | Prompt queue + worker pool | N independent sessions |
 | **Concurrency** | Queue any number of prompts, workers pull from queue | Fixed number of parallel sessions |
 | **Dependencies** | Single binary (just needs `claude` in PATH) | Requires tmux, git worktrees |
-| **Code isolation** | Each worker is a fresh subprocess—no shared state | Git worktrees per session |
+| **Code isolation** | Fresh subprocess per worker + optional git worktree per prompt | Git worktrees per session (always) |
 | **Interaction** | Full Claude TUI embedded via PTY + terminal emulator | Full interactive terminal per session |
 | **Binary size** | ~1500 lines of Rust | Go/Python projects with larger dependency trees |
 | **Runtime** | Native async (tokio) + OS threads | tmux + shell processes |
@@ -47,6 +47,7 @@ No tmux. No git worktrees. No Python. No Node. Just a single Rust binary and the
 - **Export output** — save a prompt's output to a markdown file with `w`
 - **Retry prompts** — re-queue completed or failed prompts with `r`
 - **Resume sessions** — resume a completed/failed prompt's Claude session with `R`
+- **Git worktree isolation** — press `Ctrl+W` in insert mode to run a prompt in its own git worktree, preventing file conflicts between parallel workers
 - **Prompt persistence** — prompts are saved to disk and restored on restart
 - **Reorder queue** — move pending prompts up/down with `J`/`K`
 - **Search/filter** — press `/` to live-filter prompts by text
@@ -114,6 +115,7 @@ clhorde store drop failed       # drop failed only
 clhorde store drop pending      # drop pending only
 clhorde store keep completed    # keep completed, drop rest
 clhorde store keep failed       # keep failed, drop rest
+clhorde store clean-worktrees   # remove lingering git worktrees
 ```
 
 Valid filters for `drop`: `all`, `completed`, `failed`, `pending`, `running`.
@@ -152,6 +154,7 @@ clhorde config edit           # open config in $EDITOR (or vi)
 | `Esc` | Cancel and return to normal mode |
 | `↑` / `↓` | Cycle through prompt history (when no suggestions visible) |
 | `Tab` | Accept directory or template suggestion |
+| `Ctrl+W` | Toggle git worktree isolation for this prompt |
 
 ### View mode
 | Key | Action |
@@ -234,6 +237,44 @@ This is especially useful when combined with working directories. For example, t
 ```
 /path/to/project: Review this code for bugs and security issues:
 ```
+
+## Git worktree isolation
+
+When running multiple Claude workers in parallel against the same git repo, they can conflict by modifying the same files simultaneously. Git worktrees solve this by giving each worker its own isolated working directory that shares the same git object database.
+
+### How to use
+
+1. Press `i` to enter insert mode
+2. Type your prompt
+3. Press `Ctrl+W` — the input bar turns cyan and shows `[WT]`
+4. Press `Enter` to submit
+
+The prompt will be dispatched to a new git worktree at `../<repo-name>-wt-<prompt-id>/` (a sibling directory of your repo). The Claude worker runs inside this worktree, so its file changes are isolated from your main checkout and from other workers.
+
+Prompts with worktree enabled show a `[WT]` tag in the prompt list and output panel title.
+
+### Requirements
+
+- You must be inside a git repository (or provide a directory prefix that is)
+- If you're not in a git repo, the prompt will fail with an error message
+
+### Worktree cleanup
+
+By default, worktrees persist after the worker finishes. You can control this with the `worktree_cleanup` setting in `keymap.toml`:
+
+```toml
+[settings]
+worktree_cleanup = "manual"  # default — worktrees persist after completion
+# worktree_cleanup = "auto"  # automatically remove worktrees when workers finish
+```
+
+To manually clean up lingering worktrees:
+
+```bash
+clhorde store clean-worktrees
+```
+
+This scans all persisted prompts, finds any with associated worktree paths, and runs `git worktree remove` for each one.
 
 ## Architecture
 
