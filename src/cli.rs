@@ -7,6 +7,7 @@ use crate::keymap::{
     TomlFilterBindings, TomlInsertBindings, TomlInteractBindings, TomlNormalBindings,
     TomlViewBindings, ViewAction,
 };
+use crate::persistence;
 
 /// Returns Some(exit_code) if a CLI subcommand was handled, None to continue to TUI.
 pub fn run(args: &[String]) -> Option<i32> {
@@ -16,6 +17,7 @@ pub fn run(args: &[String]) -> Option<i32> {
         "qp" => Some(cmd_qp(&args[2..])),
         "keys" => Some(cmd_keys(&args[2..])),
         "config" => Some(cmd_config(&args[2..])),
+        "store" => Some(cmd_store(&args[2..])),
         _ => None,
     }
 }
@@ -28,6 +30,12 @@ fn cmd_help() -> i32 {
     println!();
     println!("Commands:");
     println!("  (none)              Launch the TUI");
+    println!("  store               Manage persisted prompts");
+    println!("    list              List all stored prompts");
+    println!("    count             Show prompt counts by state");
+    println!("    path              Print storage directory path");
+    println!("    drop <filter>     Delete stored prompts");
+    println!("    keep <filter>     Keep only matching, delete rest");
     println!("  qp                  Manage quick prompts");
     println!("    list              List all quick prompts");
     println!("    add <key> <msg>   Add a quick prompt");
@@ -45,7 +53,13 @@ fn cmd_help() -> i32 {
     println!();
     println!("Modes: normal, insert, view, interact, filter");
     println!();
+    println!("Filters for drop/keep: all, completed, failed, pending");
+    println!();
     println!("Examples:");
+    println!("  clhorde store list");
+    println!("  clhorde store drop all");
+    println!("  clhorde store drop failed");
+    println!("  clhorde store keep completed");
     println!("  clhorde qp add g \"let's go\"");
     println!("  clhorde keys set normal quit Q");
     println!("  clhorde keys list normal");
@@ -132,6 +146,184 @@ fn qp_remove(args: &[String]) -> i32 {
         return 1;
     }
     println!("Removed quick prompt: {key_str}");
+    0
+}
+
+// ── store subcommands ──
+
+const VALID_STATES: &[&str] = &["completed", "failed", "pending", "running"];
+
+fn cmd_store(args: &[String]) -> i32 {
+    match args.first().map(|s| s.as_str()) {
+        Some("list") => store_list(),
+        Some("count") => store_count(),
+        Some("path") => store_path(),
+        Some("drop") => store_drop(args.get(1).map(|s| s.as_str())),
+        Some("keep") => store_keep(args.get(1).map(|s| s.as_str())),
+        _ => {
+            eprintln!("Usage: clhorde store <list|count|path|drop|keep>");
+            eprintln!("  list              List all stored prompts");
+            eprintln!("  count             Show prompt counts by state");
+            eprintln!("  path              Print storage directory path");
+            eprintln!("  drop <filter>     Delete stored prompts");
+            eprintln!("  keep <filter>     Keep only matching, delete rest");
+            eprintln!();
+            eprintln!("Filters: all, completed, failed, pending, running");
+            1
+        }
+    }
+}
+
+fn store_dir_or_err() -> Result<std::path::PathBuf, i32> {
+    match persistence::default_prompts_dir() {
+        Some(d) => Ok(d),
+        None => {
+            eprintln!("Cannot determine storage directory.");
+            Err(1)
+        }
+    }
+}
+
+fn store_path() -> i32 {
+    match store_dir_or_err() {
+        Ok(d) => {
+            println!("{}", d.display());
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+fn store_list() -> i32 {
+    let dir = match store_dir_or_err() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let prompts = persistence::load_all_prompts(&dir);
+    if prompts.is_empty() {
+        println!("No stored prompts.");
+        return 0;
+    }
+    println!(
+        "{:<38} {:<11} {:<13} PROMPT",
+        "UUID", "STATE", "MODE"
+    );
+    println!("{}", "-".repeat(78));
+    for (uuid, p) in &prompts {
+        let text = if p.prompt.len() > 40 {
+            format!("{}...", &p.prompt[..37])
+        } else {
+            p.prompt.clone()
+        };
+        // Replace newlines with spaces for display
+        let text = text.replace('\n', " ");
+        println!(
+            "{:<38} {:<11} {:<13} {}",
+            uuid, p.state, p.options.mode, text
+        );
+    }
+    println!("\n{} prompt(s) total.", prompts.len());
+    0
+}
+
+fn store_count() -> i32 {
+    let dir = match store_dir_or_err() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let prompts = persistence::load_all_prompts(&dir);
+    if prompts.is_empty() {
+        println!("No stored prompts.");
+        return 0;
+    }
+
+    let mut counts = std::collections::HashMap::new();
+    for (_, p) in &prompts {
+        *counts.entry(p.state.as_str()).or_insert(0usize) += 1;
+    }
+    for state in VALID_STATES {
+        if let Some(&n) = counts.get(state) {
+            println!("{state}: {n}");
+        }
+    }
+    println!("total: {}", prompts.len());
+    0
+}
+
+fn store_drop(filter: Option<&str>) -> i32 {
+    let filter = match filter {
+        Some(f) => f,
+        None => {
+            eprintln!("Usage: clhorde store drop <filter>");
+            eprintln!("Filters: all, completed, failed, pending, running");
+            return 1;
+        }
+    };
+
+    if filter != "all" && !VALID_STATES.contains(&filter) {
+        eprintln!("Unknown filter: {filter}");
+        eprintln!("Valid filters: all, completed, failed, pending, running");
+        return 1;
+    }
+
+    let dir = match store_dir_or_err() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+
+    if filter == "all" {
+        let prompts = persistence::load_all_prompts(&dir);
+        let count = prompts.len();
+        for (uuid, _) in &prompts {
+            persistence::delete_prompt_file(&dir, uuid);
+        }
+        println!("Dropped {count} prompt(s).");
+    } else {
+        let prompts = persistence::load_all_prompts(&dir);
+        let mut count = 0;
+        for (uuid, p) in &prompts {
+            if p.state == filter {
+                persistence::delete_prompt_file(&dir, uuid);
+                count += 1;
+            }
+        }
+        println!("Dropped {count} {filter} prompt(s).");
+    }
+    0
+}
+
+fn store_keep(filter: Option<&str>) -> i32 {
+    let filter = match filter {
+        Some(f) => f,
+        None => {
+            eprintln!("Usage: clhorde store keep <filter>");
+            eprintln!("Filters: completed, failed, pending, running");
+            return 1;
+        }
+    };
+
+    if !VALID_STATES.contains(&filter) {
+        eprintln!("Unknown filter: {filter}");
+        eprintln!("Valid filters: completed, failed, pending, running");
+        return 1;
+    }
+
+    let dir = match store_dir_or_err() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let prompts = persistence::load_all_prompts(&dir);
+    let mut dropped = 0;
+    let mut kept = 0;
+    for (uuid, p) in &prompts {
+        if p.state != filter {
+            persistence::delete_prompt_file(&dir, uuid);
+            dropped += 1;
+        } else {
+            kept += 1;
+        }
+    }
+    println!("Kept {kept} {filter} prompt(s), dropped {dropped}.");
     0
 }
 
@@ -783,6 +975,7 @@ mod tests {
         assert!(run(&["clhorde".into(), "qp".into()]).is_some());
         assert!(run(&["clhorde".into(), "keys".into()]).is_some());
         assert!(run(&["clhorde".into(), "config".into()]).is_some());
+        assert!(run(&["clhorde".into(), "store".into()]).is_some());
     }
 
     #[test]
@@ -790,5 +983,128 @@ mod tests {
         assert_eq!(run(&["clhorde".into(), "help".into()]), Some(0));
         assert_eq!(run(&["clhorde".into(), "--help".into()]), Some(0));
         assert_eq!(run(&["clhorde".into(), "-h".into()]), Some(0));
+    }
+
+    // ── store subcommand tests ──
+
+    use std::fs;
+    use crate::persistence::{PromptFile, PromptOptions};
+
+    fn temp_store_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("clhorde-cli-test-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_prompt(state: &str, rank: f64) -> PromptFile {
+        PromptFile {
+            prompt: format!("test {state}"),
+            options: PromptOptions {
+                mode: "interactive".to_string(),
+                context: None,
+            },
+            state: state.to_string(),
+            queue_rank: rank,
+            session_id: None,
+        }
+    }
+
+    fn seed_store(dir: &std::path::Path, states: &[&str]) -> Vec<String> {
+        let mut uuids = Vec::new();
+        for (i, state) in states.iter().enumerate() {
+            let uuid = uuid::Uuid::now_v7().to_string();
+            persistence::save_prompt(dir, &uuid, &make_prompt(state, i as f64));
+            uuids.push(uuid);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        uuids
+    }
+
+    #[test]
+    fn store_subcommand_no_args_returns_error() {
+        assert_eq!(cmd_store(&[]), 1);
+    }
+
+    #[test]
+    fn store_path_returns_ok() {
+        assert_eq!(store_path(), 0);
+    }
+
+    #[test]
+    fn store_list_empty() {
+        // Uses real dir — may or may not be empty, but should not crash
+        assert_eq!(store_list(), 0);
+    }
+
+    #[test]
+    fn store_drop_no_filter_returns_error() {
+        assert_eq!(store_drop(None), 1);
+    }
+
+    #[test]
+    fn store_drop_invalid_filter_returns_error() {
+        assert_eq!(store_drop(Some("bogus")), 1);
+    }
+
+    #[test]
+    fn store_keep_no_filter_returns_error() {
+        assert_eq!(store_keep(None), 1);
+    }
+
+    #[test]
+    fn store_keep_invalid_filter_returns_error() {
+        assert_eq!(store_keep(Some("bogus")), 1);
+    }
+
+    #[test]
+    fn store_drop_all_clears_directory() {
+        let dir = temp_store_dir();
+        seed_store(&dir, &["completed", "failed", "pending"]);
+        assert_eq!(persistence::load_all_prompts(&dir).len(), 3);
+
+        // We can't call store_drop directly with a custom dir, so test the
+        // underlying persistence logic that store_drop uses.
+        let prompts = persistence::load_all_prompts(&dir);
+        for (uuid, _) in &prompts {
+            persistence::delete_prompt_file(&dir, uuid);
+        }
+        assert_eq!(persistence::load_all_prompts(&dir).len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_drop_by_state_filters_correctly() {
+        let dir = temp_store_dir();
+        seed_store(&dir, &["completed", "failed", "completed", "pending"]);
+
+        // Drop only "completed"
+        let prompts = persistence::load_all_prompts(&dir);
+        for (uuid, p) in &prompts {
+            if p.state == "completed" {
+                persistence::delete_prompt_file(&dir, uuid);
+            }
+        }
+        let remaining = persistence::load_all_prompts(&dir);
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|(_, p)| p.state != "completed"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_keep_by_state_filters_correctly() {
+        let dir = temp_store_dir();
+        seed_store(&dir, &["completed", "failed", "completed", "pending"]);
+
+        // Keep only "completed"
+        let prompts = persistence::load_all_prompts(&dir);
+        for (uuid, p) in &prompts {
+            if p.state != "completed" {
+                persistence::delete_prompt_file(&dir, uuid);
+            }
+        }
+        let remaining = persistence::load_all_prompts(&dir);
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|(_, p)| p.state == "completed"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

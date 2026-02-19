@@ -46,6 +46,8 @@ No tmux. No git worktrees. No Python. No Node. Just a single Rust binary and the
 - **Kill workers** — terminate a running prompt with `x`
 - **Export output** — save a prompt's output to a markdown file with `w`
 - **Retry prompts** — re-queue completed or failed prompts with `r`
+- **Resume sessions** — resume a completed/failed prompt's Claude session with `R`
+- **Prompt persistence** — prompts are saved to disk and restored on restart
 - **Reorder queue** — move pending prompts up/down with `J`/`K`
 - **Search/filter** — press `/` to live-filter prompts by text
 - **Prompt history** — `Up`/`Down` in insert mode cycles through previously submitted prompts
@@ -100,6 +102,23 @@ clhorde keys reset normal               # reset entire mode to defaults
 
 Valid modes: `normal`, `insert`, `view`, `interact`, `filter`.
 
+### Prompt storage
+
+```bash
+clhorde store list              # list all stored prompts
+clhorde store count             # show counts by state
+clhorde store path              # print storage directory
+clhorde store drop all          # drop all stored prompts
+clhorde store drop completed    # drop completed only
+clhorde store drop failed       # drop failed only
+clhorde store drop pending      # drop pending only
+clhorde store keep completed    # keep completed, drop rest
+clhorde store keep failed       # keep failed, drop rest
+```
+
+Valid filters for `drop`: `all`, `completed`, `failed`, `pending`, `running`.
+Valid filters for `keep`: `completed`, `failed`, `pending`, `running`.
+
 ### Config file
 
 ```bash
@@ -118,7 +137,8 @@ clhorde config edit           # open config in $EDITOR (or vi)
 | `j` / `k` / `↑` / `↓` | Navigate prompt list |
 | `Enter` | View selected prompt's output |
 | `s` | Interact with running/idle prompt |
-| `r` | Retry selected completed/failed prompt |
+| `r` | Retry selected completed/failed prompt (new prompt) |
+| `R` | Resume selected completed/failed prompt's session |
 | `J` / `K` | Move selected pending prompt down/up in queue |
 | `/` | Enter filter mode (search prompts) |
 | `+` / `-` | Increase / decrease max workers (1–20) |

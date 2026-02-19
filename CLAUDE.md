@@ -125,6 +125,22 @@ Add a `[settings]` section to `keymap.toml`:
 max_saved_prompts = 100  # Maximum prompt files to keep (default: 100)
 ```
 
+## CLI subcommands
+
+### `clhorde store` — manage persisted prompts
+
+```bash
+clhorde store list              # List all stored prompts
+clhorde store count             # Show counts by state
+clhorde store path              # Print storage directory
+clhorde store drop all          # Drop all stored prompts
+clhorde store drop completed    # Drop completed only
+clhorde store drop failed       # Drop failed only
+clhorde store drop pending      # Drop pending only
+clhorde store keep completed    # Keep completed, drop rest
+clhorde store keep failed       # Keep failed, drop rest
+```
+
 ## Code conventions
 
 - Rust 2021 edition, MSRV 1.88
