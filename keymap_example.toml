@@ -18,6 +18,8 @@ retry = ["r"]
 move_up = ["K"]
 move_down = ["J"]
 search = ["/"]
+shrink_list = ["h"]
+grow_list = ["l"]
 
 [insert]
 cancel = ["Esc"]
@@ -34,6 +36,7 @@ interact = ["s"]
 toggle_autoscroll = ["f"]
 kill_worker = ["x"]
 export = ["w"]
+toggle_split = ["t"]
 
 [interact]
 back = ["Esc"]
@@ -42,6 +45,9 @@ send = ["Enter"]
 [filter]
 confirm = ["Enter"]
 cancel = ["Esc"]
+
+# [settings]
+# list_ratio = 40        # Default split ratio for prompt list (10-90, default: 40)
 
 # Quick prompts — send a predefined message with a single keypress in view mode.
 # Keys here must not conflict with [view] bindings (view bindings take priority).
