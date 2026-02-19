@@ -94,7 +94,6 @@ pub fn prune_old_prompts(dir: &Path, max: usize) {
     }
 }
 
-#[allow(dead_code)]
 pub fn delete_prompt_file(dir: &Path, uuid: &str) {
     let path = dir.join(format!("{uuid}.json"));
     let _ = fs::remove_file(path);
