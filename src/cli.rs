@@ -10,16 +10,23 @@ use crate::keymap::{
 use crate::persistence;
 use crate::worktree;
 
-/// Returns Some(exit_code) if a CLI subcommand was handled, None to continue to TUI.
-pub fn run(args: &[String]) -> Option<i32> {
-    let cmd = args.get(1).map(|s| s.as_str())?;
+pub enum CliAction {
+    Exit(i32),
+    LaunchTui(Vec<String>),
+}
+
+pub fn run(args: &[String]) -> CliAction {
+    let Some(cmd) = args.get(1).map(|s| s.as_str()) else {
+        return CliAction::LaunchTui(vec![]);
+    };
     match cmd {
-        "help" | "--help" | "-h" => Some(cmd_help()),
-        "qp" => Some(cmd_qp(&args[2..])),
-        "keys" => Some(cmd_keys(&args[2..])),
-        "config" => Some(cmd_config(&args[2..])),
-        "store" => Some(cmd_store(&args[2..])),
-        _ => None,
+        "help" | "--help" | "-h" => CliAction::Exit(cmd_help()),
+        "qp" => CliAction::Exit(cmd_qp(&args[2..])),
+        "keys" => CliAction::Exit(cmd_keys(&args[2..])),
+        "config" => CliAction::Exit(cmd_config(&args[2..])),
+        "store" => CliAction::Exit(cmd_store(&args[2..])),
+        "prompt-from-files" => cmd_prompt_from_files(&args[2..]),
+        _ => CliAction::LaunchTui(vec![]),
     }
 }
 
@@ -52,6 +59,8 @@ fn cmd_help() -> i32 {
     println!("    path              Print config file path");
     println!("    edit              Open config in $EDITOR");
     println!("    init [--force]    Create config with defaults");
+    println!("  prompt-from-files <files...>");
+    println!("                      Load prompts from files and launch TUI");
     println!();
     println!("Modes: normal, insert, view, interact, filter");
     println!();
@@ -66,6 +75,8 @@ fn cmd_help() -> i32 {
     println!("  clhorde keys set normal quit Q");
     println!("  clhorde keys list normal");
     println!("  clhorde config init");
+    println!("  clhorde prompt-from-files tasks/*.md");
+    println!("  clhorde prompt-from-files a.txt,b.txt c.txt");
     0
 }
 
@@ -149,6 +160,45 @@ fn qp_remove(args: &[String]) -> i32 {
     }
     println!("Removed quick prompt: {key_str}");
     0
+}
+
+// ── prompt-from-files ──
+
+fn cmd_prompt_from_files(args: &[String]) -> CliAction {
+    if args.is_empty() {
+        eprintln!("Usage: clhorde prompt-from-files <file1> [file2...] or <file1,file2,...>");
+        return CliAction::Exit(1);
+    }
+
+    let mut prompts = Vec::new();
+    for arg in args {
+        for path_str in arg.split(',') {
+            let path_str = path_str.trim();
+            if path_str.is_empty() {
+                continue;
+            }
+            match std::fs::read_to_string(path_str) {
+                Ok(content) => {
+                    let content = content.trim().to_string();
+                    if content.is_empty() {
+                        eprintln!("Warning: skipping empty file: {path_str}");
+                    } else {
+                        prompts.push(content);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: cannot read {path_str}: {e}");
+                }
+            }
+        }
+    }
+
+    if prompts.is_empty() {
+        eprintln!("No valid prompts loaded from files.");
+        return CliAction::Exit(1);
+    }
+
+    CliAction::LaunchTui(prompts)
 }
 
 // ── store subcommands ──
@@ -1077,25 +1127,116 @@ mod tests {
     }
 
     #[test]
-    fn run_returns_none_for_tui_args() {
-        // No subcommand -> None (proceed to TUI)
-        assert!(run(&["clhorde".into()]).is_none());
+    fn run_returns_launch_tui_for_no_args() {
+        // No subcommand -> LaunchTui
+        assert!(matches!(run(&["clhorde".into()]), CliAction::LaunchTui(v) if v.is_empty()));
     }
 
     #[test]
     fn run_dispatches_subcommands() {
-        // These should return Some (handled), even if the subcommand fails
-        assert!(run(&["clhorde".into(), "qp".into()]).is_some());
-        assert!(run(&["clhorde".into(), "keys".into()]).is_some());
-        assert!(run(&["clhorde".into(), "config".into()]).is_some());
-        assert!(run(&["clhorde".into(), "store".into()]).is_some());
+        // These should return Exit (handled), even if the subcommand fails
+        assert!(matches!(run(&["clhorde".into(), "qp".into()]), CliAction::Exit(_)));
+        assert!(matches!(run(&["clhorde".into(), "keys".into()]), CliAction::Exit(_)));
+        assert!(matches!(run(&["clhorde".into(), "config".into()]), CliAction::Exit(_)));
+        assert!(matches!(run(&["clhorde".into(), "store".into()]), CliAction::Exit(_)));
     }
 
     #[test]
     fn run_dispatches_help() {
-        assert_eq!(run(&["clhorde".into(), "help".into()]), Some(0));
-        assert_eq!(run(&["clhorde".into(), "--help".into()]), Some(0));
-        assert_eq!(run(&["clhorde".into(), "-h".into()]), Some(0));
+        assert!(matches!(run(&["clhorde".into(), "help".into()]), CliAction::Exit(0)));
+        assert!(matches!(run(&["clhorde".into(), "--help".into()]), CliAction::Exit(0)));
+        assert!(matches!(run(&["clhorde".into(), "-h".into()]), CliAction::Exit(0)));
+    }
+
+    #[test]
+    fn run_unknown_command_launches_tui() {
+        assert!(matches!(run(&["clhorde".into(), "unknown".into()]), CliAction::LaunchTui(v) if v.is_empty()));
+    }
+
+    #[test]
+    fn prompt_from_files_no_args() {
+        assert!(matches!(cmd_prompt_from_files(&[]), CliAction::Exit(1)));
+    }
+
+    #[test]
+    fn prompt_from_files_reads_files() {
+        let dir = std::env::temp_dir().join(format!("clhorde-pff-test-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let f1 = dir.join("p1.txt");
+        let f2 = dir.join("p2.txt");
+        fs::write(&f1, "prompt one").unwrap();
+        fs::write(&f2, "prompt two").unwrap();
+
+        let args = vec![
+            f1.to_string_lossy().to_string(),
+            f2.to_string_lossy().to_string(),
+        ];
+        match cmd_prompt_from_files(&args) {
+            CliAction::LaunchTui(prompts) => {
+                assert_eq!(prompts.len(), 2);
+                assert_eq!(prompts[0], "prompt one");
+                assert_eq!(prompts[1], "prompt two");
+            }
+            _ => panic!("Expected LaunchTui"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_from_files_comma_separated() {
+        let dir = std::env::temp_dir().join(format!("clhorde-pff-comma-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        fs::write(&f1, "alpha").unwrap();
+        fs::write(&f2, "beta").unwrap();
+
+        let arg = format!("{},{}", f1.display(), f2.display());
+        match cmd_prompt_from_files(&[arg]) {
+            CliAction::LaunchTui(prompts) => {
+                assert_eq!(prompts.len(), 2);
+                assert_eq!(prompts[0], "alpha");
+                assert_eq!(prompts[1], "beta");
+            }
+            _ => panic!("Expected LaunchTui"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_from_files_skips_empty_and_missing() {
+        let dir = std::env::temp_dir().join(format!("clhorde-pff-skip-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let f1 = dir.join("good.txt");
+        let f2 = dir.join("empty.txt");
+        fs::write(&f1, "valid prompt").unwrap();
+        fs::write(&f2, "   ").unwrap(); // whitespace-only = empty after trim
+
+        let args = vec![
+            f1.to_string_lossy().to_string(),
+            f2.to_string_lossy().to_string(),
+            "/tmp/nonexistent-clhorde-test-file.txt".to_string(),
+        ];
+        match cmd_prompt_from_files(&args) {
+            CliAction::LaunchTui(prompts) => {
+                assert_eq!(prompts.len(), 1);
+                assert_eq!(prompts[0], "valid prompt");
+            }
+            _ => panic!("Expected LaunchTui"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_from_files_all_invalid_exits() {
+        let args = vec![
+            "/tmp/nonexistent-clhorde-1.txt".to_string(),
+            "/tmp/nonexistent-clhorde-2.txt".to_string(),
+        ];
+        assert!(matches!(cmd_prompt_from_files(&args), CliAction::Exit(1)));
     }
 
     // ── store subcommand tests ──
