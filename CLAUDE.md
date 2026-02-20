@@ -150,10 +150,13 @@ clhorde store clean-worktrees   # Remove lingering git worktrees from completed 
 
 Reads file contents and queues them as prompts, then launches the TUI. Each file becomes one pending prompt. Shell glob expansion handles patterns. Comma-separated values within a single argument are also split into individual file paths.
 
+All prompts loaded via `prompt-from-files` automatically have **worktree isolation enabled**, so each prompt gets its own git worktree. Use `--run-path <path>` to specify the working directory (and git repo) for all prompts.
+
 ```bash
-clhorde prompt-from-files tasks/*.md            # Load all .md files as prompts
-clhorde prompt-from-files a.txt b.txt c.txt     # Load specific files
-clhorde prompt-from-files a.txt,b.txt c.txt     # Comma-separated + space-separated
+clhorde prompt-from-files tasks/*.md                          # Load all .md files as prompts
+clhorde prompt-from-files --run-path /path/to/repo tasks/*.md # Run in a specific directory
+clhorde prompt-from-files a.txt b.txt c.txt                   # Load specific files
+clhorde prompt-from-files a.txt,b.txt c.txt                   # Comma-separated + space-separated
 ```
 
 ## Code conventions

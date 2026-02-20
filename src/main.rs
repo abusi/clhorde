@@ -20,15 +20,15 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use app::App;
-use cli::CliAction;
+use cli::{CliAction, LaunchOptions};
 use worker::{SpawnResult, WorkerInput, WorkerMessage};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let initial_prompts = match cli::run(&args) {
+    let launch_opts = match cli::run(&args) {
         CliAction::Exit(code) => std::process::exit(code),
-        CliAction::LaunchTui(prompts) => prompts,
+        CliAction::LaunchTui(opts) => opts,
     };
 
     enable_raw_mode()?;
@@ -37,7 +37,7 @@ async fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, initial_prompts).await;
+    let result = run_app(&mut terminal, launch_opts).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
@@ -50,11 +50,12 @@ async fn main() -> io::Result<()> {
     Ok(())
 }
 
-async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, initial_prompts: Vec<String>) -> io::Result<()> {
+async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_opts: LaunchOptions) -> io::Result<()> {
     let mut app = App::new();
 
-    for text in initial_prompts {
-        app.add_prompt(text, None, false, Vec::new());
+    let LaunchOptions { prompts, worktree, run_path } = launch_opts;
+    for text in prompts {
+        app.add_prompt(text, run_path.clone(), worktree, Vec::new());
     }
 
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<WorkerMessage>();

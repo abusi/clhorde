@@ -178,10 +178,15 @@ Created config: /home/user/.config/clhorde/keymap.toml
     <!-- ── prompt-from-files ── -->
     <section id="prompt-from-files">
       <h2><code>clhorde prompt-from-files</code></h2>
-      <p>Read file contents and queue them as prompts, then launch the TUI. Each file becomes one pending prompt.</p>
+      <p>Read file contents and queue them as prompts, then launch the TUI. Each file becomes one pending prompt. All prompts automatically run with <strong>worktree isolation</strong>, so each gets its own git worktree.</p>
 
       <h3>Synopsis</h3>
-      <pre><code><span class="tok-prompt">$ </span>clhorde prompt-from-files &lt;file1&gt; [file2...] or &lt;file1,file2,...&gt;</code></pre>
+      <pre><code><span class="tok-prompt">$ </span>clhorde prompt-from-files [--run-path &lt;path&gt;] &lt;file1&gt; [file2...] or &lt;file1,file2,...&gt;</code></pre>
+
+      <h3>Options</h3>
+      <table>
+        <tr><td><code>--run-path &lt;path&gt;</code></td><td>Set the working directory (and git repo) for all prompts. Must be an existing directory.</td></tr>
+      </table>
 
       <h3>Details</h3>
       <ul>
@@ -191,12 +196,15 @@ Created config: /home/user/.config/clhorde/keymap.toml
         <li>Empty files are skipped with a warning</li>
         <li>Unreadable files are skipped with a warning</li>
         <li>If no valid prompts are loaded, the command exits with an error</li>
+        <li>Worktree isolation is always enabled &mdash; each prompt gets its own git worktree</li>
+        <li>Use <code>--run-path</code> to target a specific repository when running from a different directory</li>
       </ul>
 
       <h3>Examples</h3>
-      <pre><code><span class="tok-prompt">$ </span>clhorde prompt-from-files tasks/*.md            <span class="tok-cmt"># Load all .md files as prompts</span>
-<span class="tok-prompt">$ </span>clhorde prompt-from-files a.txt b.txt c.txt     <span class="tok-cmt"># Load specific files</span>
-<span class="tok-prompt">$ </span>clhorde prompt-from-files a.txt,b.txt c.txt     <span class="tok-cmt"># Comma + space separated</span></code></pre>
+      <pre><code><span class="tok-prompt">$ </span>clhorde prompt-from-files tasks/*.md                          <span class="tok-cmt"># Load all .md files as prompts</span>
+<span class="tok-prompt">$ </span>clhorde prompt-from-files --run-path /path/to/repo tasks/*.md <span class="tok-cmt"># Run in a specific directory</span>
+<span class="tok-prompt">$ </span>clhorde prompt-from-files a.txt b.txt c.txt                   <span class="tok-cmt"># Load specific files</span>
+<span class="tok-prompt">$ </span>clhorde prompt-from-files a.txt,b.txt c.txt                   <span class="tok-cmt"># Comma + space separated</span></code></pre>
     </section>
 
   </main>

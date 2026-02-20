@@ -10,14 +10,20 @@ use crate::keymap::{
 use crate::persistence;
 use crate::worktree;
 
+pub struct LaunchOptions {
+    pub prompts: Vec<String>,
+    pub worktree: bool,
+    pub run_path: Option<String>,
+}
+
 pub enum CliAction {
     Exit(i32),
-    LaunchTui(Vec<String>),
+    LaunchTui(LaunchOptions),
 }
 
 pub fn run(args: &[String]) -> CliAction {
     let Some(cmd) = args.get(1).map(|s| s.as_str()) else {
-        return CliAction::LaunchTui(vec![]);
+        return CliAction::LaunchTui(LaunchOptions { prompts: vec![], worktree: false, run_path: None });
     };
     match cmd {
         "help" | "--help" | "-h" => CliAction::Exit(cmd_help()),
@@ -26,7 +32,7 @@ pub fn run(args: &[String]) -> CliAction {
         "config" => CliAction::Exit(cmd_config(&args[2..])),
         "store" => CliAction::Exit(cmd_store(&args[2..])),
         "prompt-from-files" => cmd_prompt_from_files(&args[2..]),
-        _ => CliAction::LaunchTui(vec![]),
+        _ => CliAction::LaunchTui(LaunchOptions { prompts: vec![], worktree: false, run_path: None }),
     }
 }
 
@@ -59,8 +65,10 @@ fn cmd_help() -> i32 {
     println!("    path              Print config file path");
     println!("    edit              Open config in $EDITOR");
     println!("    init [--force]    Create config with defaults");
-    println!("  prompt-from-files <files...>");
+    println!("  prompt-from-files [--run-path <path>] <files...>");
     println!("                      Load prompts from files and launch TUI");
+    println!("                      Each prompt runs in its own git worktree");
+    println!("                      --run-path sets the working directory for all prompts");
     println!();
     println!("Modes: normal, insert, view, interact, filter");
     println!();
@@ -76,6 +84,7 @@ fn cmd_help() -> i32 {
     println!("  clhorde keys list normal");
     println!("  clhorde config init");
     println!("  clhorde prompt-from-files tasks/*.md");
+    println!("  clhorde prompt-from-files --run-path /tmp/myproject tasks/*.md");
     println!("  clhorde prompt-from-files a.txt,b.txt c.txt");
     0
 }
@@ -166,12 +175,45 @@ fn qp_remove(args: &[String]) -> i32 {
 
 fn cmd_prompt_from_files(args: &[String]) -> CliAction {
     if args.is_empty() {
-        eprintln!("Usage: clhorde prompt-from-files <file1> [file2...] or <file1,file2,...>");
+        eprintln!("Usage: clhorde prompt-from-files [--run-path <path>] <file1> [file2...] or <file1,file2,...>");
+        return CliAction::Exit(1);
+    }
+
+    // Extract --run-path <path> from args
+    let mut run_path: Option<String> = None;
+    let mut file_args: Vec<&String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--run-path" {
+            if let Some(path) = args.get(i + 1) {
+                let p = std::path::Path::new(path);
+                if !p.exists() {
+                    eprintln!("Error: --run-path does not exist: {path}");
+                    return CliAction::Exit(1);
+                }
+                if !p.is_dir() {
+                    eprintln!("Error: --run-path is not a directory: {path}");
+                    return CliAction::Exit(1);
+                }
+                run_path = Some(path.clone());
+                i += 2;
+            } else {
+                eprintln!("Error: --run-path requires a path argument");
+                return CliAction::Exit(1);
+            }
+        } else {
+            file_args.push(&args[i]);
+            i += 1;
+        }
+    }
+
+    if file_args.is_empty() {
+        eprintln!("Usage: clhorde prompt-from-files [--run-path <path>] <file1> [file2...] or <file1,file2,...>");
         return CliAction::Exit(1);
     }
 
     let mut prompts = Vec::new();
-    for arg in args {
+    for arg in &file_args {
         for path_str in arg.split(',') {
             let path_str = path_str.trim();
             if path_str.is_empty() {
@@ -198,7 +240,7 @@ fn cmd_prompt_from_files(args: &[String]) -> CliAction {
         return CliAction::Exit(1);
     }
 
-    CliAction::LaunchTui(prompts)
+    CliAction::LaunchTui(LaunchOptions { prompts, worktree: true, run_path })
 }
 
 // ── store subcommands ──
@@ -1129,7 +1171,7 @@ mod tests {
     #[test]
     fn run_returns_launch_tui_for_no_args() {
         // No subcommand -> LaunchTui
-        assert!(matches!(run(&["clhorde".into()]), CliAction::LaunchTui(v) if v.is_empty()));
+        assert!(matches!(run(&["clhorde".into()]), CliAction::LaunchTui(opts) if opts.prompts.is_empty()));
     }
 
     #[test]
@@ -1150,7 +1192,7 @@ mod tests {
 
     #[test]
     fn run_unknown_command_launches_tui() {
-        assert!(matches!(run(&["clhorde".into(), "unknown".into()]), CliAction::LaunchTui(v) if v.is_empty()));
+        assert!(matches!(run(&["clhorde".into(), "unknown".into()]), CliAction::LaunchTui(opts) if opts.prompts.is_empty()));
     }
 
     #[test]
@@ -1173,10 +1215,12 @@ mod tests {
             f2.to_string_lossy().to_string(),
         ];
         match cmd_prompt_from_files(&args) {
-            CliAction::LaunchTui(prompts) => {
-                assert_eq!(prompts.len(), 2);
-                assert_eq!(prompts[0], "prompt one");
-                assert_eq!(prompts[1], "prompt two");
+            CliAction::LaunchTui(opts) => {
+                assert_eq!(opts.prompts.len(), 2);
+                assert_eq!(opts.prompts[0], "prompt one");
+                assert_eq!(opts.prompts[1], "prompt two");
+                assert!(opts.worktree);
+                assert!(opts.run_path.is_none());
             }
             _ => panic!("Expected LaunchTui"),
         }
@@ -1195,10 +1239,11 @@ mod tests {
 
         let arg = format!("{},{}", f1.display(), f2.display());
         match cmd_prompt_from_files(&[arg]) {
-            CliAction::LaunchTui(prompts) => {
-                assert_eq!(prompts.len(), 2);
-                assert_eq!(prompts[0], "alpha");
-                assert_eq!(prompts[1], "beta");
+            CliAction::LaunchTui(opts) => {
+                assert_eq!(opts.prompts.len(), 2);
+                assert_eq!(opts.prompts[0], "alpha");
+                assert_eq!(opts.prompts[1], "beta");
+                assert!(opts.worktree);
             }
             _ => panic!("Expected LaunchTui"),
         }
@@ -1221,9 +1266,9 @@ mod tests {
             "/tmp/nonexistent-clhorde-test-file.txt".to_string(),
         ];
         match cmd_prompt_from_files(&args) {
-            CliAction::LaunchTui(prompts) => {
-                assert_eq!(prompts.len(), 1);
-                assert_eq!(prompts[0], "valid prompt");
+            CliAction::LaunchTui(opts) => {
+                assert_eq!(opts.prompts.len(), 1);
+                assert_eq!(opts.prompts[0], "valid prompt");
             }
             _ => panic!("Expected LaunchTui"),
         }
@@ -1236,6 +1281,47 @@ mod tests {
             "/tmp/nonexistent-clhorde-1.txt".to_string(),
             "/tmp/nonexistent-clhorde-2.txt".to_string(),
         ];
+        assert!(matches!(cmd_prompt_from_files(&args), CliAction::Exit(1)));
+    }
+
+    #[test]
+    fn prompt_from_files_run_path() {
+        let dir = std::env::temp_dir().join(format!("clhorde-pff-rp-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let f1 = dir.join("task.txt");
+        fs::write(&f1, "do something").unwrap();
+
+        let args = vec![
+            "--run-path".to_string(),
+            dir.to_string_lossy().to_string(),
+            f1.to_string_lossy().to_string(),
+        ];
+        match cmd_prompt_from_files(&args) {
+            CliAction::LaunchTui(opts) => {
+                assert_eq!(opts.prompts.len(), 1);
+                assert_eq!(opts.prompts[0], "do something");
+                assert!(opts.worktree);
+                assert_eq!(opts.run_path.as_deref(), Some(dir.to_string_lossy().as_ref()));
+            }
+            _ => panic!("Expected LaunchTui"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_from_files_run_path_nonexistent() {
+        let args = vec![
+            "--run-path".to_string(),
+            "/tmp/nonexistent-clhorde-dir-xyz".to_string(),
+            "some_file.txt".to_string(),
+        ];
+        assert!(matches!(cmd_prompt_from_files(&args), CliAction::Exit(1)));
+    }
+
+    #[test]
+    fn prompt_from_files_run_path_missing_value() {
+        let args = vec!["--run-path".to_string()];
         assert!(matches!(cmd_prompt_from_files(&args), CliAction::Exit(1)));
     }
 
