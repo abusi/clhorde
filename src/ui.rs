@@ -17,7 +17,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // status bar
+            Constraint::Length(2),  // status bar (1 content + bottom border)
             Constraint::Min(5),    // main area
             Constraint::Length(3), // input bar
             Constraint::Length(1), // help bar
@@ -52,60 +52,119 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         AppMode::Filter => ("FILTER", Color::Cyan),
     };
 
-    let spans = vec![
+    let sep = Span::styled(" │ ", Style::default().fg(Color::DarkGray));
+
+    // --- Worker utilization progress bar ---
+    let bar_width = app.max_workers.min(8); // cap visual width at 8
+    let filled = if app.max_workers > 0 {
+        (app.active_workers * bar_width).div_ceil(app.max_workers)
+    } else {
+        0
+    };
+    let empty = bar_width - filled;
+    let bar_filled: String = "█".repeat(filled);
+    let bar_empty: String = "░".repeat(empty);
+
+    // --- Condensed counters ---
+    let pending = app.pending_count();
+    let done = app.completed_count();
+    let total = app.prompts.len();
+
+    // --- Selected prompt inline status ---
+    let selected_info: Vec<Span> = if let Some(prompt) = app.selected_prompt() {
+        let (status_char, status_color) = match prompt.status {
+            PromptStatus::Pending => ("·", Color::DarkGray),
+            PromptStatus::Running => ("▶", Color::Cyan),
+            PromptStatus::Idle => ("◆", Color::Magenta),
+            PromptStatus::Completed => ("✓", Color::Green),
+            PromptStatus::Failed => ("✗", Color::Red),
+        };
+        let mut parts = vec![
+            sep.clone(),
+            Span::styled(
+                format!("#{}", prompt.id),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {status_char}"),
+                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(elapsed) = prompt.elapsed_display() {
+            parts.push(Span::styled(
+                format!(" {elapsed}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        parts
+    } else {
+        vec![]
+    };
+
+    // --- Session elapsed time ---
+    let session_secs = app.session_start.elapsed().as_secs();
+    let session_str = if session_secs < 60 {
+        format!("{session_secs}s")
+    } else if session_secs < 3600 {
+        format!("{}m{}s", session_secs / 60, session_secs % 60)
+    } else {
+        format!("{}h{}m", session_secs / 3600, (session_secs % 3600) / 60)
+    };
+
+    // --- Build spans ---
+    let mut spans = vec![
         Span::raw(" "),
         Span::styled(
             format!(" {mode_str} "),
             Style::default().fg(Color::Black).bg(mode_color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" │ ", Style::default().fg(Color::Gray)),
-        Span::styled("Workers: ", Style::default().fg(Color::Gray)),
+        sep.clone(),
+        Span::styled(bar_filled, Style::default().fg(Color::Cyan)),
+        Span::styled(bar_empty, Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{}", app.active_workers),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("/{}", app.max_workers),
+            format!(" {}/{}", app.active_workers, app.max_workers),
             Style::default().fg(Color::Gray),
         ),
-        Span::styled(" │ ", Style::default().fg(Color::Gray)),
-        Span::styled("Queue: ", Style::default().fg(Color::Gray)),
+        sep.clone(),
         Span::styled(
-            format!("{}", app.pending_count()),
+            format!("Q:{pending}"),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" │ ", Style::default().fg(Color::Gray)),
-        Span::styled("Done: ", Style::default().fg(Color::Gray)),
+        Span::raw(" "),
         Span::styled(
-            format!("{}", app.completed_count()),
+            format!("D:{done}"),
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" │ ", Style::default().fg(Color::Gray)),
-        Span::styled("Total: ", Style::default().fg(Color::Gray)),
+        Span::raw(" "),
         Span::styled(
-            format!("{}", app.prompts.len()),
+            format!("T:{total}"),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" │ ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!("[{}]", app.default_mode.label()),
-            Style::default().fg(match app.default_mode {
-                PromptMode::Interactive => Color::Magenta,
-                PromptMode::OneShot => Color::Yellow,
-            }).add_modifier(Modifier::BOLD),
-        ),
     ];
+
+    spans.extend(selected_info);
+
+    spans.push(sep.clone());
+    spans.push(Span::styled(
+        session_str,
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    spans.push(sep);
+    spans.push(Span::styled(
+        format!("[{}]", app.default_mode.label()),
+        Style::default().fg(match app.default_mode {
+            PromptMode::Interactive => Color::Magenta,
+            PromptMode::OneShot => Color::Yellow,
+        }).add_modifier(Modifier::BOLD),
+    ));
 
     let paragraph = Paragraph::new(Line::from(spans))
         .style(Style::default().bg(Color::Rgb(30, 30, 40)))
         .block(
             Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(mode_color))
-                .title(Span::styled(
-                    " clhorde ",
-                    Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
-                )),
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(mode_color)),
         );
     f.render_widget(paragraph, area);
 }
