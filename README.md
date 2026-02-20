@@ -4,7 +4,7 @@ A lightweight, single-binary TUI for orchestrating multiple Claude Code CLI inst
 
 ![Rust](https://img.shields.io/badge/rust-2021-orange)
 
-**[Documentation](https://your-user.github.io/clhorde/)**
+**[Documentation](https://abusi.github.io/clhorde/)**
 
 ## Features
 
@@ -26,7 +26,7 @@ A lightweight, single-binary TUI for orchestrating multiple Claude Code CLI inst
 ## Install
 
 ```bash
-git clone https://github.com/your-user/clhorde.git
+git clone https://github.com/abusi/clhorde.git
 cd clhorde
 cargo build --release
 # binary is at target/release/clhorde
@@ -43,18 +43,18 @@ clhorde              # launch TUI
 clhorde --help       # show help
 ```
 
-Press `i` to start typing a prompt. See the [getting started guide](https://your-user.github.io/clhorde/guide.html) for a walkthrough.
+Press `i` to start typing a prompt. See the [getting started guide](https://abusi.github.io/clhorde/guide.html) for a walkthrough.
 
 ## Documentation
 
-Full documentation is available at **[your-user.github.io/clhorde](https://your-user.github.io/clhorde/)**:
+Full documentation is available at **[abusi.github.io/clhorde](https://abusi.github.io/clhorde/)**:
 
-- [Getting Started](https://your-user.github.io/clhorde/guide.html)
-- [Features](https://your-user.github.io/clhorde/features.html)
-- [Keybindings](https://your-user.github.io/clhorde/keybindings.html)
-- [Configuration](https://your-user.github.io/clhorde/configuration.html)
-- [CLI Reference](https://your-user.github.io/clhorde/cli.html)
-- [Cheatsheet](https://your-user.github.io/clhorde/cheatsheet.html)
+- [Getting Started](https://abusi.github.io/clhorde/guide.html)
+- [Features](https://abusi.github.io/clhorde/features.html)
+- [Keybindings](https://abusi.github.io/clhorde/keybindings.html)
+- [Configuration](https://abusi.github.io/clhorde/configuration.html)
+- [CLI Reference](https://abusi.github.io/clhorde/cli.html)
+- [Cheatsheet](https://abusi.github.io/clhorde/cheatsheet.html)
 
 ## License
 
