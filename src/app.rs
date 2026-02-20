@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 
+use crate::editor::TextBuffer;
 use crate::keymap::{
     self, FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction,
 };
@@ -41,7 +42,9 @@ pub struct App {
     pub active_workers: usize,
     pub mode: AppMode,
     pub list_state: ListState,
-    pub input: String,
+    pub input: TextBuffer,
+    /// Flag: Ctrl+E pressed in insert mode, main.rs should open $EDITOR.
+    pub open_external_editor: bool,
     pub scroll_offset: u16,
     pub should_quit: bool,
     pub worker_inputs: HashMap<usize, mpsc::UnboundedSender<WorkerInput>>,
@@ -176,7 +179,8 @@ impl App {
             active_workers: 0,
             mode: AppMode::Normal,
             list_state,
-            input: String::new(),
+            input: TextBuffer::new(),
+            open_external_editor: false,
             scroll_offset: 0,
             should_quit: false,
             worker_inputs: HashMap::new(),
@@ -278,11 +282,12 @@ impl App {
         self.suggestion_index = 0;
 
         // Don't suggest if `: ` already present (user is typing the prompt text)
-        if self.input.contains(": ") {
+        let input_str = self.input.first_line();
+        if input_str.contains(": ") {
             return;
         }
 
-        let input = self.input.trim();
+        let input = input_str.trim();
         if input.is_empty() {
             return;
         }
@@ -334,8 +339,8 @@ impl App {
     }
 
     fn accept_suggestion(&mut self) {
-        if let Some(path) = self.suggestions.get(self.suggestion_index) {
-            self.input = format!("{path}/");
+        if let Some(path) = self.suggestions.get(self.suggestion_index).cloned() {
+            self.input.set(&format!("{path}/"));
             self.suggestions.clear();
             self.suggestion_index = 0;
             self.update_suggestions();
@@ -602,6 +607,7 @@ impl App {
             NormalAction::Insert => {
                 self.mode = AppMode::Insert;
                 self.input.clear();
+                self.open_external_editor = false;
                 self.history_index = None;
                 self.history_stash.clear();
                 self.template_suggestions.clear();
@@ -819,6 +825,42 @@ impl App {
             return;
         }
 
+        // Shift+Enter or Alt+Enter → insert newline
+        if key.code == KeyCode::Enter
+            && (key.modifiers.contains(KeyModifiers::SHIFT)
+                || key.modifiers.contains(KeyModifiers::ALT))
+        {
+            self.input.insert_newline();
+            self.history_index = None;
+            self.suggestions.clear();
+            self.template_suggestions.clear();
+            return;
+        }
+
+        // Ctrl+E → open external editor
+        if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.open_external_editor = true;
+            return;
+        }
+
+        // Up/Down: navigate within multi-line buffer before falling through to history
+        if key.code == KeyCode::Up
+            && self.suggestions.is_empty()
+            && self.template_suggestions.is_empty()
+            && self.input.is_multiline()
+        {
+            self.input.move_up();
+            return;
+        }
+        if key.code == KeyCode::Down
+            && self.suggestions.is_empty()
+            && self.template_suggestions.is_empty()
+            && self.input.is_multiline()
+        {
+            self.input.move_down();
+            return;
+        }
+
         if let Some(action) = self.keymap.insert.get(&key.code) {
             match action {
                 InsertAction::Cancel => {
@@ -833,7 +875,7 @@ impl App {
                     self.worktree_pending = false;
                 }
                 InsertAction::Submit => {
-                    let text = self.input.trim().to_string();
+                    let text = self.input.trimmed();
                     if !text.is_empty() {
                         let (cwd, prompt_text) = Self::parse_cwd_prefix(&text);
                         if !prompt_text.is_empty() {
@@ -895,13 +937,28 @@ impl App {
         // Text input fallthrough
         match key.code {
             KeyCode::Backspace => {
-                self.input.pop();
+                self.input.backspace();
                 self.history_index = None;
                 self.update_suggestions();
                 self.update_template_suggestions();
             }
+            KeyCode::Delete => {
+                self.input.delete();
+            }
+            KeyCode::Left => {
+                self.input.move_left();
+            }
+            KeyCode::Right => {
+                self.input.move_right();
+            }
+            KeyCode::Home => {
+                self.input.move_home();
+            }
+            KeyCode::End => {
+                self.input.move_end();
+            }
             KeyCode::Char(c) => {
-                self.input.push(c);
+                self.input.insert_char(c);
                 self.history_index = None;
                 self.update_suggestions();
                 self.update_template_suggestions();
@@ -1684,7 +1741,7 @@ impl App {
             Ok(content) => content
                 .lines()
                 .filter(|l| !l.is_empty())
-                .map(String::from)
+                .map(|l| l.replace("\\n", "\n"))
                 .collect(),
             Err(_) => Vec::new(),
         }
@@ -1707,7 +1764,8 @@ impl App {
                 .append(true)
                 .open(&path)
             {
-                let _ = writeln!(file, "{text}");
+                let escaped = text.replace('\n', "\\n");
+                let _ = writeln!(file, "{escaped}");
             }
         }
     }
@@ -1719,16 +1777,16 @@ impl App {
         match self.history_index {
             None => {
                 // Start navigating: stash current input
-                self.history_stash = self.input.clone();
+                self.history_stash = self.input.to_string();
                 let idx = self.history.len() - 1;
                 self.history_index = Some(idx);
-                self.input = self.history[idx].clone();
+                self.input.set(&self.history[idx].clone());
             }
             Some(idx) => {
                 if idx > 0 {
                     let new_idx = idx - 1;
                     self.history_index = Some(new_idx);
-                    self.input = self.history[new_idx].clone();
+                    self.input.set(&self.history[new_idx].clone());
                 }
             }
         }
@@ -1741,11 +1799,12 @@ impl App {
         if idx + 1 < self.history.len() {
             let new_idx = idx + 1;
             self.history_index = Some(new_idx);
-            self.input = self.history[new_idx].clone();
+            self.input.set(&self.history[new_idx].clone());
         } else {
             // Past the end: restore stashed input
             self.history_index = None;
-            self.input = self.history_stash.clone();
+            let stash = self.history_stash.clone();
+            self.input.set(&stash);
             self.history_stash.clear();
         }
     }
@@ -1796,7 +1855,8 @@ impl App {
         }
 
         // Check if input starts with `:` and has no space yet (still typing template name)
-        let input = &self.input;
+        let input_str = self.input.first_line().to_string();
+        let input = &input_str;
         if !input.starts_with(':') {
             return;
         }
@@ -1822,7 +1882,7 @@ impl App {
     fn accept_template_suggestion(&mut self) {
         if let Some(name) = self.template_suggestions.get(self.template_suggestion_index).cloned() {
             if let Some(template_text) = self.templates.get(&name).cloned() {
-                self.input = format!("{template_text} ");
+                self.input.set(&format!("{template_text} "));
                 self.template_suggestions.clear();
                 self.template_suggestion_index = 0;
             }
@@ -1846,7 +1906,8 @@ mod tests {
             active_workers: 0,
             mode: AppMode::Normal,
             list_state,
-            input: String::new(),
+            input: TextBuffer::new(),
+            open_external_editor: false,
             scroll_offset: 0,
             should_quit: false,
             worker_inputs: HashMap::new(),
@@ -2239,7 +2300,7 @@ mod tests {
     fn history_empty_is_noop() {
         let mut app = new_test_app();
         app.history.clear();
-        app.input = "current".to_string();
+        app.input.set("current");
         app.history_prev();
         assert_eq!(app.input, "current");
         assert!(app.history_index.is_none());
@@ -2249,7 +2310,7 @@ mod tests {
     fn history_prev_stashes_and_navigates() {
         let mut app = new_test_app();
         app.history = vec!["first".to_string(), "second".to_string()];
-        app.input = "typing".to_string();
+        app.input.set("typing");
 
         app.history_prev();
         assert_eq!(app.input, "second");
@@ -2265,7 +2326,7 @@ mod tests {
     fn history_prev_stops_at_beginning() {
         let mut app = new_test_app();
         app.history = vec!["only".to_string()];
-        app.input = "typing".to_string();
+        app.input.set("typing");
 
         app.history_prev();
         assert_eq!(app.input, "only");
@@ -2280,7 +2341,7 @@ mod tests {
     fn history_next_restores_stash() {
         let mut app = new_test_app();
         app.history = vec!["first".to_string(), "second".to_string()];
-        app.input = "typing".to_string();
+        app.input.set("typing");
 
         app.history_prev(); // "second"
         app.history_next(); // past end -> restore stash
@@ -2292,7 +2353,7 @@ mod tests {
     fn history_next_without_navigating_is_noop() {
         let mut app = new_test_app();
         app.history = vec!["first".to_string()];
-        app.input = "current".to_string();
+        app.input.set("current");
         app.history_next();
         assert_eq!(app.input, "current");
     }
@@ -2301,7 +2362,7 @@ mod tests {
     fn history_prev_next_roundtrip() {
         let mut app = new_test_app();
         app.history = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        app.input = "now".to_string();
+        app.input.set("now");
 
         app.history_prev(); // "c"
         app.history_prev(); // "b"
