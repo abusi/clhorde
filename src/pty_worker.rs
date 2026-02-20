@@ -44,6 +44,7 @@ impl Dimensions for PtyDimensions {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_pty_worker(
     prompt_id: usize,
     prompt_text: String,
@@ -52,6 +53,7 @@ pub fn spawn_pty_worker(
     rows: u16,
     tx: mpsc::UnboundedSender<WorkerMessage>,
     resume_session_id: Option<String>,
+    worktree: bool,
 ) -> Result<(mpsc::UnboundedSender<WorkerInput>, PtyHandle), String> {
     let pty_system = native_pty_system();
 
@@ -65,6 +67,10 @@ pub fn spawn_pty_worker(
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
     let mut cmd = CommandBuilder::new("claude");
+    if worktree && resume_session_id.is_none() {
+        cmd.arg("-w");
+        cmd.arg(format!("clhorde-{prompt_id}"));
+    }
     if let Some(ref session_id) = resume_session_id {
         if session_id.is_empty() {
             cmd.arg("--resume");
