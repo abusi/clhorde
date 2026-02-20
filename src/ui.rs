@@ -41,6 +41,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_quit_confirmation(f, f.area());
     }
 
+    if app.confirm_batch_delete {
+        render_batch_delete_confirmation(f, app, f.area());
+    }
+
     if app.show_help_overlay {
         render_help_overlay(f, app, f.area());
     }
@@ -122,6 +126,14 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             format!(" {mode_str} "),
             Style::default().fg(Color::Black).bg(mode_color).add_modifier(Modifier::BOLD),
         ),
+    ];
+    if app.visual_select_active {
+        spans.push(Span::styled(
+            " VISUAL ",
+            Style::default().fg(Color::Black).bg(Color::LightBlue).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.extend([
         sep.clone(),
         Span::styled(bar_filled, Style::default().fg(Color::Cyan)),
         Span::styled(bar_empty, Style::default().fg(Color::DarkGray)),
@@ -144,7 +156,16 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             format!("T:{total}"),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
-    ];
+    ]);
+
+    // Selection count indicator
+    if app.selection_count() > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("{} sel", app.selection_count()),
+            Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+        ));
+    }
 
     spans.extend(selected_info);
 
@@ -250,7 +271,12 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
             // Calculate display width of all non-text spans to give remaining space to prompt text
             // Status emoji (2 display cols) + space (1) = 3
             let id_str = format!("#{} ", prompt.id);
+            let is_selected = app.is_selected(prompt.id);
+            // "● " = 2 display cols when selected
             let mut overhead = 3 + id_str.len() + elapsed.len();
+            if is_selected {
+                overhead += 2;
+            }
 
             if prompt.worktree {
                 overhead += 5; // " [WT]"
@@ -320,7 +346,11 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                 None
             };
 
-            let mut spans = vec![
+            let mut spans = Vec::new();
+            if is_selected {
+                spans.push(Span::styled("● ", Style::default().fg(Color::LightBlue)));
+            }
+            spans.extend([
                 Span::styled(
                     format!("{} ", prompt.status.symbol()),
                     status_style,
@@ -331,7 +361,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                 ),
                 Span::raw(truncated),
                 Span::styled(elapsed, Style::default().fg(Color::DarkGray)),
-            ];
+            ]);
             if prompt.worktree {
                 spans.push(Span::styled(" [WT]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
             }
@@ -345,8 +375,11 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
 
             let line = Line::from(spans);
 
-            // Give unseen/idle items a subtle background highlight
+            // Give unseen/idle/selected items a subtle background highlight
             let item = ListItem::new(line);
+            if is_selected {
+                return item.style(Style::default().bg(Color::Rgb(35, 40, 55)));
+            }
             if moved_id == Some(prompt.id) {
                 // Flash highlight for recently reordered prompt
                 item.style(Style::default().bg(Color::Rgb(60, 60, 30)).add_modifier(Modifier::BOLD))
@@ -939,6 +972,46 @@ fn render_quit_confirmation(f: &mut Frame, area: Rect) {
     f.render_widget(paragraph, popup_area);
 }
 
+fn render_batch_delete_confirmation(f: &mut Frame, app: &App, area: Rect) {
+    let count = app.selection_count();
+    let msg = format!("  Delete {count} prompt{}? ", if count == 1 { "" } else { "s" });
+    let width = (msg.len() as u16 + 8).max(36);
+    let height = 5;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup_area = Rect {
+        x,
+        y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(msg),
+            Span::styled("y", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("/"),
+            Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(Span::styled(
+                    " Confirm Delete ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .style(Style::default().bg(Color::Rgb(40, 25, 25)));
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(paragraph, popup_area);
+}
+
 fn render_quick_prompts_popup(f: &mut Frame, app: &App, main_area: Rect) {
     let qp = app.keymap.quick_prompt_help();
 
@@ -1063,6 +1136,16 @@ fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
         ("gg", "go to top"),
     ]);
 
+    // SELECTION
+    add_section("SELECTION (normal mode)", &[], &[
+        (&app.keymap.normal_key_hint(NormalAction::ToggleSelect), "toggle select"),
+        (&app.keymap.normal_key_hint(NormalAction::VisualSelect), "visual select"),
+        (&app.keymap.normal_key_hint(NormalAction::SelectAllVisible), "select all visible"),
+        (&app.keymap.normal_key_hint(NormalAction::DeleteSelected), "delete selected"),
+        (&app.keymap.normal_key_hint(NormalAction::KillSelected), "kill selected"),
+        ("Esc", "clear selection"),
+    ]);
+
     // INSERT
     let insert = app.keymap.insert_help();
     add_section("INSERT", &insert, &[
@@ -1151,6 +1234,24 @@ fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let bindings: Vec<(String, &str)> = match app.mode {
+        AppMode::Normal if app.visual_select_active => {
+            vec![
+                (app.keymap.normal_key_hint(NormalAction::SelectNext), "extend"),
+                (app.keymap.normal_key_hint(NormalAction::ToggleSelect), "toggle"),
+                ("Esc".to_string(), "clear sel"),
+            ]
+        }
+        AppMode::Normal if app.selection_count() > 0 => {
+            vec![
+                (app.keymap.normal_key_hint(NormalAction::Retry), "retry"),
+                (app.keymap.normal_key_hint(NormalAction::KillSelected), "kill"),
+                (app.keymap.normal_key_hint(NormalAction::DeleteSelected), "delete"),
+                (app.keymap.normal_key_hint(NormalAction::ToggleMode), "mode"),
+                (app.keymap.normal_key_hint(NormalAction::ToggleSelect), "toggle"),
+                (app.keymap.normal_key_hint(NormalAction::SelectAllVisible), "sel all"),
+                ("Esc".to_string(), "clear sel"),
+            ]
+        }
         AppMode::Normal => app.keymap.normal_help(),
         AppMode::Insert => {
             let mut help = app.keymap.insert_help();
