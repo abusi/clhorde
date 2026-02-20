@@ -6,7 +6,7 @@ mod prompt;
 mod pty_worker;
 mod ui;
 mod worker;
-
+mod worktree;
 
 use std::io;
 use std::time::Duration;
@@ -84,7 +84,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 let prompt = &app.prompts[idx];
                 let id = prompt.id;
                 let text = prompt.text.clone();
-                let cwd = prompt.cwd.clone();
+                let mut cwd = prompt.cwd.clone();
                 let mode = prompt.mode;
                 let wants_worktree = prompt.worktree;
                 let resume_session_id = if prompt.resume {
@@ -93,10 +93,48 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     None
                 };
 
+                // Create git worktree if requested
+                if wants_worktree {
+                    let effective_cwd = cwd.as_deref()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    match worktree::repo_root(&effective_cwd) {
+                        Some(root) => {
+                            match worktree::create_worktree(&root, id) {
+                                Ok(wt_path) => {
+                                    let wt_str = wt_path.to_string_lossy().to_string();
+                                    cwd = Some(wt_str.clone());
+                                    if let Some(p) = app.prompts.get_mut(idx) {
+                                        p.worktree_path = Some(wt_str);
+                                    }
+                                }
+                                Err(e) => {
+                                    app.mark_running(idx);
+                                    app.active_workers += 1;
+                                    app.apply_message(WorkerMessage::SpawnError {
+                                        prompt_id: id,
+                                        error: format!("Worktree creation failed: {e}"),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                        None => {
+                            app.mark_running(idx);
+                            app.active_workers += 1;
+                            app.apply_message(WorkerMessage::SpawnError {
+                                prompt_id: id,
+                                error: "Not inside a git repository — cannot create worktree".to_string(),
+                            });
+                            continue;
+                        }
+                    }
+                }
+
                 app.mark_running(idx);
                 app.active_workers += 1;
                 let pty_size = app.output_panel_size;
-                match worker::spawn_worker(id, text, cwd, mode, worker_tx.clone(), pty_size, resume_session_id, wants_worktree)
+                match worker::spawn_worker(id, text, cwd, mode, worker_tx.clone(), pty_size, resume_session_id)
                 {
                     SpawnResult::Pty {
                         input_sender,
