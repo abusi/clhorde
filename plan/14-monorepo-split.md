@@ -18,7 +18,8 @@
 | `prompt.rs` | 224 | → clhorde-core (refactored) |
 | `main.rs` | 199 | Split: dispatch loop → daemon, event loop → TUI |
 | `worker.rs` | 184 | → clhorde-daemon |
-| **Total** | **7023** | |
+| `editor.rs` | ~200 | → clhorde-tui |
+| **Total** | **~7223** | |
 
 ---
 
@@ -53,6 +54,7 @@ clhorde/
       src/
         main.rs                  # terminal setup, daemon connection, event loop
         app.rs                   # UI-only state (modes, selection, input, scroll)
+        editor.rs                # TextBuffer: multi-line cursor-aware input buffer
         ui.rs                    # ratatui rendering
         keymap_runtime.rs        # Keymap struct, action enums, build_keymap()
         pty_renderer.rs          # local alacritty_terminal for PTY byte rendering
@@ -92,9 +94,9 @@ Modules moved from current codebase:
 
 - **`prompt.rs`** — `Prompt`, `PromptMode`, `PromptStatus`. Refactored: remove `pty_state: Option<SharedPtyState>` (contains `Arc<Mutex<PtyState>>` with alacritty `Term` — not serializable, daemon-only). Replace `started_at`/`finished_at` (`Instant`, not serializable) with `started_at_epoch_ms`/`finished_at_epoch_ms` (`Option<u64>`). The struct becomes fully `Serialize + Deserialize + Clone + Send`.
 
-- **`persistence.rs`** — `PromptFile`, `PromptOptions`, `default_prompts_dir()`, `save_prompt()`, `load_all_prompts()`, `prune_old_prompts()`, `delete_prompt_file()`. Unchanged. Used by both daemon (runtime persistence) and CLI (store management).
+- **`persistence.rs`** — `PromptFile`, `PromptOptions`, `default_prompts_dir()`, `save_prompt()`, `load_all_prompts()`, `prune_old_prompts()`, `delete_prompt_file()`. Unchanged. Used by daemon only (runtime persistence + store management via IPC). CLI routes all store operations through the daemon.
 
-- **`worktree.rs`** — `is_git_repo()`, `repo_root()`, `repo_name()`, `worktree_exists()`, `create_worktree()`, `remove_worktree()`. Unchanged. Used by daemon (worktree creation/cleanup) and CLI (`store clean-worktrees`).
+- **`worktree.rs`** — `is_git_repo()`, `repo_root()`, `repo_name()`, `worktree_exists()`, `create_worktree()`, `remove_worktree()`. Unchanged. Used by daemon only (worktree creation/cleanup). Daemon wraps calls in `tokio::task::spawn_blocking` to avoid blocking the async executor.
 
 - **`keymap.rs`** — The TOML-facing half of the current 968-line `keymap.rs`. Includes:
   - TOML deserialization structs: `TomlConfig`, `TomlSettings`, `TomlKeybindings`, `TomlModeBindings`
@@ -110,13 +112,14 @@ New modules:
 
 - **`protocol.rs`** — IPC message types (see [Protocol Types](#protocol-types) below).
 
-- **`ipc.rs`** — Length-delimited framing helpers:
-  - `async fn write_message(stream: &mut WriteHalf, msg: &[u8]) -> io::Result<()>`
-  - `async fn read_message(stream: &mut ReadHalf) -> io::Result<Vec<u8>>`
+- **`ipc.rs`** — Pure byte manipulation for length-delimited framing (no async, no I/O, no tokio dependency). Each consumer (daemon, TUI, CLI) wraps these with their own trivial async read/write helpers:
+  - `fn encode_frame(msg: &[u8]) -> Vec<u8>` — prepend 4-byte BE length header
+  - `fn decode_frame(buf: &[u8]) -> Result<(usize, Vec<u8>)>` — parse length header + payload
   - `fn daemon_socket_path() -> PathBuf` (`~/.local/share/clhorde/daemon.sock`)
   - `fn daemon_pid_path() -> PathBuf` (`~/.local/share/clhorde/daemon.pid`)
-  - `fn encode_pty_frame(prompt_id: usize, data: &[u8]) -> Vec<u8>`
-  - `fn decode_frame(payload: &[u8]) -> Frame` (JSON vs binary PTY)
+  - `fn encode_pty_frame(prompt_id: usize, data: &[u8]) -> Vec<u8>` — binary PTY frame with 0x01 marker
+  - `fn decode_pty_frame(payload: &[u8]) -> Option<(usize, &[u8])>` — extract prompt_id + raw bytes from binary frame
+  - `fn is_binary_frame(payload: &[u8]) -> bool` — check first byte for 0x01 marker
 
 ### clhorde-daemon
 
@@ -127,11 +130,11 @@ New modules:
 
 - **`worker.rs`** — Current `worker.rs` unchanged: `WorkerMessage`, `WorkerInput`, `SpawnResult` enums, `spawn_worker()` function, one-shot stream-json parsing logic. Worker threads send `WorkerMessage` to orchestrator via `mpsc::UnboundedSender`.
 
-- **`pty_worker.rs`** — Current `pty_worker.rs`, modified. The reader thread gains a second output path: in addition to feeding bytes into the local `alacritty_terminal::Term` (needed for `extract_text_from_term()` on completion), it also sends raw bytes to a `tokio::sync::broadcast` channel that `ipc_server.rs` fans out to subscribers. Key types unchanged: `PtyState`, `SharedPtyState`, `PtyHandle`. Functions: `spawn_pty_worker()`, `key_event_to_bytes()`, `extract_text_from_term()`, `resize_pty()`.
+- **`pty_worker.rs`** — Current `pty_worker.rs`, modified. The reader thread gains a second output path: in addition to feeding bytes into the local `alacritty_terminal::Term` (needed for `extract_text_from_term()` on completion), it also sends raw bytes to a `tokio::sync::broadcast` channel that `ipc_server.rs` fans out to subscribers. Additionally, the daemon maintains a **64KB ring buffer** of recent PTY output per active prompt; on late-join, the buffered bytes are replayed to the new client so its local `Term` gets an immediate snapshot of the current screen state. Key types unchanged: `PtyState`, `SharedPtyState`, `PtyHandle`. Functions: `spawn_pty_worker()`, `key_event_to_bytes()`, `extract_text_from_term()`, `resize_pty()`.
 
 - **`ipc_server.rs`** — `tokio::net::UnixListener`, accepts connections, spawns per-client tasks. Each task: read `ClientRequest` frames → dispatch to orchestrator → forward `DaemonEvent` stream back to client. Uses `tokio::sync::broadcast` for fan-out.
 
-- **`session.rs`** — `struct ClientSession { id, subscribed, pty_sizes }`. Tracks which clients are subscribed to events and per-client PTY size preferences (if multiple TUIs connect with different terminal sizes, each gets independent PTY resize).
+- **`session.rs`** — `struct ClientSession { id, subscribed }`. Tracks which clients are subscribed to events. PTY size is global per prompt (last `ResizePty` wins) — no per-client size tracking.
 
 ### clhorde-tui
 
@@ -156,14 +159,16 @@ New modules:
 
 **Dependencies:** clhorde-core, serde_json, tokio (for daemon commands), uuid
 
-All current `cli.rs` subcommands (1223 lines) split into focused modules:
+All CLI commands go through the daemon — the CLI is purely a facade, same as the TUI. It does not know where files are stored; storage paths are daemon config. If the daemon is not running, all commands fail with a clear error: `"Daemon not running. Start it with: clhorded"`.
 
-- **`commands/store.rs`** — `store {list, count, path, drop <filter>, keep <filter>, clean-worktrees}`. Uses `clhorde-core` persistence + worktree directly (no daemon needed).
-- **`commands/qp.rs`** — `qp {list, add <key> <msg>, remove <key>}`. Uses `clhorde-core` keymap config.
-- **`commands/keys.rs`** — `keys {list [mode], set <mode> <action> <keys...>, reset <mode> [action]}`. Uses `clhorde-core` keymap config.
-- **`commands/config.rs`** — `config {path, edit, init [--force]}`. Uses `clhorde-core` config paths.
-- **`commands/prompt.rs`** — New: `clhorde-cli submit "prompt text" [--mode interactive|oneshot] [--cwd path]`. Connects to daemon socket, sends `SubmitPrompt`, prints prompt ID.
-- **`commands/status.rs`** — New: `clhorde-cli status`. Connects to daemon, sends `GetState`, prints worker/queue summary table.
+Current `cli.rs` subcommands (1223 lines) split into focused modules, all as thin daemon clients:
+
+- **`commands/store.rs`** — `store {list, count, path, drop <filter>, keep <filter>, clean-worktrees}`. Sends corresponding `ClientRequest` variants to daemon.
+- **`commands/qp.rs`** — `qp {list, add <key> <msg>, remove <key>}`. Uses `clhorde-core` keymap config (local config file, not daemon).
+- **`commands/keys.rs`** — `keys {list [mode], set <mode> <action> <keys...>, reset <mode> [action]}`. Uses `clhorde-core` keymap config (local config file, not daemon).
+- **`commands/config.rs`** — `config {path, edit, init [--force]}`. Uses `clhorde-core` config paths (local config file, not daemon).
+- **`commands/prompt.rs`** — New: `clhorde-cli submit "prompt text" [--mode interactive|oneshot] [--cwd path]`. Sends `SubmitPrompt` to daemon, prints prompt ID.
+- **`commands/status.rs`** — New: `clhorde-cli status`. Sends `GetState` to daemon, prints worker/queue summary table.
 
 ---
 
@@ -235,7 +240,15 @@ pub enum ClientRequest {
 
     // Queries
     GetState,                   // request full DaemonState snapshot
-    GetPromptOutput { prompt_id: usize },  // request full output text for one prompt
+    GetPromptOutput { prompt_id: usize },  // request full output text for one prompt (late-join/reconnect only)
+
+    // Store management (CLI facade)
+    StoreList,
+    StoreCount,
+    StorePath,
+    StoreDrop { filter: String },           // "all" | "completed" | "failed" | "pending"
+    StoreKeep { filter: String },           // "completed" | "failed" | "pending"
+    CleanWorktrees,
 
     // PTY
     ResizePty { prompt_id: usize, cols: u16, rows: u16 },
@@ -274,6 +287,12 @@ pub enum DaemonEvent {
     MaxWorkersChanged { count: usize },
     ActiveWorkersChanged { count: usize },
 
+    // Store responses
+    StoreListResult { prompts: Vec<PromptInfo> },
+    StoreCountResult { pending: usize, running: usize, completed: usize, failed: usize },
+    StorePathResult { path: String },
+    StoreOpComplete { message: String },     // response to StoreDrop/StoreKeep/CleanWorktrees
+
     // Lifecycle
     Pong,
     Error { message: String },
@@ -298,6 +317,7 @@ pub struct PromptInfo {
     pub worktree: bool,
     pub worktree_path: Option<String>,
     pub has_pty: bool,             // true if this prompt has an active PTY (for rendering decisions)
+    pub tags: Vec<String>,         // @tag prefixes for filtering
 }
 
 /// Full daemon state for initial sync on Subscribe
@@ -330,8 +350,8 @@ The most architecturally significant decision. Currently the TUI reads PTY state
 - Raw PTY bytes are compact (typically 4-8KB chunks for screen redraws)
 - Full fidelity: colors, cursor position, scrollback, all ANSI escape sequences preserved
 - No complex grid serialization (the grid has ~30 fields per cell across thousands of cells)
-- Resize: TUI sends `ResizePty`, daemon resizes the real PTY master + its local Term, output naturally adjusts on next redraw
-- Multiple TUI clients can connect simultaneously, each with independent local terminal state and potentially different sizes
+- Resize: TUI resizes its local `Term` immediately and sends `ResizePty` to daemon. The transient size mismatch (~1ms round-trip) is invisible — `alacritty_terminal` handles this gracefully, same as real terminal multiplexers
+- Multiple TUI clients can connect simultaneously, each with independent local terminal state. PTY size is global per prompt (last `ResizePty` wins)
 
 ### PTY reader thread modification
 
@@ -350,7 +370,7 @@ loop {
 
 After (daemon):
 ```rust
-// Reader thread: PTY master → alacritty Term + broadcast to subscribers
+// Reader thread: PTY master → alacritty Term + ring buffer + broadcast to subscribers
 loop {
     let n = reader.read(&mut buf)?;
     let bytes = buf[..n].to_vec();
@@ -359,6 +379,8 @@ loop {
     for byte in &bytes {
         state.processor.advance(&mut state.term, *byte);
     }
+    // Append to 64KB ring buffer (for late-joining TUI replay)
+    ring_buffer.extend(&bytes);
     // Forward raw bytes to subscriber broadcast channel
     let _ = pty_byte_tx.send((prompt_id, bytes));
     tx.send(WorkerMessage::PtyUpdate { prompt_id })?;
@@ -373,27 +395,33 @@ Daemon buffers PTY output at 50-100ms intervals or up to 8KB, whichever comes fi
 
 When a TUI connects to a daemon with already-running PTY workers, it receives:
 1. `StateSnapshot` with `has_pty: true` on relevant prompts
-2. No historical PTY bytes (the stream is live-only)
-3. The local `Term` starts empty; next PTY output naturally fills the screen
+2. Replay of the 64KB ring buffer of recent PTY output for each active PTY prompt — the TUI's local `Term` gets an immediate snapshot of the current screen state
+3. Subsequent live PTY bytes stream normally
 
-This is acceptable because: (a) Claude Code redraws frequently during tool use, (b) user can trigger a redraw by switching away and back, (c) the alternative (replaying full PTY history) adds complexity for minimal benefit.
+The ring buffer ensures the user sees the current screen even if Claude is in a long thinking pause, waiting for permission, or idle. Memory cost is negligible (~64KB per active PTY worker, ~320KB total at `max_workers = 5`).
 
 ---
 
 ## Daemon Lifecycle
 
-### Auto-Start from TUI
+### No Auto-Start
+
+Neither the TUI nor the CLI auto-start the daemon. The user must start `clhorded` explicitly. This avoids hidden background process spawning, simplifies startup logic, and eliminates polling/retry race conditions.
 
 ```
-TUI startup:
+TUI/CLI startup:
   1. Try connect to ~/.local/share/clhorde/daemon.sock
   2. If success → send Ping → wait for Pong → Subscribe → GetState → proceed
-  3. If fail (ECONNREFUSED or ENOENT):
-     a. Read daemon.pid — if PID exists and process is alive, retry (startup race)
-     b. spawn `clhorded` as detached background process (setsid, close stdio)
-     c. Poll connection every 100ms, up to 2 seconds (20 attempts)
-     d. If still can't connect → show error and exit
+  3. If fail → exit with clear error: "Daemon not running. Start it with: clhorded"
 ```
+
+### Disconnection Handling (TUI)
+
+If the daemon connection is lost mid-session (daemon crash, shutdown, etc.):
+1. TUI shows `[DISCONNECTED]` indicator in status bar
+2. Retries connection every 2 seconds in the background
+3. User can still quit cleanly (`q`)
+4. On successful reconnect: re-subscribes, requests full state via `GetState`, requests `GetPromptOutput` for any prompts with `has_pty: false`
 
 ### PID File Protocol
 
@@ -495,7 +523,7 @@ pub struct App {
     pub max_workers: usize,
     pub active_workers: usize,
     pub default_mode: String,
-    pub prompt_outputs: HashMap<usize, String>,  // lazy-loaded via GetPromptOutput
+    pub prompt_outputs: HashMap<usize, String>,  // accumulated from OutputChunk events (all prompts, no eviction)
 
     // --- Local PTY rendering ---
     pub pty_terms: HashMap<usize, Term<VoidListener>>,  // managed by pty_renderer
@@ -511,7 +539,7 @@ pub struct App {
     pub list_collapsed: bool,               // list panel hidden
 
     // --- Input buffers ---
-    pub input: String,                      // Insert mode text
+    pub input: TextBuffer,                  // Insert mode text (multi-line, cursor-aware)
     pub interact_input: String,             // Interact mode text
     pub filter_input: String,               // Filter mode text
 
@@ -537,6 +565,11 @@ pub struct App {
     // --- Templates ---
     pub templates: HashMap<String, String>, // loaded from templates.toml
 
+    // --- Visual select / batch ---
+    pub visual_select_active: bool,
+    pub selected_ids: HashSet<usize>,
+    pub confirm_batch_delete: bool,
+
     // --- Misc UI state ---
     pub tick: u64,                          // 100ms counter for animations
     pub should_quit: bool,
@@ -544,6 +577,8 @@ pub struct App {
     pub status_message: Option<(String, Instant)>,
     pub show_quick_prompts_popup: bool,
     pub worktree_pending: bool,             // Ctrl+W toggle for next prompt
+    pub open_external_editor: bool,         // flag for main.rs to suspend terminal and open $EDITOR
+    pub daemon_connected: bool,             // false during disconnection, shows [DISCONNECTED] indicator
 
     // --- Config ---
     pub keymap: Keymap,                     // runtime keybinding dispatch tables
@@ -562,8 +597,7 @@ Methods retained in TUI `App` (modified to send requests):
 - Export: `export_selected_output()` (reads from `prompt_outputs` cache)
 
 New methods:
-- `apply_event(DaemonEvent)` — update local state from daemon events
-- `request_output(prompt_id)` — send `GetPromptOutput` if not cached
+- `apply_event(DaemonEvent)` — update local state from daemon events. `OutputChunk` events are accumulated into `prompt_outputs` for all prompts (no eviction). `GetPromptOutput` is only used on reconnect/late-join.
 - `selected_prompt() -> Option<&PromptInfo>` — get currently selected prompt info
 
 ### Key Behavioral Change
@@ -771,9 +805,9 @@ uuid.workspace = true
 7. Create `clhorde-cli` crate with `commands/` modules extracted from `cli.rs`
 8. Split `cli.rs` (1223 lines) into: `store.rs`, `qp.rs`, `keys.rs`, `config.rs`
 9. Remove CLI dispatch from TUI's `main.rs` (currently `cli::run()` intercepts args)
-10. Verify all subcommands: `clhorde-cli store list`, `clhorde-cli qp list`, `clhorde-cli keys list`, `clhorde-cli config path`
+10. Verify config-only subcommands: `clhorde-cli qp list`, `clhorde-cli keys list`, `clhorde-cli config path` (these read local config files, no daemon needed)
 
-**Verification:** All CLI subcommands produce identical output. TUI launches without CLI arg interception.
+**Verification:** Config-only CLI subcommands produce identical output. TUI launches without CLI arg interception. Store commands are deferred to Phase 5 (require running daemon).
 
 ### Phase 2: Split App State (refactor only, no IPC)
 
@@ -802,21 +836,22 @@ uuid.workspace = true
 23. Implement `pty_renderer.rs`: local `Term` instances, `feed_bytes()`, `get_term()`
 24. Modify TUI `App` to send `ClientRequest` via `daemon_tx` instead of calling `Orchestrator`
 25. Add `apply_event(DaemonEvent)` method to update local `PromptInfo` mirror
-26. Modify TUI `main.rs`: auto-start daemon, connect, subscribe, new event loop with `tokio::select!`
+26. Modify TUI `main.rs`: connect to daemon (fail with clear error if not running), subscribe, new event loop with `tokio::select!`, disconnection handling with `[DISCONNECTED]` indicator and 2s retry
 27. Remove `Orchestrator`, `worker.rs`, `pty_worker.rs` from TUI crate (now daemon-only)
-28. End-to-end testing: start TUI → auto-starts daemon → submit prompt → see output
+28. End-to-end testing: start `clhorded` → start TUI → submit prompt → see output
 
 **Verification:** Full workflow: submit, view, interact, retry, resume, kill, filter, export. PTY rendering works. Multiple TUI connections to same daemon.
 
 ### Phase 5: New CLI Commands + Polish
 
-29. Add `clhorde-cli submit "prompt"` — connect to daemon, submit, print ID
-30. Add `clhorde-cli status` — connect, GetState, print table
-31. Add `clhorde-cli attach <id>` — connect, subscribe, stream output to stdout
-32. Add daemon connection check to CLI: helpful error if daemon not running
-33. Documentation update: README, CLAUDE.md, help text
+29. Add `clhorde-cli store {list, count, path, drop, keep, clean-worktrees}` — all go through daemon via new `ClientRequest` variants
+30. Add `clhorde-cli submit "prompt"` — connect to daemon, submit, print ID
+31. Add `clhorde-cli status` — connect, GetState, print table
+32. Add `clhorde-cli attach <id>` — connect, subscribe, stream output to stdout
+33. Add daemon connection check to all CLI commands: helpful error if daemon not running (`"Daemon not running. Start it with: clhorded"`)
+34. Documentation update: README, CLAUDE.md, help text
 
-**Verification:** CLI commands work against running daemon. `clhorde-cli submit` + `clhorde status` shows prompt. `clhorde-cli attach` streams live output.
+**Verification:** CLI commands work against running daemon. Store commands produce identical output to pre-split. `clhorde-cli submit` + `clhorde-cli status` shows prompt. `clhorde-cli attach` streams live output.
 
 ---
 
@@ -826,9 +861,9 @@ uuid.workspace = true
 |------|--------|-----------|
 | **PTY latency over socket** | Sluggish interactive sessions | Unix sockets are <1ms RTT. Current tick is 100ms. Batching at 50-100ms. Invisible overhead. Benchmark before/after. |
 | **State divergence (TUI vs daemon)** | UI shows stale data, confusing UX | TUI treats daemon events as single source of truth. Never caches or assumes. `GetState` available for full resync on reconnect. |
-| **Daemon crash → orphan workers** | `claude` processes leak | PTY master FD drop sends SIGHUP to child. Daemon uses `setsid` + process groups. PID file enables detection of stale daemon. TUI can re-launch daemon which adopts nothing (clean slate). |
+| **Daemon crash → orphan workers** | `claude` processes leak | PTY master FD drop sends SIGHUP to child. Daemon uses `setsid` + process groups. PID file enables detection of stale daemon. User restarts `clhorded` which starts fresh (clean slate). TUI auto-reconnects on 2s retry. |
 | **Daemon crash → lost in-flight output** | Partial prompt results lost | Daemon persists prompt state to JSON on every status transition. On restart, completed/failed prompts are restored from disk. Running prompts are lost (acceptable: user can retry). |
-| **Backward compatibility** | Users confused by new daemon process | Auto-start from TUI is transparent. `clhorde` command works exactly as before. Daemon is an implementation detail. Status bar could show daemon connection indicator. |
+| **Backward compatibility** | Users must learn to start `clhorded` first | Clear error message on TUI/CLI startup if daemon not running. README documents the new workflow. Daemon is a simple background process (`clhorded &` or systemd user service). |
 | **Large refactor risk** | Regressions in modes, keybindings, edge cases | 5-phase approach. Each phase is independently shippable and testable. Phase 2 (internal split) catches most bugs before IPC is involved. Comprehensive manual testing checklist per phase. |
 | **Socket permission issues** | TUI can't connect in some environments | Socket in user-owned `~/.local/share/`. No root required. Configurable socket path for edge cases. Clear error messages with path shown. |
 | **Multiple daemon instances** | Conflicting state, port stomping | PID file with atomic create prevents duplicates. Socket path is deterministic per user. |
@@ -845,4 +880,5 @@ Some things remain identical through the split:
 - **PTY rendering** — Same `alacritty_terminal` grid → `ratatui` Span conversion. Same color/flag mapping. Users see identical output.
 - **Git worktree behavior** — Same `git worktree add --detach` pattern. Same cleanup policies.
 - **Templates and history** — Same files, same format, same loading logic.
-- **`clhorde store` / `clhorde qp` / `clhorde keys` / `clhorde config`** — Same subcommands, same output. Just invoked as `clhorde-cli` instead (or aliased).
+- **`clhorde qp` / `clhorde keys` / `clhorde config`** — Same subcommands, same output. Just invoked as `clhorde-cli` instead (or aliased). These operate on local config files and don't require the daemon.
+- **`clhorde store`** — Same subcommands, same output. Now invoked as `clhorde-cli store` and routed through the daemon (requires `clhorded` running).
