@@ -14,12 +14,17 @@ use crate::prompt::{PromptMode, PromptStatus};
 use crate::pty_worker::SharedPtyState;
 
 pub fn render(f: &mut Frame, app: &mut App) {
+    let input_bar_height = if app.mode == AppMode::Insert && app.input.is_multiline() {
+        (app.input.line_count() as u16 + 2).clamp(3, 10) // +2 for borders
+    } else {
+        3
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),  // status bar (1 content + bottom border)
             Constraint::Min(5),    // main area
-            Constraint::Length(3), // input bar
+            Constraint::Length(input_bar_height), // input bar
             Constraint::Length(1), // help bar
         ])
         .split(f.area());
@@ -789,9 +794,15 @@ fn render_input_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let (title, content, style, border_color): (String, String, Style, Color) = match app.mode {
         AppMode::Insert => {
             let wt_tag = if app.worktree_pending { " [WT]" } else { "" };
+            let line_tag = if app.input.is_multiline() {
+                let (row, _) = app.input.cursor();
+                format!(" [L{}/{}]", row + 1, app.input.line_count())
+            } else {
+                String::new()
+            };
             (
-                format!(" Input (Enter to submit, Esc to cancel){wt_tag} "),
-                app.input.clone(),
+                format!(" Input (Enter to submit, Esc to cancel){wt_tag}{line_tag} "),
+                app.input.to_string(),
                 Style::default().fg(Color::White),
                 if app.worktree_pending { Color::Cyan } else { Color::Green },
             )
@@ -837,8 +848,9 @@ fn render_input_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     match app.mode {
         AppMode::Insert => {
-            let x = area.x + app.input.len() as u16 + 1;
-            let y = area.y + 1;
+            let (row, col) = app.input.cursor();
+            let x = area.x + col as u16 + 1; // +1 for border
+            let y = area.y + row as u16 + 1;  // +1 for border
             f.set_cursor_position((x, y));
         }
         AppMode::Interact => {
@@ -1176,8 +1188,12 @@ fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
     // INSERT
     let insert = app.keymap.insert_help();
     add_section("INSERT", &insert, &[
+        ("Shift+Enter", "insert newline"),
+        ("Ctrl+E", "open $EDITOR"),
         ("Ctrl+W", "toggle worktree"),
-        ("Up/Down", "history nav"),
+        ("Left/Right", "move cursor"),
+        ("Home/End", "line start/end"),
+        ("Up/Down", "navigate lines / history"),
         (":name+Tab", "expand template"),
     ]);
 
@@ -1297,6 +1313,8 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         }
         AppMode::Insert => {
             let mut help = app.keymap.insert_help();
+            help.push(("S-Ret".to_string(), "newline"));
+            help.push(("C-e".to_string(), "editor"));
             help.push(("C-w".to_string(), "worktree"));
             help
         }

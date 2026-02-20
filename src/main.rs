@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod editor;
 mod keymap;
 mod persistence;
 mod prompt;
@@ -11,7 +12,7 @@ mod worktree;
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, EnableBracketedPaste, DisableBracketedPaste, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -30,14 +31,14 @@ async fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_app(&mut terminal).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     if let Err(e) = result {
@@ -168,6 +169,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         app.handle_key(key);
                     }
+                    Event::Paste(text) if app.mode == app::AppMode::Insert => {
+                        for c in text.chars() {
+                            if c == '\n' {
+                                app.input.insert_newline();
+                            } else if c != '\r' {
+                                app.input.insert_char(c);
+                            }
+                        }
+                    }
                     Event::Resize(_, _) => {
                         // Terminal resized — next draw will update output_panel_size
                         // and resize_pty_workers will be called
@@ -184,6 +194,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
+        // Check if user wants to open external editor
+        if app.open_external_editor {
+            app.open_external_editor = false;
+            if let Err(e) = open_editor(terminal, &mut app) {
+                app.status_message = Some((format!("Editor error: {e}"), std::time::Instant::now()));
+            }
+        }
+
         if app.should_quit {
             // Send Kill to all active workers
             for (_id, sender) in app.worker_inputs.drain() {
@@ -196,4 +214,55 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             return Ok(());
         }
     }
+}
+
+fn open_editor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> io::Result<()> {
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".to_string());
+
+    let pid = std::process::id();
+    let tmp_path = std::path::PathBuf::from(format!("/tmp/clhorde-prompt-{pid}.md"));
+
+    // Write current input to temp file
+    std::fs::write(&tmp_path, app.input.to_string())?;
+
+    // Suspend terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
+
+    // Spawn editor
+    let status = std::process::Command::new(&editor)
+        .arg(&tmp_path)
+        .status();
+
+    // Restore terminal
+    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableBracketedPaste)?;
+    enable_raw_mode()?;
+    terminal.clear()?;
+
+    match status {
+        Ok(s) if s.success() => {
+            let content = std::fs::read_to_string(&tmp_path).unwrap_or_default();
+            app.input.set(&content);
+        }
+        Ok(s) => {
+            app.status_message = Some((
+                format!("Editor exited with {}", s.code().unwrap_or(-1)),
+                std::time::Instant::now(),
+            ));
+        }
+        Err(e) => {
+            app.status_message = Some((
+                format!("Failed to run '{editor}': {e}"),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+
+    let _ = std::fs::remove_file(&tmp_path);
+    Ok(())
 }
