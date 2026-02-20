@@ -980,7 +980,7 @@ impl App {
             // PTY worker: send message as typed text + Enter (no echo needed,
             // the PTY terminal will show it)
             let mut bytes = message.as_bytes().to_vec();
-            bytes.push(b'\n');
+            bytes.push(b'\r');
             let _ = sender.send(WorkerInput::SendBytes(bytes));
         } else {
             // Stream-json worker: echo and send as structured input
