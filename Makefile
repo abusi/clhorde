@@ -1,7 +1,13 @@
-.PHONY: build test lint check clean
+.PHONY: build build-dev run test lint check clean
 
 build:
+	cargo build --release
+
+build-dev:
 	cargo build
+
+run: build
+	target/release/clhorde
 
 test:
 	cargo test
