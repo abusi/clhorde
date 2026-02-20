@@ -8,7 +8,6 @@ use crate::keymap::{
     TomlViewBindings, ViewAction,
 };
 use crate::persistence;
-use crate::worktree;
 
 /// Returns Some(exit_code) if a CLI subcommand was handled, None to continue to TUI.
 pub fn run(args: &[String]) -> Option<i32> {
@@ -37,7 +36,6 @@ fn cmd_help() -> i32 {
     println!("    path              Print storage directory path");
     println!("    drop <filter>     Delete stored prompts");
     println!("    keep <filter>     Keep only matching, delete rest");
-    println!("    clean-worktrees   Remove lingering git worktrees");
     println!("  qp                  Manage quick prompts");
     println!("    list              List all quick prompts");
     println!("    add <key> <msg>   Add a quick prompt");
@@ -162,15 +160,13 @@ fn cmd_store(args: &[String]) -> i32 {
         Some("path") => store_path(),
         Some("drop") => store_drop(args.get(1).map(|s| s.as_str())),
         Some("keep") => store_keep(args.get(1).map(|s| s.as_str())),
-        Some("clean-worktrees") => store_clean_worktrees(),
         _ => {
-            eprintln!("Usage: clhorde store <list|count|path|drop|keep|clean-worktrees>");
+            eprintln!("Usage: clhorde store <list|count|path|drop|keep>");
             eprintln!("  list              List all stored prompts");
             eprintln!("  count             Show prompt counts by state");
             eprintln!("  path              Print storage directory path");
             eprintln!("  drop <filter>     Delete stored prompts");
             eprintln!("  keep <filter>     Keep only matching, delete rest");
-            eprintln!("  clean-worktrees   Remove lingering git worktrees");
             eprintln!();
             eprintln!("Filters: all, completed, failed, pending, running");
             1
@@ -329,97 +325,6 @@ fn store_keep(filter: Option<&str>) -> i32 {
     }
     println!("Kept {kept} {filter} prompt(s), dropped {dropped}.");
     0
-}
-
-fn store_clean_worktrees() -> i32 {
-    let dir = match store_dir_or_err() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-    let prompts = persistence::load_all_prompts(&dir);
-    let mut cleaned = 0;
-    let mut skipped = 0;
-    let mut errors = 0;
-
-    for (uuid, pf) in &prompts {
-        let Some(ref wt_path_str) = pf.worktree_path else {
-            continue;
-        };
-        let wt_path = std::path::Path::new(wt_path_str);
-        if !wt_path.exists() {
-            println!("  skip (already gone): {wt_path_str}");
-            skipped += 1;
-            // Clear the worktree_path in the persisted file
-            let updated = persistence::PromptFile {
-                prompt: pf.prompt.clone(),
-                options: persistence::PromptOptions {
-                    mode: pf.options.mode.clone(),
-                    context: pf.options.context.clone(),
-                    worktree: pf.options.worktree,
-                },
-                state: pf.state.clone(),
-                queue_rank: pf.queue_rank,
-                session_id: pf.session_id.clone(),
-                worktree_path: None,
-            };
-            persistence::save_prompt(&dir, uuid, &updated);
-            continue;
-        }
-
-        // Try to find the repo root to run git worktree remove
-        let mut removed = false;
-        if let Some(parent) = wt_path.parent() {
-            if let Ok(entries) = std::fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() && path != wt_path {
-                        if let Some(root) = worktree::repo_root(&path) {
-                            match worktree::remove_worktree(&root, wt_path) {
-                                Ok(()) => {
-                                    println!("  removed: {wt_path_str}");
-                                    cleaned += 1;
-                                    removed = true;
-                                    // Clear worktree_path in persisted file
-                                    let updated = persistence::PromptFile {
-                                        prompt: pf.prompt.clone(),
-                                        options: persistence::PromptOptions {
-                                            mode: pf.options.mode.clone(),
-                                            context: pf.options.context.clone(),
-                                            worktree: pf.options.worktree,
-                                        },
-                                        state: pf.state.clone(),
-                                        queue_rank: pf.queue_rank,
-                                        session_id: pf.session_id.clone(),
-                                        worktree_path: None,
-                                    };
-                                    persistence::save_prompt(&dir, uuid, &updated);
-                                    break;
-                                }
-                                Err(e) => {
-                                    eprintln!("  error: {wt_path_str}: {e}");
-                                    errors += 1;
-                                    removed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if !removed {
-            eprintln!("  error: {wt_path_str}: could not find parent git repo");
-            errors += 1;
-        }
-    }
-
-    let total = cleaned + skipped;
-    if total == 0 && errors == 0 {
-        println!("No worktrees to clean.");
-    } else {
-        println!("Cleaned {cleaned} worktree(s), {skipped} already gone, {errors} error(s).");
-    }
-    if errors > 0 { 1 } else { 0 }
 }
 
 // ── keys subcommands ──
@@ -1118,7 +1023,6 @@ mod tests {
             state: state.to_string(),
             queue_rank: rank,
             session_id: None,
-            worktree_path: None,
         }
     }
 

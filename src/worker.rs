@@ -37,6 +37,7 @@ pub enum SpawnResult {
 
 /// Spawns a claude worker. For interactive mode, uses PTY when `pty_size` is
 /// provided. For one-shot mode, uses stream-json as before.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_worker(
     prompt_id: usize,
     prompt_text: String,
@@ -45,6 +46,7 @@ pub fn spawn_worker(
     tx: mpsc::UnboundedSender<WorkerMessage>,
     pty_size: Option<(u16, u16)>,
     resume_session_id: Option<String>,
+    worktree: bool,
 ) -> SpawnResult {
     match mode {
         PromptMode::Interactive => {
@@ -57,6 +59,7 @@ pub fn spawn_worker(
                 rows,
                 tx,
                 resume_session_id,
+                worktree,
             ) {
                 Ok((input_sender, pty_handle)) => {
                     SpawnResult::Pty { input_sender, pty_handle }
@@ -65,7 +68,7 @@ pub fn spawn_worker(
             }
         }
         PromptMode::OneShot => {
-            spawn_oneshot(prompt_id, prompt_text, cwd, tx, resume_session_id);
+            spawn_oneshot(prompt_id, prompt_text, cwd, tx, resume_session_id, worktree);
             SpawnResult::OneShot
         }
     }
@@ -77,9 +80,13 @@ fn spawn_oneshot(
     cwd: Option<String>,
     tx: mpsc::UnboundedSender<WorkerMessage>,
     resume_session_id: Option<String>,
+    worktree: bool,
 ) {
     std::thread::spawn(move || {
         let mut cmd = Command::new("claude");
+        if worktree && resume_session_id.is_none() {
+            cmd.args(["-w", &format!("clhorde-{prompt_id}")]);
+        }
         cmd.args(["-p"])
             .arg(&prompt_text)
             .args([
