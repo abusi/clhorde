@@ -217,6 +217,10 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
 
     app.list_height = list_area.height;
     let tick = app.tick;
+    // Check for recently moved prompt (flash highlight for ~300ms)
+    let moved_id = app.recently_moved.and_then(|(id, t)| {
+        if t.elapsed().as_millis() < 300 { Some(id) } else { None }
+    });
     let visible_indices = app.visible_prompt_indices().to_vec();
 
     // Available width for content: list_area minus borders (2) minus highlight symbol "▶ " (2)
@@ -343,7 +347,10 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
 
             // Give unseen/idle items a subtle background highlight
             let item = ListItem::new(line);
-            if prompt.status == PromptStatus::Idle {
+            if moved_id == Some(prompt.id) {
+                // Flash highlight for recently reordered prompt
+                item.style(Style::default().bg(Color::Rgb(60, 60, 30)).add_modifier(Modifier::BOLD))
+            } else if prompt.status == PromptStatus::Idle {
                 let bg = if (tick / 5) % 2 == 0 {
                     Color::Rgb(45, 30, 50)
                 } else {
@@ -1216,6 +1223,18 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         spans.push(Span::styled(
             ":all prompts",
             Style::default().fg(Color::Gray),
+        ));
+    }
+
+    // Show transient status message at the right end of the help bar
+    if let Some((ref msg, _)) = app.status_message {
+        spans.push(Span::styled(
+            " │ ",
+            Style::default().fg(Color::Rgb(60, 60, 60)),
+        ));
+        spans.push(Span::styled(
+            msg.as_str(),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
     }
 

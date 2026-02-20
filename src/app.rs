@@ -97,6 +97,8 @@ pub struct App {
     pub show_help_overlay: bool,
     /// Scroll offset for the help overlay content.
     pub help_scroll: u16,
+    /// Recently moved prompt: (prompt_id, Instant) for flash highlight.
+    pub recently_moved: Option<(usize, Instant)>,
 }
 
 impl App {
@@ -189,6 +191,7 @@ impl App {
             session_start: Instant::now(),
             show_help_overlay: false,
             help_scroll: 0,
+            recently_moved: None,
         }
     }
 
@@ -442,11 +445,16 @@ impl App {
         }
     }
 
-    /// Clear expired status messages (older than 3 seconds).
+    /// Clear expired status messages (older than 3 seconds) and stale move highlights.
     pub fn clear_expired_status(&mut self) {
         if let Some((_, created)) = &self.status_message {
             if created.elapsed().as_secs() >= 3 {
                 self.status_message = None;
+            }
+        }
+        if let Some((_, t)) = &self.recently_moved {
+            if t.elapsed().as_millis() >= 300 {
+                self.recently_moved = None;
             }
         }
     }
@@ -1210,6 +1218,8 @@ impl App {
             persistence::save_prompt(dir, &self.prompts[idx - 1].uuid, &persistence::PromptFile::from_prompt(&self.prompts[idx - 1]));
         }
         self.list_state.select(Some(idx - 1));
+        self.recently_moved = Some((self.prompts[idx - 1].id, Instant::now()));
+        self.status_message = Some((format!("Moved #{} up", self.prompts[idx - 1].id), Instant::now()));
         self.rebuild_filter();
     }
 
@@ -1235,6 +1245,8 @@ impl App {
             persistence::save_prompt(dir, &self.prompts[idx + 1].uuid, &persistence::PromptFile::from_prompt(&self.prompts[idx + 1]));
         }
         self.list_state.select(Some(idx + 1));
+        self.recently_moved = Some((self.prompts[idx + 1].id, Instant::now()));
+        self.status_message = Some((format!("Moved #{} down", self.prompts[idx + 1].id), Instant::now()));
         self.rebuild_filter();
     }
 
@@ -1488,6 +1500,7 @@ mod tests {
             session_start: Instant::now(),
             show_help_overlay: false,
             help_scroll: 0,
+            recently_moved: None,
         }
     }
 
