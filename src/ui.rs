@@ -453,7 +453,7 @@ fn render_pty_output_viewer(
     is_pty_interact: bool,
 ) {
     // Show [WT] in PTY title if this prompt has a worktree
-    let wt_tag = if app.selected_prompt().is_some_and(|p| p.worktree) {
+    let wt_tag = if app.selected_prompt().is_some_and(|p| p.worktree_path.is_some()) {
         " [WT]"
     } else {
         ""
@@ -624,7 +624,7 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
     let (title, content) = match app.selected_prompt() {
         Some(prompt) => {
             let cwd_str = prompt.cwd.as_deref().unwrap_or(".");
-            let wt_tag = if prompt.worktree { " [WT]" } else { "" };
+            let wt_tag = if prompt.worktree_path.is_some() { " [WT]" } else { "" };
             let title = format!(" Output: #{} [{}]{wt_tag} ", prompt.id, cwd_str);
             let content = match &prompt.status {
                 PromptStatus::Pending => "(pending)".to_string(),

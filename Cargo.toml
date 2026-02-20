@@ -16,3 +16,6 @@ chrono = "0.4"
 alacritty_terminal = "0.25"
 portable-pty = "0.9"
 uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+tempfile = "3"

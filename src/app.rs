@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use crate::keymap::{
     self, FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction,
 };
+use crate::worktree;
 use crate::persistence;
 use crate::prompt::{Prompt, PromptMode, PromptStatus};
 use crate::pty_worker::{self, PtyHandle};
@@ -25,6 +26,12 @@ pub enum AppMode {
     /// Raw keystroke forwarding to PTY worker.
     PtyInteract,
     Filter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WorktreeCleanup {
+    Manual,
+    Auto,
 }
 
 pub struct App {
@@ -83,6 +90,8 @@ pub struct App {
     pub prompts_dir: Option<PathBuf>,
     /// Whether the next submitted prompt should use a git worktree.
     pub worktree_pending: bool,
+    /// Worktree cleanup policy.
+    pub worktree_cleanup: WorktreeCleanup,
     /// Height of the prompt list panel (set during rendering).
     pub list_height: u16,
     /// Whether `g` was pressed once (waiting for second `g` for gg → go to top).
@@ -110,6 +119,10 @@ impl App {
         let settings = keymap::load_settings();
         let max_saved_prompts = settings.max_saved_prompts.unwrap_or(100);
         let list_ratio = (settings.list_ratio.unwrap_or(40) as u16).clamp(10, 90);
+        let worktree_cleanup = match settings.worktree_cleanup.as_deref() {
+            Some("auto") => WorktreeCleanup::Auto,
+            _ => WorktreeCleanup::Manual,
+        };
 
         let prompts_dir = persistence::default_prompts_dir();
 
@@ -133,6 +146,7 @@ impl App {
                 prompt.queue_rank = pf.queue_rank;
                 prompt.session_id = pf.session_id.clone();
                 prompt.worktree = pf.options.worktree.unwrap_or(false);
+                prompt.worktree_path = pf.worktree_path.clone();
                 prompt.status = status;
                 prompt.seen = true;
                 prompts.push(prompt);
@@ -184,6 +198,7 @@ impl App {
             max_saved_prompts,
             prompts_dir,
             worktree_pending: false,
+            worktree_cleanup,
             list_height: 0,
             pending_g: false,
             list_ratio,
@@ -399,6 +414,7 @@ impl App {
                     }
                 }
                 self.persist_prompt_by_id(prompt_id);
+                self.maybe_cleanup_worktree(prompt_id);
                 self.pty_handles.remove(&prompt_id);
                 self.worker_inputs.remove(&prompt_id);
                 self.active_workers = self.active_workers.saturating_sub(1);
@@ -420,6 +436,7 @@ impl App {
                     prompt.pty_state = None;
                 }
                 self.persist_prompt_by_id(prompt_id);
+                self.maybe_cleanup_worktree(prompt_id);
                 self.pty_handles.remove(&prompt_id);
                 self.worker_inputs.remove(&prompt_id);
                 self.active_workers = self.active_workers.saturating_sub(1);
@@ -1111,6 +1128,47 @@ impl App {
         self.last_pty_size = Some((cols, rows));
     }
 
+    // ── Worktree cleanup ──
+
+    fn maybe_cleanup_worktree(&mut self, prompt_id: usize) {
+        if self.worktree_cleanup != WorktreeCleanup::Auto {
+            return;
+        }
+        let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) else {
+            return;
+        };
+        let Some(wt_path) = prompt.worktree_path.take() else {
+            return;
+        };
+        // Persist the cleared worktree_path
+        if let Some(ref dir) = self.prompts_dir {
+            if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
+                persistence::save_prompt(dir, &prompt.uuid, &persistence::PromptFile::from_prompt(prompt));
+            }
+        }
+        // Spawn a background thread for cleanup to avoid blocking
+        let wt_path = PathBuf::from(&wt_path);
+        std::thread::spawn(move || {
+            // Try to find repo root from the worktree path's parent
+            if let Some(parent) = wt_path.parent() {
+                // Look for the main repo among siblings
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() && path != wt_path
+                            && worktree::is_git_repo(&path)
+                        {
+                            if let Some(root) = worktree::repo_root(&path) {
+                                let _ = worktree::remove_worktree(&root, &wt_path);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // ── Feature 1: Export ──
 
     fn export_selected_output(&mut self) {
@@ -1493,6 +1551,7 @@ mod tests {
             max_saved_prompts: 100,
             prompts_dir: None,
             worktree_pending: false,
+            worktree_cleanup: WorktreeCleanup::Manual,
             list_height: 0,
             pending_g: false,
             list_ratio: 40,
