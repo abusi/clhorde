@@ -200,6 +200,22 @@ fn truncate_prompt(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Deterministic color for a tag name (hashed to a palette of distinct colors).
+fn tag_color(tag: &str) -> Color {
+    const PALETTE: &[Color] = &[
+        Color::LightBlue,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightMagenta,
+        Color::LightCyan,
+        Color::LightRed,
+        Color::Cyan,
+        Color::Yellow,
+    ];
+    let hash: usize = tag.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+    PALETTE[hash % PALETTE.len()]
+}
+
 fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     // In Normal mode with a selected prompt, reserve space for preview pane
     let show_preview = app.mode == AppMode::Normal && app.list_state.selected().is_some();
@@ -254,6 +270,11 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
 
             if prompt.worktree {
                 overhead += 5; // " [WT]"
+            }
+
+            // Tag badges: " [tag]" per tag
+            for tag in &prompt.tags {
+                overhead += tag.len() + 3; // " [" + tag + "]"
             }
 
             if let Some(ref dir) = prompt.cwd {
@@ -334,6 +355,12 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
             ];
             if prompt.worktree {
                 spans.push(Span::styled(" [WT]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            }
+            for tag in &prompt.tags {
+                spans.push(Span::styled(
+                    format!(" [{tag}]"),
+                    Style::default().fg(tag_color(tag)).add_modifier(Modifier::BOLD),
+                ));
             }
             if let Some(cwd_span) = cwd_hint {
                 spans.push(cwd_span);

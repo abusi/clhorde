@@ -70,6 +70,8 @@ pub struct Prompt {
     pub worktree: bool,
     /// Path to the created worktree directory (for cleanup).
     pub worktree_path: Option<String>,
+    /// User-defined tags for grouping/filtering (e.g. `@frontend`).
+    pub tags: Vec<String>,
 }
 
 impl Prompt {
@@ -92,6 +94,7 @@ impl Prompt {
             resume: false,
             worktree: false,
             worktree_path: None,
+            tags: Vec::new(),
         }
     }
 
@@ -124,6 +127,33 @@ pub fn format_duration(secs: f64) -> String {
         let m = (total % 3600) / 60;
         format!("{h}h {m}m")
     }
+}
+
+/// Parse `@tag` prefixes from prompt text.
+/// Returns (tags, remaining_text) where tags are stripped from the text sent to Claude.
+/// Example: `@frontend @urgent Fix the navbar` → (["frontend", "urgent"], "Fix the navbar")
+pub fn parse_tags(input: &str) -> (Vec<String>, String) {
+    let mut tags = Vec::new();
+    let mut rest = input;
+    loop {
+        rest = rest.trim_start();
+        if let Some(stripped) = rest.strip_prefix('@') {
+            // Find the end of the tag word (alphanumeric, dash, underscore)
+            let end = stripped
+                .find(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                .unwrap_or(stripped.len());
+            if end == 0 {
+                // Bare `@` with no tag name — not a tag
+                break;
+            }
+            let tag = &stripped[..end];
+            tags.push(tag.to_string());
+            rest = &stripped[end..];
+        } else {
+            break;
+        }
+    }
+    (tags, rest.trim_start().to_string())
 }
 
 #[cfg(test)]
@@ -221,4 +251,54 @@ mod tests {
         assert_eq!(format_duration(7261.0), "2h 1m");
     }
 
+    // ── parse_tags ──
+
+    #[test]
+    fn parse_tags_single() {
+        let (tags, text) = parse_tags("@frontend Fix the navbar");
+        assert_eq!(tags, vec!["frontend"]);
+        assert_eq!(text, "Fix the navbar");
+    }
+
+    #[test]
+    fn parse_tags_multiple() {
+        let (tags, text) = parse_tags("@frontend @urgent Fix the navbar");
+        assert_eq!(tags, vec!["frontend", "urgent"]);
+        assert_eq!(text, "Fix the navbar");
+    }
+
+    #[test]
+    fn parse_tags_none() {
+        let (tags, text) = parse_tags("Fix the navbar");
+        assert!(tags.is_empty());
+        assert_eq!(text, "Fix the navbar");
+    }
+
+    #[test]
+    fn parse_tags_only_tags() {
+        let (tags, text) = parse_tags("@frontend @backend");
+        assert_eq!(tags, vec!["frontend", "backend"]);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn parse_tags_at_in_middle_not_parsed() {
+        let (tags, text) = parse_tags("Fix @frontend the navbar");
+        assert!(tags.is_empty());
+        assert_eq!(text, "Fix @frontend the navbar");
+    }
+
+    #[test]
+    fn parse_tags_bare_at() {
+        let (tags, text) = parse_tags("@ Fix something");
+        assert!(tags.is_empty());
+        assert_eq!(text, "@ Fix something");
+    }
+
+    #[test]
+    fn parse_tags_with_dashes_and_underscores() {
+        let (tags, text) = parse_tags("@my-tag @another_tag Do stuff");
+        assert_eq!(tags, vec!["my-tag", "another_tag"]);
+        assert_eq!(text, "Do stuff");
+    }
 }
