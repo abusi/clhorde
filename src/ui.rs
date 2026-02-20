@@ -138,12 +138,26 @@ fn truncate_prompt(text: &str, max_chars: usize) -> String {
 }
 
 fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
-    app.list_height = area.height;
+    // In Normal mode with a selected prompt, reserve space for preview pane
+    let show_preview = app.mode == AppMode::Normal && app.list_state.selected().is_some();
+    let preview_height: u16 = if show_preview { 5 } else { 0 }; // 3 content lines + 2 borders
+
+    let (list_area, preview_area) = if show_preview && area.height > preview_height + 4 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(4), Constraint::Length(preview_height)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
+
+    app.list_height = list_area.height;
     let tick = app.tick;
     let visible_indices = app.visible_prompt_indices().to_vec();
 
-    // Available width for content: area minus borders (2) minus highlight symbol "▶ " (2)
-    let content_width = (area.width as usize).saturating_sub(4);
+    // Available width for content: list_area minus borders (2) minus highlight symbol "▶ " (2)
+    let content_width = (list_area.width as usize).saturating_sub(4);
 
     let items: Vec<ListItem> = visible_indices
         .iter()
@@ -317,7 +331,27 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
         )
         .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(list, area, &mut filtered_list_state);
+    f.render_stateful_widget(list, list_area, &mut filtered_list_state);
+
+    // Render prompt preview pane
+    if let Some(preview_rect) = preview_area {
+        if let Some(selected) = app.list_state.selected() {
+            let prompt_text = &app.prompts[selected].text;
+            let preview = Paragraph::new(prompt_text.as_str())
+                .style(Style::default().fg(Color::White))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Rgb(60, 60, 80)))
+                        .title(Span::styled(
+                            " Preview ",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                )
+                .wrap(Wrap { trim: false });
+            f.render_widget(preview, preview_rect);
+        }
+    }
 }
 
 fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
