@@ -146,6 +146,16 @@ clhorde store keep failed       # Keep failed, drop rest
 clhorde store clean-worktrees   # Remove lingering git worktrees from completed prompts
 ```
 
+### `clhorde prompt-from-files` — load prompts from files
+
+Reads file contents and queues them as prompts, then launches the TUI. Each file becomes one pending prompt. Shell glob expansion handles patterns. Comma-separated values within a single argument are also split into individual file paths.
+
+```bash
+clhorde prompt-from-files tasks/*.md            # Load all .md files as prompts
+clhorde prompt-from-files a.txt b.txt c.txt     # Load specific files
+clhorde prompt-from-files a.txt,b.txt c.txt     # Comma-separated + space-separated
+```
+
 ## Code conventions
 
 - Rust 2021 edition, MSRV 1.88
