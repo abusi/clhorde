@@ -91,6 +91,8 @@ pub struct App {
     pub list_ratio: u16,
     /// Whether the list panel is collapsed (output maximized).
     pub list_collapsed: bool,
+    /// Wall-clock time when the session started.
+    pub session_start: Instant,
 }
 
 impl App {
@@ -180,6 +182,7 @@ impl App {
             pending_g: false,
             list_ratio,
             list_collapsed: false,
+            session_start: Instant::now(),
         }
     }
 
@@ -1455,6 +1458,7 @@ mod tests {
             pending_g: false,
             list_ratio: 40,
             list_collapsed: false,
+            session_start: Instant::now(),
         }
     }
 
