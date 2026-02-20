@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cheatsheet — clhorde</title>
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="css/print.css">
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a href="index.html" class="nav-brand"><span>&gt;_ </span>clhorde</a>
+      <button class="hamburger" aria-label="Menu">&#9776;</button>
+      <div class="nav-links">
+        <a href="guide.html">Guide</a>
+        <a href="features.html">Features</a>
+        <a href="keybindings.html">Keys</a>
+        <a href="configuration.html">Config</a>
+        <a href="cli.html">CLI</a>
+        <a href="cheatsheet.html">Cheatsheet</a>
+        <a href="https://github.com/your-user/clhorde" class="github-link">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <h1>Quick Reference</h1>
+    <p class="lead">Everything at a glance. <button class="print-btn" onclick="window.print()">Print</button></p>
+
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="tab-by-mode">By Mode</button>
+      <button class="tab-btn" data-tab="tab-by-action">By Action</button>
+    </div>
+
+    <!-- ── By Mode ── -->
+    <div class="tab-content active" id="tab-by-mode">
+      <div class="cheat-grid">
+
+        <div class="cheat-card">
+          <div class="cheat-card-header normal">Normal Mode</div>
+          <table>
+            <tr><td><kbd>i</kbd></td><td>Enter insert mode</td></tr>
+            <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Navigate list</td></tr>
+            <tr><td><kbd>Ctrl+D</kbd> / <kbd>Ctrl+U</kbd></td><td>Half-page down / up</td></tr>
+            <tr><td><kbd>gg</kbd> / <kbd>G</kbd></td><td>Go to top / bottom</td></tr>
+            <tr><td><kbd>Enter</kbd></td><td>View output</td></tr>
+            <tr><td><kbd>s</kbd></td><td>Interact with prompt</td></tr>
+            <tr><td><kbd>m</kbd></td><td>Toggle mode</td></tr>
+            <tr><td><kbd>r</kbd> / <kbd>R</kbd></td><td>Retry / Resume</td></tr>
+            <tr><td><kbd>J</kbd> / <kbd>K</kbd></td><td>Reorder queue</td></tr>
+            <tr><td><kbd>/</kbd></td><td>Filter prompts</td></tr>
+            <tr><td><kbd>+</kbd> / <kbd>-</kbd></td><td>Workers +/-</td></tr>
+            <tr><td><kbd>h</kbd> / <kbd>l</kbd></td><td>Resize split</td></tr>
+            <tr><td><kbd>?</kbd></td><td>Help overlay</td></tr>
+            <tr><td><kbd>Space</kbd></td><td>Toggle select</td></tr>
+            <tr><td><kbd>v</kbd> / <kbd>V</kbd></td><td>Visual / Select all</td></tr>
+            <tr><td><kbd>d</kbd></td><td>Delete selected</td></tr>
+            <tr><td><kbd>x</kbd></td><td>Kill selected</td></tr>
+            <tr><td><kbd>q</kbd></td><td>Quit</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header insert">Insert Mode</div>
+          <table>
+            <tr><td><kbd>Enter</kbd></td><td>Submit prompt</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Cancel</td></tr>
+            <tr><td><kbd>Tab</kbd></td><td>Accept suggestion</td></tr>
+            <tr><td><kbd>Up</kbd> / <kbd>Down</kbd></td><td>History / Suggestions</td></tr>
+            <tr><td><kbd>Ctrl+W</kbd></td><td>Toggle worktree</td></tr>
+            <tr><td><kbd>Shift+Enter</kbd></td><td>Insert newline</td></tr>
+            <tr><td><kbd>Ctrl+E</kbd></td><td>Open in $EDITOR</td></tr>
+            <tr><td><code>:name</code>+<kbd>Tab</kbd></td><td>Expand template</td></tr>
+            <tr><td><code>@tag</code></td><td>Tag the prompt</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header view">View Mode</div>
+          <table>
+            <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Scroll output</td></tr>
+            <tr><td><kbd>s</kbd></td><td>Enter interact</td></tr>
+            <tr><td><kbd>f</kbd></td><td>Toggle auto-scroll</td></tr>
+            <tr><td><kbd>t</kbd></td><td>Toggle split view</td></tr>
+            <tr><td><kbd>w</kbd></td><td>Export output</td></tr>
+            <tr><td><kbd>x</kbd></td><td>Kill worker</td></tr>
+            <tr><td><kbd>Ctrl+P</kbd></td><td>Quick prompts popup</td></tr>
+            <tr><td><kbd>Esc</kbd> / <kbd>q</kbd></td><td>Back to normal</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header interact">Interact Mode</div>
+          <table>
+            <tr><td><kbd>Enter</kbd></td><td>Send message</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Back to normal</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header pty-interact">PTY Interact Mode</div>
+          <table>
+            <tr><td><em>all keys</em></td><td>Forwarded to PTY</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Back to view</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header filter">Filter Mode</div>
+          <table>
+            <tr><td><em>type</em></td><td>Live filter prompts</td></tr>
+            <tr><td><code>@tag</code></td><td>Filter by tag</td></tr>
+            <tr><td><kbd>Enter</kbd></td><td>Apply filter</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Clear &amp; cancel</td></tr>
+          </table>
+        </div>
+
+      </div>
+
+      <div class="cheat-grid">
+        <div class="cheat-card">
+          <div class="cheat-card-header cli">CLI Commands</div>
+          <table>
+            <tr><td><code>clhorde</code></td><td>Launch TUI</td></tr>
+            <tr><td><code>store list</code></td><td>List stored prompts</td></tr>
+            <tr><td><code>store drop all</code></td><td>Drop all prompts</td></tr>
+            <tr><td><code>store clean-worktrees</code></td><td>Clean worktrees</td></tr>
+            <tr><td><code>keys list</code></td><td>List keybindings</td></tr>
+            <tr><td><code>keys set &lt;m&gt; &lt;a&gt; &lt;k&gt;</code></td><td>Set a keybinding</td></tr>
+            <tr><td><code>qp add &lt;k&gt; &lt;msg&gt;</code></td><td>Add quick prompt</td></tr>
+            <tr><td><code>config init</code></td><td>Create default config</td></tr>
+            <tr><td><code>config edit</code></td><td>Open config in editor</td></tr>
+            <tr><td><code>prompt-from-files &lt;f&gt;</code></td><td>Load prompts from files</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header config">Config &amp; Symbols</div>
+          <table>
+            <tr><td><code>~/.config/clhorde/</code></td><td>Config directory</td></tr>
+            <tr><td><code>keymap.toml</code></td><td>Keys, settings, quick prompts</td></tr>
+            <tr><td><code>templates.toml</code></td><td>Prompt templates</td></tr>
+            <tr><td><code>~/.local/share/clhorde/</code></td><td>Data directory</td></tr>
+          </table>
+          <table>
+            <tr><td>&#10004;</td><td>Completed</td></tr>
+            <tr><td>&#8635;</td><td>Running</td></tr>
+            <tr><td>&#9203;</td><td>Pending / Queued</td></tr>
+            <tr><td>&#10008;</td><td>Failed</td></tr>
+            <tr><td>[WT]</td><td>Worktree enabled</td></tr>
+            <tr><td>@tag</td><td>Prompt tag</td></tr>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── By Action ── -->
+    <div class="tab-content" id="tab-by-action">
+      <div class="cheat-grid">
+
+        <div class="cheat-card">
+          <div class="cheat-card-header normal">Navigation</div>
+          <table>
+            <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Next / prev (Normal, View)</td></tr>
+            <tr><td><kbd>Ctrl+D</kbd> / <kbd>Ctrl+U</kbd></td><td>Half-page down / up (Normal)</td></tr>
+            <tr><td><kbd>gg</kbd> / <kbd>G</kbd></td><td>Top / bottom (Normal)</td></tr>
+            <tr><td><kbd>Up</kbd> / <kbd>Down</kbd></td><td>History or suggestions (Insert)</td></tr>
+            <tr><td><kbd>/</kbd></td><td>Enter filter mode (Normal)</td></tr>
+            <tr><td><kbd>h</kbd> / <kbd>l</kbd></td><td>Resize split (Normal)</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header insert">Prompt Input</div>
+          <table>
+            <tr><td><kbd>i</kbd></td><td>Enter insert mode (Normal)</td></tr>
+            <tr><td><kbd>Enter</kbd></td><td>Submit prompt (Insert) / Send (Interact)</td></tr>
+            <tr><td><kbd>Tab</kbd></td><td>Accept suggestion (Insert)</td></tr>
+            <tr><td><kbd>Ctrl+W</kbd></td><td>Toggle worktree (Insert)</td></tr>
+            <tr><td><kbd>Shift+Enter</kbd></td><td>Insert newline (Insert)</td></tr>
+            <tr><td><kbd>Ctrl+E</kbd></td><td>Open in $EDITOR (Insert)</td></tr>
+            <tr><td><code>:name</code>+<kbd>Tab</kbd></td><td>Expand template (Insert)</td></tr>
+            <tr><td><code>@tag</code></td><td>Tag prompt (Insert) / Filter (Filter)</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header view">Viewing &amp; Output</div>
+          <table>
+            <tr><td><kbd>Enter</kbd></td><td>View output (Normal)</td></tr>
+            <tr><td><kbd>f</kbd></td><td>Toggle auto-scroll (View)</td></tr>
+            <tr><td><kbd>t</kbd></td><td>Toggle split view (View)</td></tr>
+            <tr><td><kbd>w</kbd></td><td>Export output (View)</td></tr>
+            <tr><td><kbd>Ctrl+P</kbd></td><td>Quick prompts popup (View)</td></tr>
+            <tr><td><kbd>Esc</kbd> / <kbd>q</kbd></td><td>Back (View, Filter)</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header interact">Interaction</div>
+          <table>
+            <tr><td><kbd>s</kbd></td><td>Enter interact (Normal, View)</td></tr>
+            <tr><td><kbd>Enter</kbd></td><td>Send message (Interact)</td></tr>
+            <tr><td><em>all keys</em></td><td>Forwarded to PTY (PTY Interact)</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header normal">Selection &amp; Batch</div>
+          <table>
+            <tr><td><kbd>Space</kbd></td><td>Toggle select (Normal)</td></tr>
+            <tr><td><kbd>v</kbd></td><td>Visual select mode (Normal)</td></tr>
+            <tr><td><kbd>V</kbd></td><td>Select all visible (Normal)</td></tr>
+            <tr><td><kbd>d</kbd></td><td>Delete selected (Normal)</td></tr>
+            <tr><td><kbd>x</kbd></td><td>Kill selected (Normal) / Kill worker (View)</td></tr>
+            <tr><td><kbd>m</kbd></td><td>Toggle mode for selection (Normal)</td></tr>
+            <tr><td><kbd>r</kbd></td><td>Retry selected (Normal)</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header cli">Management</div>
+          <table>
+            <tr><td><kbd>r</kbd> / <kbd>R</kbd></td><td>Retry / Resume (Normal)</td></tr>
+            <tr><td><kbd>m</kbd></td><td>Toggle prompt mode (Normal)</td></tr>
+            <tr><td><kbd>J</kbd> / <kbd>K</kbd></td><td>Reorder queue (Normal)</td></tr>
+            <tr><td><kbd>+</kbd> / <kbd>-</kbd></td><td>Workers +/- (Normal)</td></tr>
+            <tr><td><kbd>?</kbd></td><td>Help overlay (Normal)</td></tr>
+            <tr><td><kbd>q</kbd></td><td>Quit (Normal)</td></tr>
+          </table>
+        </div>
+
+      </div>
+    </div>
+
+  </main>
+
+  <footer>
+    <span>MIT License</span>
+    <a href="https://github.com/your-user/clhorde">Source</a>
+    <a href="https://github.com/your-user/clhorde/issues">Issues</a>
+  </footer>
+
+  <script src="js/main.js"></script>
+</body>
+</html>

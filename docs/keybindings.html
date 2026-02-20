@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Keybindings — clhorde</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a href="index.html" class="nav-brand"><span>&gt;_ </span>clhorde</a>
+      <button class="hamburger" aria-label="Menu">&#9776;</button>
+      <div class="nav-links">
+        <a href="guide.html">Guide</a>
+        <a href="features.html">Features</a>
+        <a href="keybindings.html">Keys</a>
+        <a href="configuration.html">Config</a>
+        <a href="cli.html">CLI</a>
+        <a href="cheatsheet.html">Cheatsheet</a>
+        <a href="https://github.com/your-user/clhorde" class="github-link">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <h1>Keybinding Reference</h1>
+    <p class="lead">Complete keybinding reference for all six modes. All bindings are customizable via <a href="configuration.html"><code>keymap.toml</code></a>.</p>
+
+    <!-- ── Normal Mode ── -->
+    <div class="mode-header">
+      <h2 id="normal">Normal Mode</h2>
+      <span class="mode-badge normal">Normal</span>
+    </div>
+
+    <h4>Navigation</h4>
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>j</kbd> / <kbd>Down</kbd></td><td>select_next</td><td>Move cursor to next prompt</td></tr>
+        <tr><td><kbd>k</kbd> / <kbd>Up</kbd></td><td>select_prev</td><td>Move cursor to previous prompt</td></tr>
+        <tr><td><kbd>Ctrl+D</kbd></td><td>half_page_down</td><td>Jump down half a page</td></tr>
+        <tr><td><kbd>Ctrl+U</kbd></td><td>half_page_up</td><td>Jump up half a page</td></tr>
+        <tr><td><kbd>gg</kbd></td><td>go_to_top</td><td>Jump to first prompt</td></tr>
+        <tr><td><kbd>G</kbd></td><td>go_to_bottom</td><td>Jump to last prompt</td></tr>
+        <tr><td><kbd>/</kbd></td><td>search</td><td>Enter filter mode to search prompts</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Selection &amp; Batch Operations</h4>
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>Space</kbd></td><td>toggle_select</td><td>Toggle selection on current prompt</td></tr>
+        <tr><td><kbd>v</kbd></td><td>visual_select</td><td>Start visual select (extend with <kbd>j</kbd>/<kbd>k</kbd>)</td></tr>
+        <tr><td><kbd>V</kbd></td><td>select_all_visible</td><td>Select all visible (filtered) prompts</td></tr>
+        <tr><td><kbd>d</kbd></td><td>delete_selected</td><td>Delete selected prompts (with confirmation)</td></tr>
+        <tr><td><kbd>x</kbd></td><td>kill_selected</td><td>Kill selected running prompts</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>&mdash;</td><td>Clear selection</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Actions</h4>
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>Enter</kbd></td><td>view_output</td><td>View selected prompt's output</td></tr>
+        <tr><td><kbd>s</kbd></td><td>interact</td><td>Interact with running/idle prompt</td></tr>
+        <tr><td><kbd>i</kbd></td><td>insert</td><td>Enter insert mode to type a prompt</td></tr>
+        <tr><td><kbd>m</kbd></td><td>toggle_mode</td><td>Toggle prompt mode (interactive / one-shot)</td></tr>
+        <tr><td><kbd>r</kbd></td><td>retry</td><td>Retry completed/failed prompt (new prompt)</td></tr>
+        <tr><td><kbd>R</kbd></td><td>resume</td><td>Resume completed/failed prompt's session</td></tr>
+        <tr><td><kbd>?</kbd></td><td>show_help</td><td>Show help overlay</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Queue &amp; Workers</h4>
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>J</kbd></td><td>move_down</td><td>Move selected pending prompt down in queue</td></tr>
+        <tr><td><kbd>K</kbd></td><td>move_up</td><td>Move selected pending prompt up in queue</td></tr>
+        <tr><td><kbd>+</kbd> / <kbd>=</kbd></td><td>increase_workers</td><td>Increase max workers (up to 20)</td></tr>
+        <tr><td><kbd>-</kbd></td><td>decrease_workers</td><td>Decrease max workers (down to 1)</td></tr>
+      </tbody>
+    </table>
+
+    <h4>View</h4>
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>h</kbd></td><td>shrink_list</td><td>Shrink prompt list panel</td></tr>
+        <tr><td><kbd>l</kbd></td><td>grow_list</td><td>Grow prompt list panel</td></tr>
+        <tr><td><kbd>q</kbd></td><td>quit</td><td>Quit (confirms if workers active)</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Insert Mode ── -->
+    <div class="mode-header">
+      <h2 id="insert">Insert Mode</h2>
+      <span class="mode-badge insert">Insert</span>
+    </div>
+
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>Enter</kbd></td><td>submit</td><td>Submit prompt to the queue</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>cancel</td><td>Cancel and return to normal mode</td></tr>
+        <tr><td><kbd>Tab</kbd></td><td>accept_suggestion</td><td>Accept directory or template suggestion</td></tr>
+        <tr><td><kbd>Down</kbd></td><td>next_suggestion</td><td>Next suggestion / next history entry</td></tr>
+        <tr><td><kbd>Up</kbd></td><td>prev_suggestion</td><td>Previous suggestion / previous history entry</td></tr>
+        <tr><td><kbd>Ctrl+W</kbd></td><td>&mdash;</td><td>Toggle git worktree isolation (shows <code>[WT]</code>)</td></tr>
+        <tr><td><kbd>Shift+Enter</kbd> / <kbd>Alt+Enter</kbd></td><td>&mdash;</td><td>Insert newline (multi-line editing)</td></tr>
+        <tr><td><kbd>Ctrl+E</kbd></td><td>&mdash;</td><td>Open prompt in <code>$EDITOR</code> for complex editing</td></tr>
+        <tr><td><kbd>Left</kbd> / <kbd>Right</kbd></td><td>&mdash;</td><td>Move cursor within the buffer</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout tip">
+      <div class="callout-title">Tip</div>
+      <p>Type <code>:review</code> then press <kbd>Tab</kbd> to expand a template. Type <code>@feature</code> to tag the prompt. Use <code>/path/to/dir:</code> prefix to set a working directory. The input bar supports multi-line editing and grows dynamically up to 10 lines.</p>
+    </div>
+
+    <!-- ── View Mode ── -->
+    <div class="mode-header">
+      <h2 id="view">View Mode</h2>
+      <span class="mode-badge view">View</span>
+    </div>
+
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>j</kbd> / <kbd>Down</kbd></td><td>scroll_down</td><td>Scroll output down</td></tr>
+        <tr><td><kbd>k</kbd> / <kbd>Up</kbd></td><td>scroll_up</td><td>Scroll output up</td></tr>
+        <tr><td><kbd>s</kbd></td><td>interact</td><td>Enter interact mode (send follow-up)</td></tr>
+        <tr><td><kbd>f</kbd></td><td>toggle_autoscroll</td><td>Toggle auto-scroll on/off</td></tr>
+        <tr><td><kbd>t</kbd></td><td>toggle_split</td><td>Toggle split view (list + output)</td></tr>
+        <tr><td><kbd>w</kbd></td><td>export</td><td>Export output to <code>~/clhorde-output-*.md</code></td></tr>
+        <tr><td><kbd>x</kbd></td><td>kill_worker</td><td>Kill the running worker</td></tr>
+        <tr><td><kbd>Ctrl+P</kbd></td><td>&mdash;</td><td>Show quick prompts popup</td></tr>
+        <tr><td><kbd>Esc</kbd> / <kbd>q</kbd></td><td>back</td><td>Return to normal mode</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout info">
+      <div class="callout-title">Quick Prompts</div>
+      <p>When viewing a running prompt, configured quick prompt keys (e.g., <kbd>g</kbd> for "let's go") send messages instantly without entering interact mode. See <a href="configuration.html#quick-prompts">quick prompts config</a>.</p>
+    </div>
+
+    <!-- ── Interact Mode ── -->
+    <div class="mode-header">
+      <h2 id="interact">Interact Mode</h2>
+      <span class="mode-badge interact">Interact</span>
+    </div>
+
+    <p>Used to send follow-up messages to one-shot workers.</p>
+
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>Enter</kbd></td><td>send</td><td>Send the typed message to the worker</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>back</td><td>Return to normal mode</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── PTY Interact Mode ── -->
+    <div class="mode-header">
+      <h2 id="pty-interact">PTY Interact Mode</h2>
+      <span class="mode-badge pty-interact">PTY Interact</span>
+    </div>
+
+    <p>Used to interact directly with the Claude Code TUI for interactive workers. All keystrokes are forwarded to the PTY.</p>
+
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><em>all keys</em></td><td>&mdash;</td><td>Forwarded directly to the embedded PTY</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>back</td><td>Return to view mode</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Filter Mode ── -->
+    <div class="mode-header">
+      <h2 id="filter">Filter Mode</h2>
+      <span class="mode-badge filter">Filter</span>
+    </div>
+
+    <p>Live-filter prompts by text and/or <code>@tag</code>. Case-insensitive. Supports AND logic for multiple <code>@tag</code> tokens.</p>
+
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><em>type</em></td><td>&mdash;</td><td>Live-filter prompts as you type</td></tr>
+        <tr><td><kbd>Enter</kbd></td><td>confirm</td><td>Apply filter and return to normal</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>cancel</td><td>Clear filter and return to normal</td></tr>
+      </tbody>
+    </table>
+
+    <hr>
+
+    <div class="callout">
+      <div class="callout-title">Custom Keybindings</div>
+      <p>All keybindings shown above are defaults. Override any of them in <code>~/.config/clhorde/keymap.toml</code>. Only specify what you want to change&mdash;unspecified keys keep their defaults. See the <a href="configuration.html">configuration reference</a> for details.</p>
+    </div>
+
+  </main>
+
+  <footer>
+    <span>MIT License</span>
+    <a href="https://github.com/your-user/clhorde">Source</a>
+    <a href="https://github.com/your-user/clhorde/issues">Issues</a>
+  </footer>
+
+  <script src="js/main.js"></script>
+</body>
+</html>

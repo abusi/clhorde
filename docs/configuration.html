@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Configuration — clhorde</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a href="index.html" class="nav-brand"><span>&gt;_ </span>clhorde</a>
+      <button class="hamburger" aria-label="Menu">&#9776;</button>
+      <div class="nav-links">
+        <a href="guide.html">Guide</a>
+        <a href="features.html">Features</a>
+        <a href="keybindings.html">Keys</a>
+        <a href="configuration.html">Config</a>
+        <a href="cli.html">CLI</a>
+        <a href="cheatsheet.html">Cheatsheet</a>
+        <a href="https://github.com/your-user/clhorde" class="github-link">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <h1>Configuration Reference</h1>
+    <p class="lead">All configuration files, settings, and customization options.</p>
+
+    <h2>Config File Locations</h2>
+
+    <table>
+      <thead><tr><th>File</th><th>Location</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>keymap.toml</code></td><td><code>~/.config/clhorde/keymap.toml</code></td><td>Keybindings, settings, quick prompts</td></tr>
+        <tr><td><code>templates.toml</code></td><td><code>~/.config/clhorde/templates.toml</code></td><td>Prompt templates</td></tr>
+        <tr><td><code>history</code></td><td><code>~/.local/share/clhorde/history</code></td><td>Prompt history (auto-managed)</td></tr>
+        <tr><td><code>prompts/</code></td><td><code>~/.local/share/clhorde/prompts/</code></td><td>Per-prompt persistence (UUID v7 JSON)</td></tr>
+      </tbody>
+    </table>
+
+    <p>Config paths respect <code>$XDG_CONFIG_HOME</code> and <code>$XDG_DATA_HOME</code>. The config file is optional&mdash;everything has sensible defaults.</p>
+
+    <h2 id="keymap">Keybindings (<code>keymap.toml</code>)</h2>
+
+    <p>Only specify what you want to change. Missing keys silently use defaults.</p>
+
+    <pre><code><span class="tok-cmt"># ~/.config/clhorde/keymap.toml</span>
+<span class="tok-cmt"># Only override what you want — missing keys keep defaults.</span>
+
+<span class="tok-section">[normal]</span>
+<span class="tok-key">quit</span> = [<span class="tok-str">"q"</span>]
+<span class="tok-key">insert</span> = [<span class="tok-str">"i"</span>]
+<span class="tok-key">select_next</span> = [<span class="tok-str">"j"</span>, <span class="tok-str">"Down"</span>]
+<span class="tok-key">select_prev</span> = [<span class="tok-str">"k"</span>, <span class="tok-str">"Up"</span>]
+<span class="tok-key">view_output</span> = [<span class="tok-str">"Enter"</span>]
+<span class="tok-key">interact</span> = [<span class="tok-str">"s"</span>]
+<span class="tok-key">increase_workers</span> = [<span class="tok-str">"+"</span>, <span class="tok-str">"="</span>]
+<span class="tok-key">decrease_workers</span> = [<span class="tok-str">"-"</span>]
+<span class="tok-key">toggle_mode</span> = [<span class="tok-str">"m"</span>]
+<span class="tok-key">retry</span> = [<span class="tok-str">"r"</span>]
+<span class="tok-key">resume</span> = [<span class="tok-str">"R"</span>]
+<span class="tok-key">move_up</span> = [<span class="tok-str">"K"</span>]
+<span class="tok-key">move_down</span> = [<span class="tok-str">"J"</span>]
+<span class="tok-key">search</span> = [<span class="tok-str">"/"</span>]
+<span class="tok-key">shrink_list</span> = [<span class="tok-str">"h"</span>]
+<span class="tok-key">grow_list</span> = [<span class="tok-str">"l"</span>]
+<span class="tok-key">show_help</span> = [<span class="tok-str">"?"</span>]
+<span class="tok-key">toggle_select</span> = [<span class="tok-str">"Space"</span>]
+<span class="tok-key">select_all_visible</span> = [<span class="tok-str">"V"</span>]
+<span class="tok-key">visual_select</span> = [<span class="tok-str">"v"</span>]
+<span class="tok-key">delete_selected</span> = [<span class="tok-str">"d"</span>]
+<span class="tok-key">kill_selected</span> = [<span class="tok-str">"x"</span>]
+
+<span class="tok-section">[insert]</span>
+<span class="tok-key">cancel</span> = [<span class="tok-str">"Esc"</span>]
+<span class="tok-key">submit</span> = [<span class="tok-str">"Enter"</span>]
+<span class="tok-key">accept_suggestion</span> = [<span class="tok-str">"Tab"</span>]
+<span class="tok-key">next_suggestion</span> = [<span class="tok-str">"Down"</span>]
+<span class="tok-key">prev_suggestion</span> = [<span class="tok-str">"Up"</span>]
+
+<span class="tok-section">[view]</span>
+<span class="tok-key">back</span> = [<span class="tok-str">"Esc"</span>, <span class="tok-str">"q"</span>]
+<span class="tok-key">scroll_down</span> = [<span class="tok-str">"j"</span>, <span class="tok-str">"Down"</span>]
+<span class="tok-key">scroll_up</span> = [<span class="tok-str">"k"</span>, <span class="tok-str">"Up"</span>]
+<span class="tok-key">interact</span> = [<span class="tok-str">"s"</span>]
+<span class="tok-key">toggle_autoscroll</span> = [<span class="tok-str">"f"</span>]
+<span class="tok-key">kill_worker</span> = [<span class="tok-str">"x"</span>]
+<span class="tok-key">export</span> = [<span class="tok-str">"w"</span>]
+<span class="tok-key">toggle_split</span> = [<span class="tok-str">"t"</span>]
+
+<span class="tok-section">[interact]</span>
+<span class="tok-key">back</span> = [<span class="tok-str">"Esc"</span>]
+<span class="tok-key">send</span> = [<span class="tok-str">"Enter"</span>]
+
+<span class="tok-section">[filter]</span>
+<span class="tok-key">confirm</span> = [<span class="tok-str">"Enter"</span>]
+<span class="tok-key">cancel</span> = [<span class="tok-str">"Esc"</span>]</code></pre>
+
+    <h3 id="key-names">Key Name Reference</h3>
+
+    <table>
+      <thead><tr><th>Key Name</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>"a"</code> &ndash; <code>"z"</code>, <code>"A"</code> &ndash; <code>"Z"</code></td><td>Single letter characters</td></tr>
+        <tr><td><code>"0"</code> &ndash; <code>"9"</code></td><td>Digit characters</td></tr>
+        <tr><td><code>"+"</code>, <code>"-"</code>, <code>"/"</code>, <code>"?"</code>, etc.</td><td>Symbol characters</td></tr>
+        <tr><td><code>"Enter"</code></td><td>Enter / Return key</td></tr>
+        <tr><td><code>"Esc"</code></td><td>Escape key</td></tr>
+        <tr><td><code>"Tab"</code></td><td>Tab key</td></tr>
+        <tr><td><code>"Space"</code></td><td>Space bar</td></tr>
+        <tr><td><code>"Backspace"</code></td><td>Backspace key</td></tr>
+        <tr><td><code>"Up"</code>, <code>"Down"</code>, <code>"Left"</code>, <code>"Right"</code></td><td>Arrow keys</td></tr>
+      </tbody>
+    </table>
+
+    <p>Each action takes an array of keys. When any of the listed keys is pressed, the action fires.</p>
+
+    <h2 id="settings">Settings</h2>
+
+    <p>Add a <code>[settings]</code> section to <code>keymap.toml</code>:</p>
+
+    <pre><code><span class="tok-section">[settings]</span>
+<span class="tok-key">max_saved_prompts</span> = <span class="tok-val">100</span>    <span class="tok-cmt"># Maximum prompt files to keep (default: 100)</span>
+<span class="tok-key">worktree_cleanup</span> = <span class="tok-str">"manual"</span> <span class="tok-cmt"># "manual" (default) or "auto"</span>
+<span class="tok-key">list_ratio</span> = <span class="tok-val">40</span>            <span class="tok-cmt"># Prompt list width percentage (10-90, default: 40)</span></code></pre>
+
+    <table>
+      <thead><tr><th>Setting</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>max_saved_prompts</code></td>
+          <td>integer</td>
+          <td>100</td>
+          <td>Maximum number of prompt files to keep. Oldest completed prompts are pruned first.</td>
+        </tr>
+        <tr>
+          <td><code>worktree_cleanup</code></td>
+          <td>string</td>
+          <td><code>"manual"</code></td>
+          <td><code>"manual"</code> keeps worktrees after completion. <code>"auto"</code> removes them when workers finish.</td>
+        </tr>
+        <tr>
+          <td><code>list_ratio</code></td>
+          <td>integer</td>
+          <td>40</td>
+          <td>Percentage width of the prompt list panel (10&ndash;90). The output panel gets the rest.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2 id="templates">Templates (<code>templates.toml</code>)</h2>
+
+    <p>Define reusable prompt snippets in a separate file:</p>
+
+    <pre><code><span class="tok-cmt"># ~/.config/clhorde/templates.toml</span>
+
+<span class="tok-section">[templates]</span>
+<span class="tok-key">review</span> = <span class="tok-str">"Review this code for bugs and security issues:"</span>
+<span class="tok-key">explain</span> = <span class="tok-str">"Explain what this code does:"</span>
+<span class="tok-key">test</span> = <span class="tok-str">"Write unit tests for this code:"</span>
+<span class="tok-key">refactor</span> = <span class="tok-str">"Refactor this code to be more idiomatic:"</span></code></pre>
+
+    <p>In insert mode, type <code>:review</code> and press <kbd>Tab</kbd> to expand. Combine with a directory prefix:</p>
+
+    <pre><code>/path/to/project: :review<kbd>Tab</kbd>
+<span class="tok-cmt">&rarr; /path/to/project: Review this code for bugs and security issues:</span></code></pre>
+
+    <h2 id="quick-prompts">Quick Prompts</h2>
+
+    <p>Add a <code>[quick_prompts]</code> section to <code>keymap.toml</code>:</p>
+
+    <pre><code><span class="tok-section">[quick_prompts]</span>
+<span class="tok-key">g</span> = <span class="tok-str">"let's go"</span>
+<span class="tok-key">c</span> = <span class="tok-str">"continue"</span>
+<span class="tok-key">y</span> = <span class="tok-str">"yes"</span>
+<span class="tok-key">n</span> = <span class="tok-str">"no"</span></code></pre>
+
+    <p>These keys send the associated message instantly when viewing a running prompt. Keys must not conflict with view mode bindings (<kbd>j</kbd>, <kbd>k</kbd>, <kbd>q</kbd>, <kbd>s</kbd>, <kbd>f</kbd>, <kbd>x</kbd>, <kbd>w</kbd>, <kbd>t</kbd>, <kbd>Esc</kbd>, arrows). View bindings take priority on conflict.</p>
+
+    <h2 id="config-cli">Config CLI Management</h2>
+
+    <pre><code><span class="tok-prompt">$ </span>clhorde config path           <span class="tok-cmt"># Print config file path</span>
+<span class="tok-prompt">$ </span>clhorde config init           <span class="tok-cmt"># Create config with all defaults</span>
+<span class="tok-prompt">$ </span>clhorde config init --force   <span class="tok-cmt"># Overwrite existing config</span>
+<span class="tok-prompt">$ </span>clhorde config edit           <span class="tok-cmt"># Open config in $EDITOR (or vi)</span></code></pre>
+
+    <p><code>config init</code> creates a fully populated <code>keymap.toml</code> with all default values, making it easy to see every available option.</p>
+
+  </main>
+
+  <footer>
+    <span>MIT License</span>
+    <a href="https://github.com/your-user/clhorde">Source</a>
+    <a href="https://github.com/your-user/clhorde/issues">Issues</a>
+  </footer>
+
+  <script src="js/main.js"></script>
+</body>
+</html>
