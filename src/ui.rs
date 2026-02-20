@@ -40,6 +40,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.confirm_quit {
         render_quit_confirmation(f, f.area());
     }
+
+    if app.show_help_overlay {
+        render_help_overlay(f, app, f.area());
+    }
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -999,6 +1003,139 @@ fn render_quick_prompts_popup(f: &mut Frame, app: &App, main_area: Rect) {
 
     f.render_widget(Clear, popup_area);
     f.render_widget(paragraph, popup_area);
+}
+
+fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
+    let title_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(Color::Gray);
+    let section_style = Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Helper to add a section
+    let mut add_section = |name: &str, bindings: &[(String, &str)], extras: &[(&str, &str)]| {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {name}"),
+            section_style,
+        )));
+        for (key, desc) in bindings {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("{key:>12}"), key_style),
+                Span::raw("  "),
+                Span::styled(desc.to_string(), desc_style),
+            ]));
+        }
+        for (key, desc) in extras {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("{key:>12}"), key_style),
+                Span::raw("  "),
+                Span::styled(desc.to_string(), desc_style),
+            ]));
+        }
+    };
+
+    // NORMAL
+    let normal = app.keymap.normal_help();
+    add_section("NORMAL", &normal, &[
+        ("Ctrl+D", "half page down"),
+        ("Ctrl+U", "half page up"),
+        ("gg", "go to top"),
+    ]);
+
+    // INSERT
+    let insert = app.keymap.insert_help();
+    add_section("INSERT", &insert, &[
+        ("Ctrl+W", "toggle worktree"),
+        ("Up/Down", "history nav"),
+        (":name+Tab", "expand template"),
+    ]);
+
+    // VIEW
+    let view = app.keymap.view_help();
+    add_section("VIEW", &view, &[
+        ("Ctrl+P", "quick prompts"),
+    ]);
+
+    // INTERACT
+    let interact = app.keymap.interact_help();
+    add_section("INTERACT", &interact, &[]);
+
+    // FILTER
+    let filter = app.keymap.filter_help();
+    add_section("FILTER", &filter, &[]);
+
+    // PTY INTERACT
+    add_section("PTY INTERACT", &[], &[
+        ("Esc", "exit PTY mode"),
+        ("*", "all keys forwarded to PTY"),
+    ]);
+
+    // Quick prompts section (if any configured)
+    let qp = app.keymap.quick_prompt_help();
+    if !qp.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  QUICK PROMPTS (view mode)",
+            section_style,
+        )));
+        for (key, msg) in &qp {
+            let display_msg = if msg.len() > 40 {
+                format!("{}...", &msg[..37])
+            } else {
+                msg.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("{key:>12}"), key_style),
+                Span::raw("  "),
+                Span::styled(display_msg, desc_style),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+
+    // Apply scroll
+    let total_lines = lines.len() as u16;
+    let inner_height = area.height.saturating_sub(4); // borders + footer
+    let max_scroll = total_lines.saturating_sub(inner_height);
+    let scroll = app.help_scroll.min(max_scroll);
+
+    let paragraph = Paragraph::new(lines)
+        .scroll((scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(Span::styled(" Keybindings ", title_style))
+                .title_bottom(Line::from(vec![
+                    Span::styled(" ?", key_style),
+                    Span::styled("/", desc_style),
+                    Span::styled("Esc", key_style),
+                    Span::styled("/", desc_style),
+                    Span::styled("q", key_style),
+                    Span::styled(" to close", desc_style),
+                    Span::raw("  "),
+                    Span::styled("j", key_style),
+                    Span::styled("/", desc_style),
+                    Span::styled("k", key_style),
+                    Span::styled(" to scroll ", desc_style),
+                ])),
+        )
+        .style(Style::default().bg(Color::Rgb(20, 20, 30)));
+
+    f.render_widget(Clear, area);
+    f.render_widget(paragraph, area);
 }
 
 fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {

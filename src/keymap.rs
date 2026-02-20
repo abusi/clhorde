@@ -29,6 +29,7 @@ pub enum NormalAction {
     GoToBottom,
     ShrinkList,
     GrowList,
+    ShowHelp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +97,7 @@ impl Default for Keymap {
         normal.insert(KeyCode::Char('G'), NormalAction::GoToBottom);
         normal.insert(KeyCode::Char('h'), NormalAction::ShrinkList);
         normal.insert(KeyCode::Char('l'), NormalAction::GrowList);
+        normal.insert(KeyCode::Char('?'), NormalAction::ShowHelp);
 
         let mut insert = HashMap::new();
         insert.insert(KeyCode::Esc, InsertAction::Cancel);
@@ -206,6 +208,8 @@ pub(crate) struct TomlNormalBindings {
     pub(crate) shrink_list: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) grow_list: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) show_help: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -338,6 +342,7 @@ impl Keymap {
             apply_bindings(&mut keymap.normal, NormalAction::GoToBottom, normal.go_to_bottom);
             apply_bindings(&mut keymap.normal, NormalAction::ShrinkList, normal.shrink_list);
             apply_bindings(&mut keymap.normal, NormalAction::GrowList, normal.grow_list);
+            apply_bindings(&mut keymap.normal, NormalAction::ShowHelp, normal.show_help);
         }
 
         if let Some(insert) = config.insert {
@@ -465,6 +470,7 @@ pub(crate) fn default_toml_config() -> TomlConfig {
             go_to_bottom: Some(keys_to_strings(&km.normal, NormalAction::GoToBottom)),
             shrink_list: Some(keys_to_strings(&km.normal, NormalAction::ShrinkList)),
             grow_list: Some(keys_to_strings(&km.normal, NormalAction::GrowList)),
+            show_help: Some(keys_to_strings(&km.normal, NormalAction::ShowHelp)),
         }),
         insert: Some(TomlInsertBindings {
             cancel: Some(keys_to_strings(&km.insert, InsertAction::Cancel)),
@@ -578,6 +584,7 @@ impl Keymap {
             (NormalAction::ToggleMode, "mode"),
             (NormalAction::ShrinkList, "shrink"),
             (NormalAction::GrowList, "grow"),
+            (NormalAction::ShowHelp, "help"),
         ];
         self.build_help(&self.normal, entries)
     }

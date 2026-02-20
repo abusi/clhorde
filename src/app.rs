@@ -93,6 +93,10 @@ pub struct App {
     pub list_collapsed: bool,
     /// Wall-clock time when the session started.
     pub session_start: Instant,
+    /// Whether the full-screen help overlay is visible.
+    pub show_help_overlay: bool,
+    /// Scroll offset for the help overlay content.
+    pub help_scroll: u16,
 }
 
 impl App {
@@ -183,6 +187,8 @@ impl App {
             list_ratio,
             list_collapsed: false,
             session_start: Instant::now(),
+            show_help_overlay: false,
+            help_scroll: 0,
         }
     }
 
@@ -446,6 +452,23 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Help overlay intercepts all keys
+        if self.show_help_overlay {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                    self.show_help_overlay = false;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.help_scroll = self.help_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Quit confirmation intercepts all keys
         if self.confirm_quit {
             match key.code {
@@ -606,6 +629,10 @@ impl App {
             }
             NormalAction::GrowList => {
                 self.list_ratio = (self.list_ratio + 5).min(90);
+            }
+            NormalAction::ShowHelp => {
+                self.show_help_overlay = true;
+                self.help_scroll = 0;
             }
         }
     }
@@ -1459,6 +1486,8 @@ mod tests {
             list_ratio: 40,
             list_collapsed: false,
             session_start: Instant::now(),
+            show_help_overlay: false,
+            help_scroll: 0,
         }
     }
 
