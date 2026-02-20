@@ -83,9 +83,10 @@ pub fn spawn_pty_worker(
     }
     cmd.arg("--dangerously-skip-permissions");
     cmd.env_remove("CLAUDECODE");
-    if let Some(ref dir) = cwd {
-        cmd.cwd(dir);
-    }
+    match cwd {
+        Some(ref dir) => cmd.cwd(dir),
+        None => cmd.cwd(std::env::current_dir().unwrap_or_default()),
+    };
 
     let child = pair
         .slave
