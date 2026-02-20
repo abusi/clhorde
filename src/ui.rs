@@ -1279,7 +1279,22 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 ("Esc".to_string(), "clear sel"),
             ]
         }
-        AppMode::Normal => app.keymap.normal_help(),
+        AppMode::Normal => {
+            let mut help = app.keymap.normal_help();
+            if let Some(p) = app.selected_prompt() {
+                let is_pending = p.status == PromptStatus::Pending;
+                let is_running = matches!(p.status, PromptStatus::Running | PromptStatus::Idle);
+                let is_finished = matches!(p.status, PromptStatus::Completed | PromptStatus::Failed);
+                let is_interactive = p.mode == PromptMode::Interactive;
+                help.retain(|(_, desc)| match *desc {
+                    "move up" | "move down" => is_pending,
+                    "interact" => is_interactive && is_running,
+                    "retry" | "resume" => is_finished,
+                    _ => true,
+                });
+            }
+            help
+        }
         AppMode::Insert => {
             let mut help = app.keymap.insert_help();
             help.push(("C-w".to_string(), "worktree"));
