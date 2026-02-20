@@ -30,6 +30,11 @@ pub enum NormalAction {
     ShrinkList,
     GrowList,
     ShowHelp,
+    ToggleSelect,
+    SelectAllVisible,
+    VisualSelect,
+    DeleteSelected,
+    KillSelected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +103,11 @@ impl Default for Keymap {
         normal.insert(KeyCode::Char('h'), NormalAction::ShrinkList);
         normal.insert(KeyCode::Char('l'), NormalAction::GrowList);
         normal.insert(KeyCode::Char('?'), NormalAction::ShowHelp);
+        normal.insert(KeyCode::Char(' '), NormalAction::ToggleSelect);
+        normal.insert(KeyCode::Char('V'), NormalAction::SelectAllVisible);
+        normal.insert(KeyCode::Char('v'), NormalAction::VisualSelect);
+        normal.insert(KeyCode::Char('d'), NormalAction::DeleteSelected);
+        normal.insert(KeyCode::Char('x'), NormalAction::KillSelected);
 
         let mut insert = HashMap::new();
         insert.insert(KeyCode::Esc, InsertAction::Cancel);
@@ -212,6 +222,16 @@ pub(crate) struct TomlNormalBindings {
     pub(crate) grow_list: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) show_help: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) toggle_select: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) select_all_visible: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) visual_select: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) delete_selected: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) kill_selected: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -345,6 +365,11 @@ impl Keymap {
             apply_bindings(&mut keymap.normal, NormalAction::ShrinkList, normal.shrink_list);
             apply_bindings(&mut keymap.normal, NormalAction::GrowList, normal.grow_list);
             apply_bindings(&mut keymap.normal, NormalAction::ShowHelp, normal.show_help);
+            apply_bindings(&mut keymap.normal, NormalAction::ToggleSelect, normal.toggle_select);
+            apply_bindings(&mut keymap.normal, NormalAction::SelectAllVisible, normal.select_all_visible);
+            apply_bindings(&mut keymap.normal, NormalAction::VisualSelect, normal.visual_select);
+            apply_bindings(&mut keymap.normal, NormalAction::DeleteSelected, normal.delete_selected);
+            apply_bindings(&mut keymap.normal, NormalAction::KillSelected, normal.kill_selected);
         }
 
         if let Some(insert) = config.insert {
@@ -473,6 +498,11 @@ pub(crate) fn default_toml_config() -> TomlConfig {
             shrink_list: Some(keys_to_strings(&km.normal, NormalAction::ShrinkList)),
             grow_list: Some(keys_to_strings(&km.normal, NormalAction::GrowList)),
             show_help: Some(keys_to_strings(&km.normal, NormalAction::ShowHelp)),
+            toggle_select: Some(keys_to_strings(&km.normal, NormalAction::ToggleSelect)),
+            select_all_visible: Some(keys_to_strings(&km.normal, NormalAction::SelectAllVisible)),
+            visual_select: Some(keys_to_strings(&km.normal, NormalAction::VisualSelect)),
+            delete_selected: Some(keys_to_strings(&km.normal, NormalAction::DeleteSelected)),
+            kill_selected: Some(keys_to_strings(&km.normal, NormalAction::KillSelected)),
         }),
         insert: Some(TomlInsertBindings {
             cancel: Some(keys_to_strings(&km.insert, InsertAction::Cancel)),
@@ -587,6 +617,11 @@ impl Keymap {
             (NormalAction::ShrinkList, "shrink"),
             (NormalAction::GrowList, "grow"),
             (NormalAction::ShowHelp, "help"),
+            (NormalAction::ToggleSelect, "select"),
+            (NormalAction::SelectAllVisible, "sel all"),
+            (NormalAction::VisualSelect, "visual"),
+            (NormalAction::DeleteSelected, "delete"),
+            (NormalAction::KillSelected, "kill"),
         ];
         self.build_help(&self.normal, entries)
     }

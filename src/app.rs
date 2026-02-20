@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -108,6 +108,12 @@ pub struct App {
     pub help_scroll: u16,
     /// Recently moved prompt: (prompt_id, Instant) for flash highlight.
     pub recently_moved: Option<(usize, Instant)>,
+    /// Set of selected prompt IDs for batch operations.
+    pub selected_ids: HashSet<usize>,
+    /// Whether visual select mode is active (j/k extends selection).
+    pub visual_select_active: bool,
+    /// Whether batch delete confirmation dialog is showing.
+    pub confirm_batch_delete: bool,
 }
 
 impl App {
@@ -207,6 +213,9 @@ impl App {
             show_help_overlay: false,
             help_scroll: 0,
             recently_moved: None,
+            selected_ids: HashSet::new(),
+            visual_select_active: false,
+            confirm_batch_delete: false,
         }
     }
 
@@ -503,6 +512,18 @@ impl App {
             return;
         }
 
+        // Batch delete confirmation intercepts all keys
+        if self.confirm_batch_delete {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.execute_batch_delete();
+                    self.confirm_batch_delete = false;
+                }
+                _ => self.confirm_batch_delete = false,
+            }
+            return;
+        }
+
         match self.mode {
             AppMode::Normal => self.handle_normal_key(key),
             AppMode::Insert => self.handle_insert_key(key),
@@ -527,14 +548,30 @@ impl App {
 
         // Ctrl+D → half page down
         if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let before = self.list_state.selected();
             self.select_half_page_down();
+            if self.visual_select_active {
+                self.extend_selection_range(before, self.list_state.selected());
+            }
             self.mark_selected_seen();
             return;
         }
         // Ctrl+U → half page up
         if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let before = self.list_state.selected();
             self.select_half_page_up();
+            if self.visual_select_active {
+                self.extend_selection_range(before, self.list_state.selected());
+            }
             self.mark_selected_seen();
+            return;
+        }
+
+        // Esc clears selection in Normal mode
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+            if !self.selected_ids.is_empty() || self.visual_select_active {
+                self.clear_selection();
+            }
             return;
         }
 
@@ -571,10 +608,24 @@ impl App {
             }
             NormalAction::SelectNext => {
                 self.select_next();
+                if self.visual_select_active {
+                    if let Some(idx) = self.list_state.selected() {
+                        if let Some(prompt) = self.prompts.get(idx) {
+                            self.selected_ids.insert(prompt.id);
+                        }
+                    }
+                }
                 self.mark_selected_seen();
             }
             NormalAction::SelectPrev => {
                 self.select_prev();
+                if self.visual_select_active {
+                    if let Some(idx) = self.list_state.selected() {
+                        if let Some(prompt) = self.prompts.get(idx) {
+                            self.selected_ids.insert(prompt.id);
+                        }
+                    }
+                }
                 self.mark_selected_seen();
             }
             NormalAction::ViewOutput => {
@@ -615,10 +666,18 @@ impl App {
                 self.max_workers = self.max_workers.saturating_sub(1).max(1);
             }
             NormalAction::ToggleMode => {
-                self.default_mode = self.default_mode.toggle();
+                if !self.selected_ids.is_empty() {
+                    self.batch_toggle_mode();
+                } else {
+                    self.default_mode = self.default_mode.toggle();
+                }
             }
             NormalAction::Retry => {
-                self.retry_selected();
+                if !self.selected_ids.is_empty() {
+                    self.batch_retry();
+                } else {
+                    self.retry_selected();
+                }
             }
             NormalAction::Resume => {
                 self.resume_selected();
@@ -634,19 +693,35 @@ impl App {
                 self.mode = AppMode::Filter;
             }
             NormalAction::HalfPageDown => {
+                let before = self.list_state.selected();
                 self.select_half_page_down();
+                if self.visual_select_active {
+                    self.extend_selection_range(before, self.list_state.selected());
+                }
                 self.mark_selected_seen();
             }
             NormalAction::HalfPageUp => {
+                let before = self.list_state.selected();
                 self.select_half_page_up();
+                if self.visual_select_active {
+                    self.extend_selection_range(before, self.list_state.selected());
+                }
                 self.mark_selected_seen();
             }
             NormalAction::GoToTop => {
+                let before = self.list_state.selected();
                 self.select_first();
+                if self.visual_select_active {
+                    self.extend_selection_range(before, self.list_state.selected());
+                }
                 self.mark_selected_seen();
             }
             NormalAction::GoToBottom => {
+                let before = self.list_state.selected();
                 self.select_last();
+                if self.visual_select_active {
+                    self.extend_selection_range(before, self.list_state.selected());
+                }
                 self.mark_selected_seen();
             }
             NormalAction::ShrinkList => {
@@ -658,6 +733,79 @@ impl App {
             NormalAction::ShowHelp => {
                 self.show_help_overlay = true;
                 self.help_scroll = 0;
+            }
+            NormalAction::ToggleSelect => {
+                self.visual_select_active = false;
+                if let Some(idx) = self.list_state.selected() {
+                    if let Some(prompt) = self.prompts.get(idx) {
+                        let id = prompt.id;
+                        if !self.selected_ids.remove(&id) {
+                            self.selected_ids.insert(id);
+                        }
+                    }
+                }
+            }
+            NormalAction::SelectAllVisible => {
+                let visible_ids: Vec<usize> = self
+                    .visible_prompt_indices()
+                    .iter()
+                    .filter_map(|&idx| self.prompts.get(idx).map(|p| p.id))
+                    .collect();
+                let all_selected = visible_ids.iter().all(|id| self.selected_ids.contains(id));
+                if all_selected {
+                    for id in &visible_ids {
+                        self.selected_ids.remove(id);
+                    }
+                } else {
+                    for id in visible_ids {
+                        self.selected_ids.insert(id);
+                    }
+                }
+            }
+            NormalAction::VisualSelect => {
+                self.visual_select_active = !self.visual_select_active;
+                if self.visual_select_active {
+                    if let Some(idx) = self.list_state.selected() {
+                        if let Some(prompt) = self.prompts.get(idx) {
+                            self.selected_ids.insert(prompt.id);
+                        }
+                    }
+                }
+            }
+            NormalAction::DeleteSelected => {
+                if self.selected_ids.is_empty() {
+                    // Select cursor prompt, then confirm
+                    if let Some(idx) = self.list_state.selected() {
+                        if let Some(prompt) = self.prompts.get(idx) {
+                            self.selected_ids.insert(prompt.id);
+                        }
+                    }
+                }
+                if !self.selected_ids.is_empty() {
+                    self.confirm_batch_delete = true;
+                }
+            }
+            NormalAction::KillSelected => {
+                if !self.selected_ids.is_empty() {
+                    self.batch_kill();
+                } else {
+                    // Kill cursor prompt if running/idle
+                    let kill_id = self.selected_prompt().and_then(|p| {
+                        if p.status == PromptStatus::Running || p.status == PromptStatus::Idle {
+                            Some(p.id)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(id) = kill_id {
+                        if let Some(sender) = self.worker_inputs.get(&id) {
+                            let _ = sender.send(WorkerInput::Kill);
+                        }
+                        if let Some(mut handle) = self.pty_handles.remove(&id) {
+                            let _ = handle.child.kill();
+                        }
+                    }
+                }
             }
         }
     }
@@ -1342,6 +1490,153 @@ impl App {
         &self.filtered_indices
     }
 
+    // ── Selection utilities ──
+
+    pub fn clear_selection(&mut self) {
+        self.selected_ids.clear();
+        self.visual_select_active = false;
+    }
+
+    pub fn selection_count(&self) -> usize {
+        self.selected_ids.len()
+    }
+
+    pub fn is_selected(&self, prompt_id: usize) -> bool {
+        self.selected_ids.contains(&prompt_id)
+    }
+
+    /// Add all prompts between `from` and `to` indices (inclusive) to selection.
+    fn extend_selection_range(&mut self, from: Option<usize>, to: Option<usize>) {
+        let (Some(a), Some(b)) = (from, to) else {
+            return;
+        };
+        let lo = a.min(b);
+        let hi = a.max(b);
+        for idx in lo..=hi {
+            if let Some(prompt) = self.prompts.get(idx) {
+                self.selected_ids.insert(prompt.id);
+            }
+        }
+    }
+
+    // ── Batch operations ──
+
+    fn batch_retry(&mut self) {
+        let to_retry: Vec<(String, Option<String>, PromptMode, bool)> = self
+            .prompts
+            .iter()
+            .filter(|p| {
+                self.selected_ids.contains(&p.id)
+                    && (p.status == PromptStatus::Completed || p.status == PromptStatus::Failed)
+            })
+            .map(|p| (p.text.clone(), p.cwd.clone(), p.mode, p.worktree))
+            .collect();
+        let count = to_retry.len();
+        for (text, cwd, mode, wt) in to_retry {
+            let mut new_prompt = Prompt::new(self.next_id, text, cwd, mode);
+            new_prompt.worktree = wt;
+            let max_rank = self
+                .prompts
+                .iter()
+                .map(|p| p.queue_rank)
+                .fold(0.0_f64, f64::max);
+            new_prompt.queue_rank = max_rank + 1.0;
+            self.next_id += 1;
+            self.persist_prompt(&new_prompt);
+            self.prompts.push(new_prompt);
+        }
+        self.clear_selection();
+        self.rebuild_filter();
+        if count > 0 {
+            self.status_message = Some((format!("Retried {count} prompts"), Instant::now()));
+        }
+    }
+
+    fn batch_kill(&mut self) {
+        let ids: Vec<usize> = self
+            .prompts
+            .iter()
+            .filter(|p| {
+                self.selected_ids.contains(&p.id)
+                    && (p.status == PromptStatus::Running || p.status == PromptStatus::Idle)
+            })
+            .map(|p| p.id)
+            .collect();
+        let count = ids.len();
+        for id in ids {
+            if let Some(sender) = self.worker_inputs.get(&id) {
+                let _ = sender.send(WorkerInput::Kill);
+            }
+            if let Some(mut handle) = self.pty_handles.remove(&id) {
+                let _ = handle.child.kill();
+            }
+        }
+        self.clear_selection();
+        if count > 0 {
+            self.status_message = Some((format!("Killed {count} workers"), Instant::now()));
+        }
+    }
+
+    fn execute_batch_delete(&mut self) {
+        let ids: Vec<usize> = self.selected_ids.iter().copied().collect();
+        let mut count = 0;
+        for id in ids {
+            // Kill running/idle workers first
+            if let Some(prompt) = self.prompts.iter().find(|p| p.id == id) {
+                if prompt.status == PromptStatus::Running || prompt.status == PromptStatus::Idle {
+                    if let Some(sender) = self.worker_inputs.get(&id) {
+                        let _ = sender.send(WorkerInput::Kill);
+                    }
+                    if let Some(mut handle) = self.pty_handles.remove(&id) {
+                        let _ = handle.child.kill();
+                    }
+                    self.worker_inputs.remove(&id);
+                    self.active_workers = self.active_workers.saturating_sub(1);
+                }
+            }
+            // Delete persistence file
+            if let Some(ref dir) = self.prompts_dir {
+                if let Some(prompt) = self.prompts.iter().find(|p| p.id == id) {
+                    persistence::delete_prompt_file(dir, &prompt.uuid);
+                }
+            }
+            // Remove from prompts list
+            if let Some(pos) = self.prompts.iter().position(|p| p.id == id) {
+                self.prompts.remove(pos);
+                count += 1;
+            }
+        }
+        self.clear_selection();
+        self.rebuild_filter();
+        self.clamp_selection_to_filter();
+        if count > 0 {
+            self.status_message = Some((format!("Deleted {count} prompts"), Instant::now()));
+        }
+    }
+
+    fn batch_toggle_mode(&mut self) {
+        let ids: Vec<usize> = self
+            .prompts
+            .iter()
+            .filter(|p| self.selected_ids.contains(&p.id) && p.status == PromptStatus::Pending)
+            .map(|p| p.id)
+            .collect();
+        let count = ids.len();
+        for id in &ids {
+            if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == *id) {
+                prompt.mode = prompt.mode.toggle();
+            }
+        }
+        for id in &ids {
+            self.persist_prompt_by_id(*id);
+        }
+        self.clear_selection();
+        if count > 0 {
+            self.status_message =
+                Some((format!("Toggled mode on {count} prompts"), Instant::now()));
+        }
+    }
+
     // ── Feature 6: History ──
 
     fn data_dir() -> Option<PathBuf> {
@@ -1560,6 +1855,9 @@ mod tests {
             show_help_overlay: false,
             help_scroll: 0,
             recently_moved: None,
+            selected_ids: HashSet::new(),
+            visual_select_active: false,
+            confirm_batch_delete: false,
         }
     }
 
