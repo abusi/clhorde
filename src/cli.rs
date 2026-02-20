@@ -361,6 +361,7 @@ fn store_clean_worktrees() -> i32 {
                 queue_rank: pf.queue_rank,
                 session_id: pf.session_id.clone(),
                 worktree_path: None,
+                tags: pf.tags.clone(),
             };
             persistence::save_prompt(&dir, uuid, &updated);
             continue;
@@ -391,6 +392,7 @@ fn store_clean_worktrees() -> i32 {
                                         queue_rank: pf.queue_rank,
                                         session_id: pf.session_id.clone(),
                                         worktree_path: None,
+                                        tags: pf.tags.clone(),
                                     };
                                     persistence::save_prompt(&dir, uuid, &updated);
                                     break;
@@ -1119,6 +1121,7 @@ mod tests {
             queue_rank: rank,
             session_id: None,
             worktree_path: None,
+            tags: Vec::new(),
         }
     }
 

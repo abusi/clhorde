@@ -14,6 +14,8 @@ pub struct PromptFile {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,6 +129,7 @@ impl PromptFile {
             queue_rank: prompt.queue_rank,
             session_id: prompt.session_id.clone(),
             worktree_path: prompt.worktree_path.clone(),
+            tags: prompt.tags.clone(),
         }
     }
 }
@@ -158,6 +161,7 @@ mod tests {
             queue_rank: 1.0,
             session_id: Some("sess-123".to_string()),
             worktree_path: None,
+            tags: Vec::new(),
         };
 
         save_prompt(&dir, &uuid1, &data);
@@ -206,6 +210,7 @@ mod tests {
                 queue_rank: rank,
                 session_id: None,
                 worktree_path: None,
+                tags: Vec::new(),
             };
             save_prompt(&dir, &uuid, &data);
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -262,6 +267,7 @@ mod tests {
                 queue_rank: i as f64,
                 session_id: None,
                 worktree_path: None,
+                tags: Vec::new(),
             };
             save_prompt(&dir, &uuid, &data);
             uuids.push(uuid);
@@ -297,6 +303,7 @@ mod tests {
             queue_rank: 1.0,
             session_id: None,
             worktree_path: None,
+            tags: Vec::new(),
         };
         save_prompt(&dir, &uuid, &data);
 
@@ -322,6 +329,7 @@ mod tests {
             queue_rank: 1.0,
             session_id: None,
             worktree_path: None,
+            tags: Vec::new(),
         };
         save_prompt(&dir, &uuid, &data);
         assert_eq!(load_all_prompts(&dir).len(), 1);

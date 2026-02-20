@@ -153,6 +153,7 @@ impl App {
                 prompt.session_id = pf.session_id.clone();
                 prompt.worktree = pf.options.worktree.unwrap_or(false);
                 prompt.worktree_path = pf.worktree_path.clone();
+                prompt.tags = pf.tags.clone();
                 prompt.status = status;
                 prompt.seen = true;
                 prompts.push(prompt);
@@ -247,9 +248,10 @@ impl App {
             .count()
     }
 
-    pub fn add_prompt(&mut self, text: String, cwd: Option<String>, worktree: bool) {
+    pub fn add_prompt(&mut self, text: String, cwd: Option<String>, worktree: bool, tags: Vec<String>) {
         let mut prompt = Prompt::new(self.next_id, text, cwd, self.default_mode);
         prompt.worktree = worktree;
+        prompt.tags = tags;
         let max_rank = self.prompts.iter().map(|p| p.queue_rank).fold(0.0_f64, f64::max);
         prompt.queue_rank = max_rank + 1.0;
         self.next_id += 1;
@@ -835,7 +837,10 @@ impl App {
                     if !text.is_empty() {
                         let (cwd, prompt_text) = Self::parse_cwd_prefix(&text);
                         if !prompt_text.is_empty() {
-                            self.add_prompt(prompt_text.clone(), cwd, self.worktree_pending);
+                            let (tags, clean_text) = crate::prompt::parse_tags(&prompt_text);
+                            if !clean_text.is_empty() {
+                                self.add_prompt(clean_text, cwd, self.worktree_pending, tags);
+                            }
                             self.append_history(&text);
                         }
                     }
@@ -1365,8 +1370,10 @@ impl App {
         let cwd = prompt.cwd.clone();
         let mode = prompt.mode;
         let wt = prompt.worktree;
+        let tags = prompt.tags.clone();
         let mut new_prompt = Prompt::new(self.next_id, text, cwd, mode);
         new_prompt.worktree = wt;
+        new_prompt.tags = tags;
         let max_rank = self.prompts.iter().map(|p| p.queue_rank).fold(0.0_f64, f64::max);
         new_prompt.queue_rank = max_rank + 1.0;
         self.next_id += 1;
@@ -1461,11 +1468,33 @@ impl App {
     fn rebuild_filter(&mut self) {
         self.filtered_indices = match &self.filter_text {
             Some(filter) => {
-                let lower = filter.to_lowercase();
+                // Split filter into @tag tokens and text tokens
+                let mut tag_filters = Vec::new();
+                let mut text_parts = Vec::new();
+                for word in filter.split_whitespace() {
+                    if let Some(tag) = word.strip_prefix('@') {
+                        if !tag.is_empty() {
+                            tag_filters.push(tag.to_lowercase());
+                        }
+                    } else {
+                        text_parts.push(word.to_lowercase());
+                    }
+                }
+                let text_filter = text_parts.join(" ");
+
                 self.prompts
                     .iter()
                     .enumerate()
-                    .filter(|(_, p)| p.text.to_lowercase().contains(&lower))
+                    .filter(|(_, p)| {
+                        // All @tag filters must match
+                        let tags_match = tag_filters.iter().all(|tf| {
+                            p.tags.iter().any(|t| t.to_lowercase() == *tf)
+                        });
+                        // Text filter must match prompt text (if present)
+                        let text_match = text_filter.is_empty()
+                            || p.text.to_lowercase().contains(&text_filter);
+                        tags_match && text_match
+                    })
                     .map(|(i, _)| i)
                     .collect()
             }
@@ -1884,9 +1913,9 @@ mod tests {
     #[test]
     fn add_prompt_increments_id() {
         let mut app = new_test_app();
-        app.add_prompt("first".to_string(), None, false);
-        app.add_prompt("second".to_string(), None, false);
-        app.add_prompt("third".to_string(), None, false);
+        app.add_prompt("first".to_string(), None, false, Vec::new());
+        app.add_prompt("second".to_string(), None, false, Vec::new());
+        app.add_prompt("third".to_string(), None, false, Vec::new());
 
         assert_eq!(app.prompts.len(), 3);
         assert_eq!(app.prompts[0].id, 1);
@@ -1899,16 +1928,16 @@ mod tests {
     fn add_prompt_selects_first() {
         let mut app = new_test_app();
         assert!(app.list_state.selected().is_none());
-        app.add_prompt("test".to_string(), None, false);
+        app.add_prompt("test".to_string(), None, false, Vec::new());
         assert_eq!(app.list_state.selected(), Some(0));
     }
 
     #[test]
     fn pending_and_completed_counts() {
         let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None, false);
-        app.add_prompt("b".to_string(), None, false);
-        app.add_prompt("c".to_string(), None, false);
+        app.add_prompt("a".to_string(), None, false, Vec::new());
+        app.add_prompt("b".to_string(), None, false, Vec::new());
+        app.add_prompt("c".to_string(), None, false, Vec::new());
 
         assert_eq!(app.pending_count(), 3);
         assert_eq!(app.completed_count(), 0);
@@ -1939,8 +1968,8 @@ mod tests {
     #[test]
     fn select_next_clamps_to_end() {
         let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None, false);
-        app.add_prompt("b".to_string(), None, false);
+        app.add_prompt("a".to_string(), None, false, Vec::new());
+        app.add_prompt("b".to_string(), None, false, Vec::new());
         app.list_state.select(Some(1));
 
         app.select_next();
@@ -1950,8 +1979,8 @@ mod tests {
     #[test]
     fn select_prev_clamps_to_start() {
         let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None, false);
-        app.add_prompt("b".to_string(), None, false);
+        app.add_prompt("a".to_string(), None, false, Vec::new());
+        app.add_prompt("b".to_string(), None, false, Vec::new());
         app.list_state.select(Some(0));
 
         app.select_prev();
@@ -1961,9 +1990,9 @@ mod tests {
     #[test]
     fn select_next_advances() {
         let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None, false);
-        app.add_prompt("b".to_string(), None, false);
-        app.add_prompt("c".to_string(), None, false);
+        app.add_prompt("a".to_string(), None, false, Vec::new());
+        app.add_prompt("b".to_string(), None, false, Vec::new());
+        app.add_prompt("c".to_string(), None, false, Vec::new());
         app.list_state.select(Some(0));
 
         app.select_next();
@@ -1975,8 +2004,8 @@ mod tests {
     #[test]
     fn select_prev_goes_back() {
         let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None, false);
-        app.add_prompt("b".to_string(), None, false);
+        app.add_prompt("a".to_string(), None, false, Vec::new());
+        app.add_prompt("b".to_string(), None, false, Vec::new());
         app.list_state.select(Some(1));
 
         app.select_prev();
@@ -1988,7 +2017,7 @@ mod tests {
     fn app_with_prompts(texts: &[&str]) -> App {
         let mut app = new_test_app();
         for t in texts {
-            app.add_prompt(t.to_string(), None, false);
+            app.add_prompt(t.to_string(), None, false, Vec::new());
         }
         app
     }
@@ -2167,6 +2196,41 @@ mod tests {
         app.rebuild_filter();
         app.clamp_selection_to_filter();
         assert!(app.list_state.selected().is_none());
+    }
+
+    // ── tag filtering ──
+
+    #[test]
+    fn filter_by_tag() {
+        let mut app = new_test_app();
+        app.add_prompt("Fix navbar".to_string(), None, false, vec!["frontend".to_string()]);
+        app.add_prompt("Fix API".to_string(), None, false, vec!["backend".to_string()]);
+        app.add_prompt("Fix styles".to_string(), None, false, vec!["frontend".to_string()]);
+        app.filter_text = Some("@frontend".to_string());
+        app.rebuild_filter();
+        assert_eq!(app.filtered_indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn filter_by_tag_and_text() {
+        let mut app = new_test_app();
+        app.add_prompt("Fix navbar".to_string(), None, false, vec!["frontend".to_string()]);
+        app.add_prompt("Fix styles".to_string(), None, false, vec!["frontend".to_string()]);
+        app.add_prompt("Fix API".to_string(), None, false, vec!["backend".to_string()]);
+        app.filter_text = Some("@frontend navbar".to_string());
+        app.rebuild_filter();
+        assert_eq!(app.filtered_indices, vec![0]);
+    }
+
+    #[test]
+    fn filter_by_multiple_tags() {
+        let mut app = new_test_app();
+        app.add_prompt("Fix".to_string(), None, false, vec!["frontend".to_string(), "urgent".to_string()]);
+        app.add_prompt("Fix2".to_string(), None, false, vec!["frontend".to_string()]);
+        app.add_prompt("Fix3".to_string(), None, false, vec!["backend".to_string()]);
+        app.filter_text = Some("@frontend @urgent".to_string());
+        app.rebuild_filter();
+        assert_eq!(app.filtered_indices, vec![0]); // only first has both tags
     }
 
     // ── history_prev / history_next ──
@@ -2411,7 +2475,7 @@ mod tests {
     fn app_with_many_prompts(n: usize) -> App {
         let mut app = new_test_app();
         for i in 0..n {
-            app.add_prompt(format!("prompt {i}"), None, false);
+            app.add_prompt(format!("prompt {i}"), None, false, Vec::new());
         }
         app
     }
