@@ -1,0 +1,51 @@
+/* Print overrides for cheatsheet */
+
+@media print {
+  :root {
+    --bg-page: #fff;
+    --bg-card: #f6f8fa;
+    --bg-code: #f0f2f4;
+    --border: #d0d7de;
+    --text: #1f2328;
+    --text-muted: #656d76;
+    --text-heading: #1f2328;
+    --accent-green: #1a7f37;
+    --accent-amber: #9a6700;
+    --accent-cyan: #0969da;
+    --accent-magenta: #8250df;
+    --accent-red: #cf222e;
+  }
+
+  nav, footer, .hamburger, .print-btn, .copy-btn, .tabs { display: none !important; }
+
+  body {
+    font-size: 10pt;
+    line-height: 1.4;
+    background: #fff;
+    color: #1f2328;
+  }
+
+  main { padding-top: 0; max-width: 100%; }
+
+  .tab-content { display: block !important; }
+
+  .cheat-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+  }
+
+  .cheat-card { break-inside: avoid; page-break-inside: avoid; }
+
+  h1 { font-size: 16pt; margin-bottom: 8px; }
+  h2 { font-size: 12pt; margin: 16px 0 8px; break-after: avoid; }
+
+  kbd {
+    border: 1px solid #999;
+    background: #f0f2f4;
+    color: #1f2328;
+    box-shadow: none;
+    font-size: 0.8em;
+  }
+
+  a { color: inherit; text-decoration: none; }
+}

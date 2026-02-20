@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Features — clhorde</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a href="index.html" class="nav-brand"><span>&gt;_ </span>clhorde</a>
+      <button class="hamburger" aria-label="Menu">&#9776;</button>
+      <div class="nav-links">
+        <a href="guide.html">Guide</a>
+        <a href="features.html">Features</a>
+        <a href="keybindings.html">Keys</a>
+        <a href="configuration.html">Config</a>
+        <a href="cli.html">CLI</a>
+        <a href="cheatsheet.html">Cheatsheet</a>
+        <a href="https://github.com/your-user/clhorde" class="github-link">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <h1>Features</h1>
+    <p class="lead">Deep-dives into every major feature. Click a section to jump directly.</p>
+
+    <ul>
+      <li><a href="#dual-architecture">Dual Architecture</a></li>
+      <li><a href="#worker-pool">Worker Pool</a></li>
+      <li><a href="#modal-interface">Modal Interface</a></li>
+      <li><a href="#prompt-input">Prompt Input &amp; Multi-line Editor</a></li>
+      <li><a href="#batch-operations">Batch Operations</a></li>
+      <li><a href="#git-worktrees">Git Worktrees</a></li>
+      <li><a href="#quick-prompts">Quick Prompts</a></li>
+      <li><a href="#filtering">Filtering &amp; Tags</a></li>
+      <li><a href="#queue-reordering">Queue Reordering</a></li>
+      <li><a href="#retry-resume">Retry &amp; Resume</a></li>
+      <li><a href="#persistence">Persistence</a></li>
+      <li><a href="#split-view">Split View</a></li>
+      <li><a href="#export">Export</a></li>
+      <li><a href="#prompt-from-files">Prompt from Files</a></li>
+    </ul>
+
+    <hr>
+
+    <!-- ── Dual Architecture ── -->
+    <section id="dual-architecture" class="feature-section">
+      <h2>Dual Architecture</h2>
+
+      <p>clhorde uses a hybrid approach: two different ways to spawn Claude depending on the prompt mode.</p>
+
+      <div class="card-grid">
+        <div class="card">
+          <h3>Interactive (PTY)</h3>
+          <p>Spawns Claude in a real pseudo-terminal via <code>portable-pty</code>. The full Claude Code TUI is rendered through <code>alacritty_terminal</code>, a headless terminal emulator. You see colors, tool use, formatting&mdash;everything.</p>
+          <pre><code>claude "your prompt" --dangerously-skip-permissions</code></pre>
+        </div>
+        <div class="card">
+          <h3>One-shot (stream-json)</h3>
+          <p>Passes the prompt as a CLI argument with <code>stream-json</code> output format. Lightweight, text-only. No embedded TUI. Process exits after responding.</p>
+          <pre><code>claude -p "your prompt" \
+  --output-format stream-json \
+  --verbose \
+  --dangerously-skip-permissions</code></pre>
+        </div>
+      </div>
+
+      <p><strong>When to use each:</strong></p>
+      <ul>
+        <li><strong>Interactive</strong> is best when you need tool use visibility, want to approve/deny actions, or plan to have an extended back-and-forth conversation.</li>
+        <li><strong>One-shot</strong> is best for fire-and-forget tasks: code reviews, explanations, simple generation. Lower overhead, faster startup.</li>
+      </ul>
+
+      <p>Toggle between modes with <kbd>m</kbd> in Normal mode. The status bar shows the current default.</p>
+    </section>
+
+    <!-- ── Worker Pool ── -->
+    <section id="worker-pool" class="feature-section">
+      <h2>Worker Pool</h2>
+
+      <p>clhorde's queue model is what sets it apart from session-based tools. You don't manage individual sessions&mdash;you queue prompts and let the worker pool handle dispatch.</p>
+
+      <ol>
+        <li>You type prompts &rarr; they enter the queue as <strong>Pending</strong></li>
+        <li>The event loop checks: <code>active_workers &lt; max_workers</code>?</li>
+        <li>If yes, the next pending prompt is dispatched to a new worker</li>
+        <li>When a worker finishes, the next queued prompt is dispatched</li>
+      </ol>
+
+      <p>Adjust the pool size with <kbd>+</kbd>/<kbd>-</kbd> (range: 1&ndash;20). The status bar shows <code>Workers: active/max</code>.</p>
+
+      <p>This means you can batch 50 prompts, set workers to 5, and walk away. Workers will chew through the queue automatically.</p>
+    </section>
+
+    <!-- ── Modal Interface ── -->
+    <section id="modal-interface" class="feature-section">
+      <h2>Modal Interface</h2>
+
+      <p>clhorde uses six vim-style modes. Each mode has its own keybindings shown in the help bar at the bottom.</p>
+
+      <table>
+        <thead><tr><th>Mode</th><th>Purpose</th><th>Enter via</th><th>Exit via</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Normal</strong></td><td>Default: navigate, select, manage</td><td>Launch / <kbd>Esc</kbd></td><td>&mdash;</td></tr>
+          <tr><td><strong>Insert</strong></td><td>Type a new prompt</td><td><kbd>i</kbd></td><td><kbd>Esc</kbd> or <kbd>Enter</kbd></td></tr>
+          <tr><td><strong>View</strong></td><td>Read prompt output</td><td><kbd>Enter</kbd></td><td><kbd>Esc</kbd> / <kbd>q</kbd></td></tr>
+          <tr><td><strong>Interact</strong></td><td>Send follow-up to one-shot worker</td><td><kbd>s</kbd></td><td><kbd>Esc</kbd></td></tr>
+          <tr><td><strong>PTY Interact</strong></td><td>Direct keyboard control of PTY</td><td><kbd>s</kbd> (on interactive)</td><td><kbd>Esc</kbd></td></tr>
+          <tr><td><strong>Filter</strong></td><td>Search/filter prompts</td><td><kbd>/</kbd></td><td><kbd>Enter</kbd> / <kbd>Esc</kbd></td></tr>
+        </tbody>
+      </table>
+
+      <p>Press <kbd>?</kbd> in Normal mode to see a full help overlay with all keybindings for every mode.</p>
+    </section>
+
+    <!-- ── Prompt Input ── -->
+    <section id="prompt-input" class="feature-section">
+      <h2>Prompt Input &amp; Multi-line Editor</h2>
+
+      <p>Insert mode provides a full-featured text editor with multi-line support:</p>
+
+      <h3>Multi-line editing</h3>
+      <p>Press <kbd>Shift+Enter</kbd> or <kbd>Alt+Enter</kbd> to insert a newline. The input bar grows dynamically (up to 10 lines) and shows a line position indicator when multi-line. Arrow keys navigate within the buffer. Bracketed paste is enabled so pasting multi-line text works without triggering premature submit.</p>
+
+      <h3>External editor</h3>
+      <p>Press <kbd>Ctrl+E</kbd> to open the current prompt in <code>$EDITOR</code> (or <code>vi</code>). When you save and exit, the content is loaded back into the input bar. This is useful for complex, multi-line prompts.</p>
+
+      <h3>Templates</h3>
+      <p>Type <code>:name</code> and press <kbd>Tab</kbd> to expand a template. A suggestion popup shows matching templates as you type. Define templates in <a href="configuration.html#templates"><code>templates.toml</code></a>.</p>
+
+      <h3>Directory suggestions</h3>
+      <p>Type a path and press <kbd>Tab</kbd> to autocomplete directory names. Useful for setting a working directory prefix.</p>
+
+      <h3>History</h3>
+      <p>Press <kbd>Up</kbd>/<kbd>Down</kbd> (when no suggestions are visible) to cycle through previously submitted prompts.</p>
+
+      <h3>Tags</h3>
+      <p>Include <code>@tag</code> anywhere in your prompt to tag it. Tags are stripped from the prompt text sent to Claude but stored for filtering.</p>
+      <pre><code>@backend @urgent Fix the database connection pooling issue</code></pre>
+
+      <h3>Worktree toggle</h3>
+      <p>Press <kbd>Ctrl+W</kbd> to enable git worktree isolation. The input bar turns cyan and shows <code>[WT]</code>. See <a href="#git-worktrees">Git Worktrees</a>.</p>
+    </section>
+
+    <!-- ── Batch Operations ── -->
+    <section id="batch-operations" class="feature-section">
+      <h2>Batch Operations</h2>
+
+      <p>Select multiple prompts and operate on them at once.</p>
+
+      <h3>Selection</h3>
+      <table>
+        <thead><tr><th>Key</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td><kbd>Space</kbd></td><td>Toggle select on current prompt</td></tr>
+          <tr><td><kbd>v</kbd></td><td>Start visual select (extend with <kbd>j</kbd>/<kbd>k</kbd>)</td></tr>
+          <tr><td><kbd>V</kbd></td><td>Select all visible (filtered) prompts</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>Clear selection</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Batch actions</h3>
+      <p>With prompts selected, these actions apply to all selected:</p>
+      <table>
+        <thead><tr><th>Key</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td><kbd>r</kbd></td><td>Retry all selected completed/failed prompts</td></tr>
+          <tr><td><kbd>x</kbd></td><td>Kill all selected running prompts</td></tr>
+          <tr><td><kbd>d</kbd></td><td>Delete selected prompts (with confirmation dialog)</td></tr>
+          <tr><td><kbd>m</kbd></td><td>Toggle mode on selected prompts</td></tr>
+        </tbody>
+      </table>
+
+      <p>The help bar changes to show selection-aware actions when prompts are selected.</p>
+    </section>
+
+    <!-- ── Git Worktrees ── -->
+    <section id="git-worktrees" class="feature-section">
+      <h2>Git Worktrees</h2>
+
+      <p>When running multiple workers against the same repo, they can conflict by modifying the same files. Git worktrees solve this by giving each worker its own isolated directory that shares the git object database.</p>
+
+      <h3>How to use</h3>
+      <ol>
+        <li>Press <kbd>i</kbd> to enter insert mode</li>
+        <li>Type your prompt</li>
+        <li>Press <kbd>Ctrl+W</kbd> &mdash; the input bar turns cyan and shows <code>[WT]</code></li>
+        <li>Press <kbd>Enter</kbd> to submit</li>
+      </ol>
+
+      <p>The worker runs in a new worktree at <code>../<em>&lt;repo-name&gt;</em>-wt-<em>&lt;prompt-id&gt;</em>/</code>, a sibling directory of your repo.</p>
+
+      <h3>Cleanup</h3>
+      <p>By default, worktrees persist after the worker finishes. Control this with the <code>worktree_cleanup</code> setting:</p>
+
+      <pre><code><span class="tok-section">[settings]</span>
+<span class="tok-key">worktree_cleanup</span> = <span class="tok-str">"manual"</span>  <span class="tok-cmt"># default — worktrees persist</span>
+<span class="tok-key">worktree_cleanup</span> = <span class="tok-str">"auto"</span>    <span class="tok-cmt"># remove worktrees when workers finish</span></code></pre>
+
+      <p>To manually clean up:</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde store clean-worktrees</code></pre>
+    </section>
+
+    <!-- ── Quick Prompts ── -->
+    <section id="quick-prompts" class="feature-section">
+      <h2>Quick Prompts</h2>
+
+      <p>Send predefined messages to a running worker with a single keypress. No need to enter interact mode.</p>
+
+      <p>Configure in <code>keymap.toml</code>:</p>
+      <pre><code><span class="tok-section">[quick_prompts]</span>
+<span class="tok-key">g</span> = <span class="tok-str">"let's go"</span>
+<span class="tok-key">c</span> = <span class="tok-str">"continue"</span>
+<span class="tok-key">y</span> = <span class="tok-str">"yes"</span>
+<span class="tok-key">n</span> = <span class="tok-str">"no"</span></code></pre>
+
+      <p>When viewing a running or idle prompt, press the configured key to send the message instantly. The message is echoed in the output panel.</p>
+
+      <p>Press <kbd>Ctrl+P</kbd> in view mode to see a popup of all configured quick prompts.</p>
+
+      <p>Quick prompt keys must not conflict with view mode bindings. If they do, the view binding takes priority.</p>
+
+      <p>Manage quick prompts from the CLI:</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde qp list
+<span class="tok-prompt">$ </span>clhorde qp add g <span class="tok-str">"let's go"</span>
+<span class="tok-prompt">$ </span>clhorde qp remove g</code></pre>
+    </section>
+
+    <!-- ── Filtering ── -->
+    <section id="filtering" class="feature-section">
+      <h2>Filtering &amp; Tags</h2>
+
+      <p>Press <kbd>/</kbd> to enter filter mode. Type to filter prompts by text. Case-insensitive. The list updates live as you type.</p>
+
+      <h3>Tag filtering</h3>
+      <p>Include <code>@tag</code> in your filter to filter by tags. Multiple <code>@tag</code> tokens use AND logic&mdash;only prompts matching <em>all</em> specified tags are shown.</p>
+
+      <pre><code><span class="tok-cmt"># Show prompts tagged @backend AND @urgent:</span>
+@backend @urgent
+
+<span class="tok-cmt"># Combine text and tags:</span>
+@frontend fix login</code></pre>
+
+      <p>Press <kbd>Enter</kbd> to apply the filter and return to Normal mode. Press <kbd>Esc</kbd> to clear the filter.</p>
+    </section>
+
+    <!-- ── Queue Reordering ── -->
+    <section id="queue-reordering" class="feature-section">
+      <h2>Queue Reordering</h2>
+
+      <p>Move pending prompts up or down in the queue to prioritize them.</p>
+
+      <table>
+        <thead><tr><th>Key</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td><kbd>J</kbd></td><td>Move selected pending prompt down</td></tr>
+          <tr><td><kbd>K</kbd></td><td>Move selected pending prompt up</td></tr>
+        </tbody>
+      </table>
+
+      <p>Only works on pending prompts. Running and completed prompts cannot be reordered. The new position is persisted.</p>
+    </section>
+
+    <!-- ── Retry & Resume ── -->
+    <section id="retry-resume" class="feature-section">
+      <h2>Retry &amp; Resume</h2>
+
+      <p>Two ways to re-run a completed or failed prompt:</p>
+
+      <div class="card-grid">
+        <div class="card">
+          <h3><kbd>r</kbd> &mdash; Retry</h3>
+          <p>Creates a new prompt with the same text and settings. A fresh Claude session. Good for: retrying after a failure, getting a different response.</p>
+        </div>
+        <div class="card">
+          <h3><kbd>R</kbd> &mdash; Resume</h3>
+          <p>Continues the existing Claude session using <code>--resume</code> with the stored session ID. The conversation context is preserved. Good for: continuing where you left off.</p>
+        </div>
+      </div>
+
+      <p>Both work on completed and failed prompts. With batch selection, <kbd>r</kbd> retries all selected prompts.</p>
+    </section>
+
+    <!-- ── Persistence ── -->
+    <section id="persistence" class="feature-section">
+      <h2>Persistence</h2>
+
+      <p>Every prompt is saved to disk as a JSON file named with a UUID v7 in <code>~/.local/share/clhorde/prompts/</code>.</p>
+
+      <p>Persisted data includes: prompt text, mode, state, tags, session ID, worktree path, and queue rank.</p>
+
+      <p>On startup, all prompt files are loaded and restored as Completed or Failed (no auto-dispatch). This means you never lose your prompt history across restarts.</p>
+
+      <h3>Pruning</h3>
+      <p>The <code>max_saved_prompts</code> setting controls automatic pruning (default: 100). When the count exceeds the limit, the oldest completed prompts are removed first.</p>
+
+      <pre><code><span class="tok-section">[settings]</span>
+<span class="tok-key">max_saved_prompts</span> = <span class="tok-val">100</span></code></pre>
+
+      <p>Manage stored prompts with the <a href="cli.html#store"><code>clhorde store</code></a> CLI commands.</p>
+    </section>
+
+    <!-- ── Split View ── -->
+    <section id="split-view" class="feature-section">
+      <h2>Split View</h2>
+
+      <p>The main area shows a split between the prompt list (left) and output panel (right).</p>
+
+      <table>
+        <thead><tr><th>Key</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td><kbd>h</kbd></td><td>Shrink prompt list panel (Normal mode)</td></tr>
+          <tr><td><kbd>l</kbd></td><td>Grow prompt list panel (Normal mode)</td></tr>
+          <tr><td><kbd>t</kbd></td><td>Toggle split view on/off (View mode)</td></tr>
+        </tbody>
+      </table>
+
+      <p>The default split ratio is 40% list / 60% output. Customize with the <code>list_ratio</code> setting (10&ndash;90):</p>
+
+      <pre><code><span class="tok-section">[settings]</span>
+<span class="tok-key">list_ratio</span> = <span class="tok-val">40</span></code></pre>
+    </section>
+
+    <!-- ── Export ── -->
+    <section id="export" class="feature-section">
+      <h2>Export</h2>
+
+      <p>Press <kbd>w</kbd> in View mode to export the current prompt's output to a markdown file.</p>
+
+      <p>The file is saved to <code>~/clhorde-output-<em>{id}</em>-<em>{timestamp}</em>.md</code>.</p>
+    </section>
+
+    <!-- ── Prompt from Files ── -->
+    <section id="prompt-from-files" class="feature-section">
+      <h2>Prompt from Files</h2>
+
+      <p>Load prompts from files and launch the TUI with them pre-queued. Each file becomes one pending prompt.</p>
+
+      <pre><code><span class="tok-prompt">$ </span>clhorde prompt-from-files tasks/*.md            <span class="tok-cmt"># Shell glob expansion</span>
+<span class="tok-prompt">$ </span>clhorde prompt-from-files a.txt b.txt c.txt     <span class="tok-cmt"># Multiple file arguments</span>
+<span class="tok-prompt">$ </span>clhorde prompt-from-files a.txt,b.txt c.txt     <span class="tok-cmt"># Comma-separated + space-separated</span></code></pre>
+
+      <p>Empty files are skipped with a warning. Unreadable files are also skipped. The TUI launches with all loaded prompts in the queue, ready for worker dispatch.</p>
+
+      <p>This is useful for batch workflows where you prepare prompts in advance as individual files.</p>
+    </section>
+
+  </main>
+
+  <footer>
+    <span>MIT License</span>
+    <a href="https://github.com/your-user/clhorde">Source</a>
+    <a href="https://github.com/your-user/clhorde/issues">Issues</a>
+  </footer>
+
+  <script src="js/main.js"></script>
+</body>
+</html>

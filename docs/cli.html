@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CLI Reference — clhorde</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a href="index.html" class="nav-brand"><span>&gt;_ </span>clhorde</a>
+      <button class="hamburger" aria-label="Menu">&#9776;</button>
+      <div class="nav-links">
+        <a href="guide.html">Guide</a>
+        <a href="features.html">Features</a>
+        <a href="keybindings.html">Keys</a>
+        <a href="configuration.html">Config</a>
+        <a href="cli.html">CLI</a>
+        <a href="cheatsheet.html">Cheatsheet</a>
+        <a href="https://github.com/your-user/clhorde" class="github-link">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <h1>CLI Reference</h1>
+    <p class="lead">All subcommands for managing clhorde outside the TUI.</p>
+
+    <pre><code><span class="tok-prompt">$ </span>clhorde [command] [options]</code></pre>
+
+    <p>Running <code>clhorde</code> with no arguments launches the TUI. Subcommands provide non-interactive management.</p>
+
+    <hr>
+
+    <!-- ── store ── -->
+    <section id="store">
+      <h2><code>clhorde store</code></h2>
+      <p>Manage persisted prompts stored in <code>~/.local/share/clhorde/prompts/</code>.</p>
+
+      <h3><code>store list</code></h3>
+      <p>List all stored prompts with their UUID, state, mode, and truncated prompt text.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde store list
+UUID                                   STATE       MODE          PROMPT
+----------------------------------------------------------------------
+019462ab-...                           completed   interactive   Review auth code...
+019462ac-...                           failed      one-shot      Fix login bug...</code></pre>
+
+      <h3><code>store count</code></h3>
+      <p>Show prompt counts grouped by state.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde store count
+completed: 12
+failed: 3
+pending: 2
+total: 17</code></pre>
+
+      <h3><code>store path</code></h3>
+      <p>Print the storage directory path.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde store path
+/home/user/.local/share/clhorde/prompts</code></pre>
+
+      <h3><code>store drop &lt;filter&gt;</code></h3>
+      <p>Delete stored prompts matching the filter.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde store drop all          <span class="tok-cmt"># Drop everything</span>
+<span class="tok-prompt">$ </span>clhorde store drop completed    <span class="tok-cmt"># Drop completed only</span>
+<span class="tok-prompt">$ </span>clhorde store drop failed       <span class="tok-cmt"># Drop failed only</span>
+<span class="tok-prompt">$ </span>clhorde store drop pending      <span class="tok-cmt"># Drop pending only</span>
+<span class="tok-prompt">$ </span>clhorde store drop running      <span class="tok-cmt"># Drop running only</span></code></pre>
+
+      <p><strong>Valid filters:</strong> <code>all</code>, <code>completed</code>, <code>failed</code>, <code>pending</code>, <code>running</code></p>
+
+      <h3><code>store keep &lt;filter&gt;</code></h3>
+      <p>Keep only prompts matching the filter, delete everything else.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde store keep completed    <span class="tok-cmt"># Keep completed, drop rest</span>
+<span class="tok-prompt">$ </span>clhorde store keep failed       <span class="tok-cmt"># Keep failed, drop rest</span></code></pre>
+
+      <p><strong>Valid filters:</strong> <code>completed</code>, <code>failed</code>, <code>pending</code>, <code>running</code></p>
+
+      <h3><code>store clean-worktrees</code></h3>
+      <p>Scan all persisted prompts for associated git worktree paths and remove them via <code>git worktree remove</code>. Clears the <code>worktree_path</code> from each prompt file.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde store clean-worktrees
+  removed: /home/user/projects/myrepo-wt-3/
+  skip (already gone): /home/user/projects/myrepo-wt-5/
+Cleaned 1 worktree(s), 1 already gone, 0 error(s).</code></pre>
+    </section>
+
+    <hr>
+
+    <!-- ── keys ── -->
+    <section id="keys">
+      <h2><code>clhorde keys</code></h2>
+      <p>Manage keybindings without editing TOML by hand.</p>
+
+      <h3><code>keys list [mode]</code></h3>
+      <p>List all keybindings, or bindings for a specific mode.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde keys list              <span class="tok-cmt"># All modes</span>
+<span class="tok-prompt">$ </span>clhorde keys list normal       <span class="tok-cmt"># Normal mode only</span></code></pre>
+
+      <p>Output format matches TOML syntax so you can copy-paste into your config.</p>
+
+      <h3><code>keys set &lt;mode&gt; &lt;action&gt; &lt;key1&gt; [key2...]</code></h3>
+      <p>Set the keys for an action. Replaces any existing keys.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde keys set normal quit Q          <span class="tok-cmt"># Remap quit to Q</span>
+<span class="tok-prompt">$ </span>clhorde keys set view back Esc q        <span class="tok-cmt"># Multiple keys</span></code></pre>
+
+      <h3><code>keys reset &lt;mode&gt; [action]</code></h3>
+      <p>Reset bindings to defaults. Without an action, resets the entire mode.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde keys reset normal quit          <span class="tok-cmt"># Reset one action</span>
+<span class="tok-prompt">$ </span>clhorde keys reset normal               <span class="tok-cmt"># Reset entire mode</span></code></pre>
+
+      <h3>Valid modes</h3>
+      <p><code>normal</code>, <code>insert</code>, <code>view</code>, <code>interact</code>, <code>filter</code></p>
+
+      <h3>Valid actions by mode</h3>
+      <table>
+        <thead><tr><th>Mode</th><th>Actions</th></tr></thead>
+        <tbody>
+          <tr><td><code>normal</code></td><td><code>quit</code>, <code>insert</code>, <code>select_next</code>, <code>select_prev</code>, <code>view_output</code>, <code>interact</code>, <code>increase_workers</code>, <code>decrease_workers</code>, <code>toggle_mode</code>, <code>retry</code>, <code>resume</code>, <code>move_up</code>, <code>move_down</code>, <code>search</code>, <code>half_page_down</code>, <code>half_page_up</code>, <code>go_to_top</code>, <code>go_to_bottom</code></td></tr>
+          <tr><td><code>insert</code></td><td><code>cancel</code>, <code>submit</code>, <code>accept_suggestion</code>, <code>next_suggestion</code>, <code>prev_suggestion</code></td></tr>
+          <tr><td><code>view</code></td><td><code>back</code>, <code>scroll_down</code>, <code>scroll_up</code>, <code>interact</code>, <code>toggle_autoscroll</code>, <code>kill_worker</code>, <code>export</code></td></tr>
+          <tr><td><code>interact</code></td><td><code>back</code>, <code>send</code></td></tr>
+          <tr><td><code>filter</code></td><td><code>confirm</code>, <code>cancel</code></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <hr>
+
+    <!-- ── qp ── -->
+    <section id="qp">
+      <h2><code>clhorde qp</code></h2>
+      <p>Manage quick prompts&mdash;single-keypress messages for running workers.</p>
+
+      <h3><code>qp list</code></h3>
+      <p>List all configured quick prompts.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde qp list
+c = "continue"
+g = "let's go"
+y = "yes"</code></pre>
+
+      <h3><code>qp add &lt;key&gt; &lt;message...&gt;</code></h3>
+      <p>Add or update a quick prompt. The message is everything after the key.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde qp add g <span class="tok-str">"let's go"</span>
+Added quick prompt: g = "let's go"</code></pre>
+
+      <h3><code>qp remove &lt;key&gt;</code></h3>
+      <p>Remove a quick prompt.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde qp remove g
+Removed quick prompt: g</code></pre>
+    </section>
+
+    <hr>
+
+    <!-- ── config ── -->
+    <section id="config">
+      <h2><code>clhorde config</code></h2>
+      <p>Manage the config file.</p>
+
+      <h3><code>config path</code></h3>
+      <p>Print the config file path.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde config path
+/home/user/.config/clhorde/keymap.toml</code></pre>
+
+      <h3><code>config init [--force]</code></h3>
+      <p>Create a config file with all default values populated. Use <code>--force</code> to overwrite an existing file.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde config init
+Created config: /home/user/.config/clhorde/keymap.toml
+
+<span class="tok-prompt">$ </span>clhorde config init --force    <span class="tok-cmt"># Overwrite existing</span></code></pre>
+
+      <h3><code>config edit</code></h3>
+      <p>Open the config file in <code>$EDITOR</code> (falls back to <code>vi</code>). Creates the file with defaults if it doesn't exist.</p>
+      <pre><code><span class="tok-prompt">$ </span>clhorde config edit</code></pre>
+    </section>
+
+    <hr>
+
+    <!-- ── prompt-from-files ── -->
+    <section id="prompt-from-files">
+      <h2><code>clhorde prompt-from-files</code></h2>
+      <p>Read file contents and queue them as prompts, then launch the TUI. Each file becomes one pending prompt.</p>
+
+      <h3>Synopsis</h3>
+      <pre><code><span class="tok-prompt">$ </span>clhorde prompt-from-files &lt;file1&gt; [file2...] or &lt;file1,file2,...&gt;</code></pre>
+
+      <h3>Details</h3>
+      <ul>
+        <li>Shell glob expansion works (e.g., <code>tasks/*.md</code>)</li>
+        <li>Multiple file arguments are supported</li>
+        <li>Comma-separated paths within a single argument are split into individual files</li>
+        <li>Empty files are skipped with a warning</li>
+        <li>Unreadable files are skipped with a warning</li>
+        <li>If no valid prompts are loaded, the command exits with an error</li>
+      </ul>
+
+      <h3>Examples</h3>
+      <pre><code><span class="tok-prompt">$ </span>clhorde prompt-from-files tasks/*.md            <span class="tok-cmt"># Load all .md files as prompts</span>
+<span class="tok-prompt">$ </span>clhorde prompt-from-files a.txt b.txt c.txt     <span class="tok-cmt"># Load specific files</span>
+<span class="tok-prompt">$ </span>clhorde prompt-from-files a.txt,b.txt c.txt     <span class="tok-cmt"># Comma + space separated</span></code></pre>
+    </section>
+
+  </main>
+
+  <footer>
+    <span>MIT License</span>
+    <a href="https://github.com/your-user/clhorde">Source</a>
+    <a href="https://github.com/your-user/clhorde/issues">Issues</a>
+  </footer>
+
+  <script src="js/main.js"></script>
+</body>
+</html>

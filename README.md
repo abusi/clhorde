@@ -4,57 +4,24 @@ A lightweight, single-binary TUI for orchestrating multiple Claude Code CLI inst
 
 ![Rust](https://img.shields.io/badge/rust-2021-orange)
 
-## Why clhorde?
-
-Tools like [Claude Squad](https://github.com/smtg-ai/claude-squad), [Clark](https://github.com/brianirish/clark), and [VibeMux](https://github.com/UgOrange/vibemux) solve a similar problem—running multiple Claude Code sessions at once. They're great tools, but they all share the same architecture: **tmux sessions + git worktrees**. Each "instance" is a full interactive Claude Code session wrapped in a tmux pane.
-
-clhorde takes a fundamentally different approach:
-
-| | clhorde | tmux-based tools |
-|---|---|---|
-| **Architecture** | Hybrid: PTY for interactive + stream-json for one-shot | Wraps interactive sessions in tmux panes |
-| **Work model** | Prompt queue + worker pool | N independent sessions |
-| **Concurrency** | Queue any number of prompts, workers pull from queue | Fixed number of parallel sessions |
-| **Dependencies** | Single binary (just needs `claude` in PATH) | Requires tmux, git worktrees |
-| **Code isolation** | Fresh subprocess per worker + optional git worktree per prompt | Git worktrees per session (always) |
-| **Interaction** | Full Claude TUI embedded via PTY + terminal emulator | Full interactive terminal per session |
-| **Binary size** | ~1500 lines of Rust | Go/Python projects with larger dependency trees |
-| **Runtime** | Native async (tokio) + OS threads | tmux + shell processes |
-
-### The queue model
-
-Most multi-Claude tools give you N parallel sessions and you manually assign work to each one. clhorde works differently: you queue up as many prompts as you want, and a configurable pool of workers (1–20) pulls from the queue automatically. This means you can batch 50 prompts and walk away—workers will chew through them at whatever concurrency you set.
-
-### Direct integration—no tmux
-
-clhorde uses a hybrid approach: interactive workers run in a real PTY with the full Claude Code TUI rendered via an embedded terminal emulator (`alacritty_terminal`). One-shot workers use the lighter `stream-json` protocol for text-only output. No tmux, no screen scraping—just direct subprocess control with proper terminal emulation where it matters.
-
-### Truly zero dependencies (beyond `claude`)
-
-No tmux. No git worktrees. No Python. No Node. Just a single Rust binary and the `claude` CLI. Install and run.
+**[Documentation](https://your-user.github.io/clhorde/)**
 
 ## Features
 
-- **Worker pool with queue** — queue unlimited prompts, configure 1–20 concurrent workers with `+`/`-`
-- **Embedded PTY terminal** — interactive workers render the full Claude Code TUI (colors, tool use, formatting) via `alacritty_terminal`
-- **Real-time streaming** — output streams token-by-token as Claude generates it
-- **Interactive follow-ups** — send messages to running workers mid-conversation, or enter PTY mode for full keyboard control
-- **One-shot & interactive modes** — toggle with `m`: one-shot prompts use stream-json, interactive prompts get a full embedded PTY
-- **Vim-style modal interface** — Normal, Insert, View, Interact, PtyInteract, and Filter modes
-- **Live status dashboard** — active workers, queue depth, completed count, per-prompt elapsed time
-- **Auto-scroll** — follows output in real time, toggleable with `f`
-- **Kill workers** — terminate a running prompt with `x`
-- **Export output** — save a prompt's output to a markdown file with `w`
-- **Retry prompts** — re-queue completed or failed prompts with `r`
-- **Resume sessions** — resume a completed/failed prompt's Claude session with `R`
-- **Git worktree isolation** — press `Ctrl+W` in insert mode to run a prompt in its own git worktree, preventing file conflicts between parallel workers
-- **Prompt persistence** — prompts are saved to disk and restored on restart
-- **Reorder queue** — move pending prompts up/down with `J`/`K`
-- **Search/filter** — press `/` to live-filter prompts by text
-- **Prompt history** — `Up`/`Down` in insert mode cycles through previously submitted prompts
-- **Prompt templates** — define reusable prompt snippets, expand with `:name` + Tab
-- **Quit confirmation** — warns before quitting with active workers
-- **Graceful shutdown** — sends EOF to all workers on quit, no orphaned processes
+- **Prompt queue + worker pool** — queue unlimited prompts, 1–20 concurrent workers pull automatically
+- **Dual architecture** — embedded PTY for interactive, stream-json for one-shot
+- **Vim-style modal interface** — Normal, Insert, View, Interact, PtyInteract, Filter modes
+- **Batch operations** — select multiple prompts, retry/kill/delete/toggle mode in bulk
+- **Prompt tags** — `@tag` syntax for tagging and filtering prompts
+- **Git worktree isolation** — per-prompt opt-in with `Ctrl+W`
+- **Quick prompts** — single-keypress messages to running workers
+- **Multi-line prompt editor** — Shift+Enter for newlines, Ctrl+E to open `$EDITOR`, bracketed paste
+- **Prompt templates** — expand `:name` + Tab snippets
+- **Batch load from files** — `clhorde prompt-from-files tasks/*.md` to queue prompts from files
+- **Session persistence** — prompts saved to disk, resume with `R`
+- **Custom keybindings** — fully remappable via TOML config
+- **CLI management** — `store`, `keys`, `qp`, `config`, `prompt-from-files` subcommands
+- **Zero dependencies** — single binary, just needs `claude` in PATH
 
 ## Install
 
@@ -76,273 +43,18 @@ clhorde              # launch TUI
 clhorde --help       # show help
 ```
 
-That's it. You'll see the TUI. Press `i` to start typing a prompt.
+Press `i` to start typing a prompt. See the [getting started guide](https://your-user.github.io/clhorde/guide.html) for a walkthrough.
 
-## CLI commands
+## Documentation
 
-clhorde includes subcommands for managing configuration without hand-editing TOML files.
+Full documentation is available at **[your-user.github.io/clhorde](https://your-user.github.io/clhorde/)**:
 
-### Quick prompts
-
-```bash
-clhorde qp list              # list all quick prompts
-clhorde qp add g "let's go"  # add a quick prompt on key 'g'
-clhorde qp remove g          # remove a quick prompt
-```
-
-### Keybindings
-
-```bash
-clhorde keys list             # list all keybindings
-clhorde keys list normal      # list normal mode only
-clhorde keys set normal quit Q          # set quit to Q
-clhorde keys set view back Esc q        # set multiple keys
-clhorde keys reset normal quit          # reset one action to default
-clhorde keys reset normal               # reset entire mode to defaults
-```
-
-Valid modes: `normal`, `insert`, `view`, `interact`, `filter`.
-
-### Prompt storage
-
-```bash
-clhorde store list              # list all stored prompts
-clhorde store count             # show counts by state
-clhorde store path              # print storage directory
-clhorde store drop all          # drop all stored prompts
-clhorde store drop completed    # drop completed only
-clhorde store drop failed       # drop failed only
-clhorde store drop pending      # drop pending only
-clhorde store keep completed    # keep completed, drop rest
-clhorde store keep failed       # keep failed, drop rest
-clhorde store clean-worktrees   # remove lingering git worktrees
-```
-
-Valid filters for `drop`: `all`, `completed`, `failed`, `pending`, `running`.
-Valid filters for `keep`: `completed`, `failed`, `pending`, `running`.
-
-### Config file
-
-```bash
-clhorde config path           # print config file path
-clhorde config init           # create config with all defaults
-clhorde config init --force   # overwrite existing config
-clhorde config edit           # open config in $EDITOR (or vi)
-```
-
-## Keybindings
-
-### Normal mode
-| Key | Action |
-|-----|--------|
-| `i` | Enter insert mode (type a prompt) |
-| `j` / `k` / `↑` / `↓` | Navigate prompt list |
-| `Enter` | View selected prompt's output |
-| `s` | Interact with running/idle prompt |
-| `r` | Retry selected completed/failed prompt (new prompt) |
-| `R` | Resume selected completed/failed prompt's session |
-| `J` / `K` | Move selected pending prompt down/up in queue |
-| `/` | Enter filter mode (search prompts) |
-| `+` / `-` | Increase / decrease max workers (1–20) |
-| `m` | Toggle prompt mode (interactive / one-shot) |
-| `q` | Quit (confirms if workers active) |
-
-### Insert mode
-| Key | Action |
-|-----|--------|
-| `Enter` | Submit prompt to queue |
-| `Esc` | Cancel and return to normal mode |
-| `↑` / `↓` | Cycle through prompt history (when no suggestions visible) |
-| `Tab` | Accept directory or template suggestion |
-| `Ctrl+W` | Toggle git worktree isolation for this prompt |
-
-### View mode
-| Key | Action |
-|-----|--------|
-| `j` / `k` / `↑` / `↓` | Scroll output |
-| `s` | Enter interact mode (send follow-up) |
-| `f` | Toggle auto-scroll |
-| `w` | Export output to `~/clhorde-output-{id}-{timestamp}.md` |
-| `x` | Kill running worker |
-| `Esc` / `q` | Back to normal mode |
-
-### Interact mode (one-shot workers)
-| Key | Action |
-|-----|--------|
-| `Enter` | Send follow-up message to worker |
-| `Esc` | Back to normal mode |
-
-### PTY Interact mode (interactive workers)
-| Key | Action |
-|-----|--------|
-| *all keys* | Forwarded directly to the PTY |
-| `Esc` | Back to view mode |
-
-### Filter mode
-| Key | Action |
-|-----|--------|
-| *type* | Live-filter prompts (case-insensitive) |
-| `Enter` | Apply filter and return to normal |
-| `Esc` | Clear filter and return to normal |
-
-## Custom keybindings
-
-All keybindings can be remapped via `~/.config/clhorde/keymap.toml` (or `$XDG_CONFIG_HOME/clhorde/keymap.toml`). The config file is optional — missing file or missing keys silently use defaults. You only need to specify what you want to change.
-
-See [`keymap_example.toml`](keymap_example.toml) for the full default keymap with all available actions.
-
-Example — remap quit to `Q` and navigation to arrow keys only:
-
-```toml
-[normal]
-quit = ["Q"]
-select_next = ["Down"]
-select_prev = ["Up"]
-```
-
-Key names: single characters (`"q"`, `"+"`) or special names (`"Enter"`, `"Esc"`, `"Tab"`, `"Up"`, `"Down"`, `"Left"`, `"Right"`, `"Space"`, `"Backspace"`).
-
-## Quick prompts
-
-Send predefined messages to a running worker with a single keypress in view mode. Add a `[quick_prompts]` section to your `keymap.toml`:
-
-```toml
-[quick_prompts]
-g = "let's go"
-c = "continue"
-y = "yes"
-n = "no"
-```
-
-When viewing a running or idle prompt, pressing `g` immediately sends `"let's go"` to the worker — no need to enter interact mode. The message is echoed in the output panel just like a regular follow-up.
-
-Quick prompt keys must not conflict with view mode bindings (`j`, `k`, `q`, `s`, `f`, `x`, `w`, `Esc`, arrows). If they do, the view binding takes priority.
-
-## Prompt templates
-
-Define reusable prompt snippets in `~/.config/clhorde/templates.toml`:
-
-```toml
-[templates]
-review = "Review this code for bugs and security issues:"
-explain = "Explain what this code does:"
-test = "Write unit tests for this code:"
-refactor = "Refactor this code to be more idiomatic:"
-```
-
-In insert mode, type `:review` and press `Tab` — the template name is replaced with its full text. A suggestion popup shows matching templates as you type.
-
-This is especially useful when combined with working directories. For example, type `/path/to/project: ` then `:review` + Tab to get:
-
-```
-/path/to/project: Review this code for bugs and security issues:
-```
-
-## Git worktree isolation
-
-When running multiple Claude workers in parallel against the same git repo, they can conflict by modifying the same files simultaneously. Git worktrees solve this by giving each worker its own isolated working directory that shares the same git object database.
-
-### How to use
-
-1. Press `i` to enter insert mode
-2. Type your prompt
-3. Press `Ctrl+W` — the input bar turns cyan and shows `[WT]`
-4. Press `Enter` to submit
-
-The prompt will be dispatched to a new git worktree at `../<repo-name>-wt-<prompt-id>/` (a sibling directory of your repo). The Claude worker runs inside this worktree, so its file changes are isolated from your main checkout and from other workers.
-
-Prompts with worktree enabled show a `[WT]` tag in the prompt list and output panel title.
-
-### Requirements
-
-- You must be inside a git repository (or provide a directory prefix that is)
-- If you're not in a git repo, the prompt will fail with an error message
-
-### Worktree cleanup
-
-By default, worktrees persist after the worker finishes. You can control this with the `worktree_cleanup` setting in `keymap.toml`:
-
-```toml
-[settings]
-worktree_cleanup = "manual"  # default — worktrees persist after completion
-# worktree_cleanup = "auto"  # automatically remove worktrees when workers finish
-```
-
-To manually clean up lingering worktrees:
-
-```bash
-clhorde store clean-worktrees
-```
-
-This scans all persisted prompts, finds any with associated worktree paths, and runs `git worktree remove` for each one.
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                       main.rs                            │
-│  Terminal setup, tokio::select! event loop               │
-│  Dispatches queued prompts → worker pool                 │
-├─────────────┬───────────────┬──────────────┬─────────────┤
-│   app.rs    │    ui.rs      │  worker.rs   │pty_worker.rs│
-│  State +    │  Stateless    │  Dispatch +  │ PTY spawn,  │
-│  keybinds   │  ratatui +    │  one-shot    │ alacritty   │
-│  modes      │  PTY grid     │  stream-json │ term grid   │
-├─────────────┴───────────────┴──────────────┴─────────────┤
-│                       prompt.rs                          │
-│  Data model: id, text, status, output, timing, pty_state │
-└──────────────────────────────────────────────────────────┘
-```
-
-- **Event handling** — Crossterm events are read on a dedicated OS thread (not async) and forwarded via channel, so the tokio runtime never blocks.
-- **Worker threads** — Each `claude` subprocess runs in `std::thread` with separate reader and writer threads for stdout parsing and stdin writing.
-- **Dual architecture** — Interactive workers run in a real PTY (`portable-pty`) with terminal emulation (`alacritty_terminal`). One-shot workers use `stream-json` for lightweight text streaming.
-- **Communication** — Workers send `WorkerMessage` variants (OutputChunk, PtyUpdate, Finished, SpawnError) back to the app via `tokio::sync::mpsc`. The app sends `WorkerInput` (SendInput, SendBytes, Kill) to workers.
-- **Clean shutdown** — PTY workers are terminated by dropping the master PTY (child gets SIGHUP). One-shot workers exit when stdin is closed.
-
-## UI Layout
-
-```
-┌──────────────────────────────────────────────────────┐
-│ NORMAL | Workers: 2/4 | Queue: 3 | Done: 5 | Total: 10 │
-├───────────────────────┬──────────────────────────────┤
-│ ▶ ✅ #1 prompt (2.3s) │                              │
-│   🔄 #2 prompt (1.1s) │  Selected prompt's output    │
-│   ⏳ #3 prompt         │  streams here in real time   │
-│   ❌ #4 prompt (0.5s) │                              │
-├───────────────────────┴──────────────────────────────┤
-│ > type your prompt here_                              │
-├──────────────────────────────────────────────────────┤
-│ i:insert  q:quit  j/k:navigate  Enter:view  +/-:wkrs │
-└──────────────────────────────────────────────────────┘
-```
-
-- **Left panel (40%)** — prompt queue with status icons, IDs, and elapsed time
-- **Right panel (60%)** — streaming output for the selected prompt
-- **Status bar** — mode, worker count, queue depth, completion stats
-- **Input bar** — context-aware prompt based on current mode
-- **Help bar** — shows available keybindings for current mode
-
-## Prompt modes
-
-clhorde supports two prompt modes, toggled with `m` in Normal mode:
-
-- **Interactive** (default) — spawns `claude "prompt" --dangerously-skip-permissions` in a real PTY. The right panel renders the full Claude Code TUI with colors, tool use, and formatting via `alacritty_terminal`. Press `s` to enter PTY Interact mode and type directly into the Claude session. When the process exits, the terminal output is extracted and stored for export/session persistence.
-- **One-shot** — spawns `claude -p "prompt text" --output-format stream-json`. The prompt is passed as a CLI argument. No stdin writer, no follow-ups. The process exits after responding and goes directly to Completed.
-
-The current default mode is shown in the status bar (`[interactive]` or `[one-shot]`). Each prompt remembers the mode it was created with.
-
-## How it works under the hood
-
-1. You type a prompt → it's added to the queue as `Pending` with the current default mode
-2. The event loop checks: `active_workers < max_workers`?
-3. If yes, the next pending prompt is dispatched to a new worker
-4. **Interactive mode:** a PTY is allocated via `portable-pty`, and `claude "prompt" --dangerously-skip-permissions` is spawned inside it. A reader thread feeds PTY output into an `alacritty_terminal` grid. The UI renders the grid with full color and formatting support.
-5. **One-shot mode:** the worker spawns `claude -p "prompt" --output-format stream-json` and a reader thread parses streaming deltas as `OutputChunk` messages
-6. The UI renders output in real time with auto-scroll
-7. When Claude finishes (PTY EOF or process exit), the worker sends `Finished` and the prompt moves to `Completed`
-8. For PTY workers, the terminal text is extracted from the grid and stored for export/session persistence
-9. The next queued prompt is automatically dispatched
+- [Getting Started](https://your-user.github.io/clhorde/guide.html)
+- [Features](https://your-user.github.io/clhorde/features.html)
+- [Keybindings](https://your-user.github.io/clhorde/keybindings.html)
+- [Configuration](https://your-user.github.io/clhorde/configuration.html)
+- [CLI Reference](https://your-user.github.io/clhorde/cli.html)
+- [Cheatsheet](https://your-user.github.io/clhorde/cheatsheet.html)
 
 ## License
 
