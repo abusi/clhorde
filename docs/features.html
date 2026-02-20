@@ -337,13 +337,16 @@
     <section id="prompt-from-files" class="feature-section">
       <h2>Prompt from Files</h2>
 
-      <p>Load prompts from files and launch the TUI with them pre-queued. Each file becomes one pending prompt.</p>
+      <p>Load prompts from files and launch the TUI with them pre-queued. Each file becomes one pending prompt. All prompts automatically run with <strong>worktree isolation</strong>, so each gets its own git worktree for safe parallel execution.</p>
 
-      <pre><code><span class="tok-prompt">$ </span>clhorde prompt-from-files tasks/*.md            <span class="tok-cmt"># Shell glob expansion</span>
-<span class="tok-prompt">$ </span>clhorde prompt-from-files a.txt b.txt c.txt     <span class="tok-cmt"># Multiple file arguments</span>
-<span class="tok-prompt">$ </span>clhorde prompt-from-files a.txt,b.txt c.txt     <span class="tok-cmt"># Comma-separated + space-separated</span></code></pre>
+      <pre><code><span class="tok-prompt">$ </span>clhorde prompt-from-files tasks/*.md                          <span class="tok-cmt"># Shell glob expansion</span>
+<span class="tok-prompt">$ </span>clhorde prompt-from-files --run-path /path/to/repo tasks/*.md <span class="tok-cmt"># Target a specific repo</span>
+<span class="tok-prompt">$ </span>clhorde prompt-from-files a.txt b.txt c.txt                   <span class="tok-cmt"># Multiple file arguments</span>
+<span class="tok-prompt">$ </span>clhorde prompt-from-files a.txt,b.txt c.txt                   <span class="tok-cmt"># Comma-separated + space-separated</span></code></pre>
 
       <p>Empty files are skipped with a warning. Unreadable files are also skipped. The TUI launches with all loaded prompts in the queue, ready for worker dispatch.</p>
+
+      <p>Use <code>--run-path &lt;path&gt;</code> to specify the working directory (and git repo) for all prompts. This is useful when the prompt files live in a different location than the target repository.</p>
 
       <p>This is useful for batch workflows where you prepare prompts in advance as individual files.</p>
     </section>

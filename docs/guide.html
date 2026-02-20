@@ -101,7 +101,7 @@
     <h3>Queue multiple prompts</h3>
     <p>Press <kbd>i</kbd>, type a prompt, press <kbd>Enter</kbd>. Repeat. Queue as many as you want. Workers automatically pull from the queue at whatever concurrency you set.</p>
 
-    <p>The input bar supports multi-line editing: press <kbd>Shift+Enter</kbd> or <kbd>Alt+Enter</kbd> to insert newlines. For complex prompts, press <kbd>Ctrl+E</kbd> to open your <code>$EDITOR</code>. You can also batch-load prompts from files with <code>clhorde prompt-from-files tasks/*.md</code>.</p>
+    <p>The input bar supports multi-line editing: press <kbd>Shift+Enter</kbd> or <kbd>Alt+Enter</kbd> to insert newlines. For complex prompts, press <kbd>Ctrl+E</kbd> to open your <code>$EDITOR</code>. You can also batch-load prompts from files with <code>clhorde prompt-from-files tasks/*.md</code> (each prompt automatically gets its own git worktree). Use <code>--run-path &lt;path&gt;</code> to target a specific repo.</p>
 
     <h3>Adjust workers</h3>
     <p>Press <kbd>+</kbd> to increase the number of concurrent workers (up to 20) or <kbd>-</kbd> to decrease (down to 1). The status bar shows active/max count.</p>
