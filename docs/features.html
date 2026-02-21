@@ -84,15 +84,15 @@
       <p>clhorde's queue model is what sets it apart from session-based tools. You don't manage individual sessions&mdash;you queue prompts and let the worker pool handle dispatch.</p>
 
       <ol>
-        <li>You type prompts &rarr; they enter the queue as <strong>Pending</strong></li>
-        <li>The event loop checks: <code>active_workers &lt; max_workers</code>?</li>
+        <li>You type prompts (via TUI or <code>clhorde-cli submit</code>) &rarr; they enter the queue as <strong>Pending</strong></li>
+        <li>The daemon checks: <code>active_workers &lt; max_workers</code>?</li>
         <li>If yes, the next pending prompt is dispatched to a new worker</li>
         <li>When a worker finishes, the next queued prompt is dispatched</li>
       </ol>
 
-      <p>Adjust the pool size with <kbd>+</kbd>/<kbd>-</kbd> (range: 1&ndash;20). The status bar shows <code>Workers: active/max</code>.</p>
+      <p>Adjust the pool size with <kbd>+</kbd>/<kbd>-</kbd> in the TUI (range: 1&ndash;20). The status bar shows <code>Workers: active/max</code>.</p>
 
-      <p>This means you can batch 50 prompts, set workers to 5, and walk away. Workers will chew through the queue automatically.</p>
+      <p>Because workers are managed by the <code>clhorded</code> daemon, they survive TUI restarts. You can batch 50 prompts, set workers to 5, and walk away. Close the TUI, come back later, and the workers are still running.</p>
     </section>
 
     <!-- ── Modal Interface ── -->
@@ -201,7 +201,7 @@
 <span class="tok-key">worktree_cleanup</span> = <span class="tok-str">"auto"</span>    <span class="tok-cmt"># remove worktrees when workers finish</span></code></pre>
 
       <p>To manually clean up:</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde store clean-worktrees</code></pre>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli store clean-worktrees</code></pre>
     </section>
 
     <!-- ── Quick Prompts ── -->
@@ -224,9 +224,9 @@
       <p>Quick prompt keys must not conflict with view mode bindings. If they do, the view binding takes priority.</p>
 
       <p>Manage quick prompts from the CLI:</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde qp list
-<span class="tok-prompt">$ </span>clhorde qp add g <span class="tok-str">"let's go"</span>
-<span class="tok-prompt">$ </span>clhorde qp remove g</code></pre>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli qp list
+<span class="tok-prompt">$ </span>clhorde-cli qp add g <span class="tok-str">"let's go"</span>
+<span class="tok-prompt">$ </span>clhorde-cli qp remove g</code></pre>
     </section>
 
     <!-- ── Filtering ── -->
@@ -288,11 +288,11 @@
     <section id="persistence" class="feature-section">
       <h2>Persistence</h2>
 
-      <p>Every prompt is saved to disk as a JSON file named with a UUID v7 in <code>~/.local/share/clhorde/prompts/</code>.</p>
+      <p>Every prompt is saved to disk as a JSON file named with a UUID v7 in <code>~/.local/share/clhorde/prompts/</code>. Persistence is managed by the <code>clhorded</code> daemon.</p>
 
       <p>Persisted data includes: prompt text, mode, state, tags, session ID, worktree path, and queue rank.</p>
 
-      <p>On startup, all prompt files are loaded and restored as Completed or Failed (no auto-dispatch). This means you never lose your prompt history across restarts.</p>
+      <p>On daemon startup, all prompt files are loaded and restored as Completed or Failed (no auto-dispatch). This means you never lose your prompt history across restarts.</p>
 
       <h3>Pruning</h3>
       <p>The <code>max_saved_prompts</code> setting controls automatic pruning (default: 100). When the count exceeds the limit, the oldest completed prompts are removed first.</p>
@@ -300,7 +300,7 @@
       <pre><code><span class="tok-section">[settings]</span>
 <span class="tok-key">max_saved_prompts</span> = <span class="tok-val">100</span></code></pre>
 
-      <p>Manage stored prompts with the <a href="cli.html#store"><code>clhorde store</code></a> CLI commands.</p>
+      <p>Manage stored prompts with the <a href="cli.html#store"><code>clhorde-cli store</code></a> CLI commands.</p>
     </section>
 
     <!-- ── Split View ── -->

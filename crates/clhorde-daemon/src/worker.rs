@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 
 use tokio::sync::mpsc;
 
-use crate::prompt::PromptMode;
+use clhorde_core::prompt::PromptMode;
 use crate::pty_worker::PtyHandle;
 
 #[allow(dead_code)]
@@ -37,6 +37,7 @@ pub enum SpawnResult {
 
 /// Spawns a claude worker. For interactive mode, uses PTY when `pty_size` is
 /// provided. For one-shot mode, uses stream-json as before.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_worker(
     prompt_id: usize,
     prompt_text: String,
@@ -45,6 +46,7 @@ pub fn spawn_worker(
     tx: mpsc::UnboundedSender<WorkerMessage>,
     pty_size: Option<(u16, u16)>,
     resume_session_id: Option<String>,
+    pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
 ) -> SpawnResult {
     match mode {
         PromptMode::Interactive => {
@@ -57,6 +59,7 @@ pub fn spawn_worker(
                 rows,
                 tx,
                 resume_session_id,
+                pty_byte_tx,
             ) {
                 Ok((input_sender, pty_handle)) => {
                     SpawnResult::Pty { input_sender, pty_handle }

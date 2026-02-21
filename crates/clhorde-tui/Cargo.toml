@@ -1,0 +1,23 @@
+[package]
+name = "clhorde-tui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "clhorde"
+path = "src/main.rs"
+
+[dependencies]
+clhorde-core.workspace = true
+ratatui.workspace = true
+crossterm = { workspace = true, features = ["events", "use-dev-tty", "bracketed-paste"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+chrono.workspace = true
+alacritty_terminal.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+uuid.workspace = true
