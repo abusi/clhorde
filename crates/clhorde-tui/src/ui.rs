@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use crate::app::{App, AppMode};
 use crate::keymap::{NormalAction, ViewAction};
-use crate::pty_worker::SharedPtyState;
+use crate::pty_renderer::PtyRenderer;
 use clhorde_core::prompt::{PromptMode, PromptStatus};
 
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -68,9 +68,9 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let sep = Span::styled(" │ ", Style::default().fg(Color::DarkGray));
 
     // --- Worker utilization progress bar ---
-    let bar_width = app.orch.max_workers.min(8); // cap visual width at 8
-    let filled = if app.orch.max_workers > 0 {
-        (app.orch.active_workers * bar_width).div_ceil(app.orch.max_workers)
+    let bar_width = app.max_workers.min(8); // cap visual width at 8
+    let filled = if app.max_workers > 0 {
+        (app.active_workers * bar_width).div_ceil(app.max_workers)
     } else {
         0
     };
@@ -81,11 +81,12 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     // --- Condensed counters ---
     let pending = app.pending_count();
     let done = app.completed_count();
-    let total = app.orch.prompts.len();
+    let total = app.prompts.len();
 
     // --- Selected prompt inline status ---
     let selected_info: Vec<Span> = if let Some(prompt) = app.selected_prompt() {
-        let (status_char, status_color) = match prompt.status {
+        let status = prompt.status_enum();
+        let (status_char, status_color) = match status {
             PromptStatus::Pending => ("·", Color::DarkGray),
             PromptStatus::Running => ("▶", Color::Cyan),
             PromptStatus::Idle => ("◆", Color::Magenta),
@@ -138,12 +139,21 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Style::default().fg(Color::Black).bg(Color::LightBlue).add_modifier(Modifier::BOLD),
         ));
     }
+
+    // Disconnected indicator
+    if !app.connected {
+        spans.push(Span::styled(
+            " [DISCONNECTED] ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+
     spans.extend([
         sep.clone(),
         Span::styled(bar_filled, Style::default().fg(Color::Cyan)),
         Span::styled(bar_empty, Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!(" {}/{}", app.orch.active_workers, app.orch.max_workers),
+            format!(" {}/{}", app.active_workers, app.max_workers),
             Style::default().fg(Color::Gray),
         ),
         sep.clone(),
@@ -182,8 +192,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     spans.push(sep);
     spans.push(Span::styled(
-        format!("[{}]", app.orch.default_mode.label()),
-        Style::default().fg(match app.orch.default_mode {
+        format!("[{}]", app.default_mode.label()),
+        Style::default().fg(match app.default_mode {
             PromptMode::Interactive => Color::Magenta,
             PromptMode::OneShot => Color::Yellow,
         }).add_modifier(Modifier::BOLD),
@@ -271,17 +281,18 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
     let items: Vec<ListItem> = visible_indices
         .iter()
         .map(|&idx| {
-            let prompt = &app.orch.prompts[idx];
+            let prompt = &app.prompts[idx];
+            let status = prompt.status_enum();
             let elapsed = prompt
                 .elapsed_display()
                 .map(|d| format!(" ({d})"))
                 .unwrap_or_default();
 
             let is_unseen_done = !prompt.seen
-                && (prompt.status == PromptStatus::Completed
-                    || prompt.status == PromptStatus::Failed);
+                && (status == PromptStatus::Completed
+                    || status == PromptStatus::Failed);
 
-            let status_style = match prompt.status {
+            let status_style = match status {
                 PromptStatus::Pending => Style::default().fg(Color::Yellow),
                 PromptStatus::Running => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 PromptStatus::Idle => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
@@ -313,10 +324,10 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                 overhead += if dir.len() > 20 { 22 } else { dir.len() + 3 };
             }
 
-            if prompt.status == PromptStatus::Idle {
+            if status == PromptStatus::Idle {
                 overhead += 7; // " " + " IDLE "
             } else if is_unseen_done {
-                overhead += if prompt.status == PromptStatus::Completed { 8 } else { 9 };
+                overhead += if status == PromptStatus::Completed { 8 } else { 9 };
             }
 
             let max_text_chars = content_width.saturating_sub(overhead).max(8);
@@ -331,7 +342,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                 Span::styled(display, Style::default().fg(Color::Magenta))
             });
 
-            let status_tag = if prompt.status == PromptStatus::Idle {
+            let status_tag = if status == PromptStatus::Idle {
                 let bright = (tick / 5) % 2 == 0;
                 let style = if bright {
                     Style::default()
@@ -345,12 +356,12 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                 };
                 Some(Span::styled(" IDLE ", style))
             } else if is_unseen_done {
-                let tag = if prompt.status == PromptStatus::Completed {
+                let tag = if status == PromptStatus::Completed {
                     " READY "
                 } else {
                     " FAILED "
                 };
-                let tag_color = if prompt.status == PromptStatus::Completed {
+                let tag_color = if status == PromptStatus::Completed {
                     Color::Green
                 } else {
                     Color::Red
@@ -378,7 +389,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
             }
             spans.extend([
                 Span::styled(
-                    format!("{} ", prompt.status.symbol()),
+                    format!("{} ", prompt.status_symbol()),
                     status_style,
                 ),
                 Span::styled(
@@ -415,7 +426,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
             if moved_id == Some(prompt.id) {
                 // Flash highlight for recently reordered prompt
                 item.style(Style::default().bg(Color::Rgb(60, 60, 30)).add_modifier(Modifier::BOLD))
-            } else if prompt.status == PromptStatus::Idle {
+            } else if status == PromptStatus::Idle {
                 let bg = if (tick / 5) % 2 == 0 {
                     Color::Rgb(45, 30, 50)
                 } else {
@@ -475,7 +486,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
     // Render prompt preview pane
     if let Some(preview_rect) = preview_area {
         if let Some(selected) = app.list_state.selected() {
-            let prompt_text = &app.orch.prompts[selected].text;
+            let prompt_text = &app.prompts[selected].text;
             let preview = Paragraph::new(prompt_text.as_str())
                 .style(Style::default().fg(Color::White))
                 .block(
@@ -496,11 +507,11 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
 fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     // Check if we should render the PTY grid
     if let Some(prompt) = app.selected_prompt() {
-        if let Some(pty_state) = app.orch.pty_handles.get(&prompt.id).map(|h| h.state.clone()) {
-            let id = prompt.id;
+        let id = prompt.id;
+        if app.pty_renderers.contains_key(&id) {
             let cwd_str = prompt.cwd.as_deref().unwrap_or(".").to_string();
             let is_pty_interact = app.mode == AppMode::PtyInteract;
-            render_pty_output_viewer(f, app, &pty_state, area, id, &cwd_str, is_pty_interact);
+            render_pty_output_viewer(f, app, area, id, &cwd_str, is_pty_interact);
             return;
         }
     }
@@ -510,7 +521,6 @@ fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rec
 fn render_pty_output_viewer(
     f: &mut Frame,
     app: &mut App,
-    pty_state: &SharedPtyState,
     area: Rect,
     id: usize,
     cwd_str: &str,
@@ -564,14 +574,14 @@ fn render_pty_output_viewer(
     app.output_panel_size = Some((inner.width, inner.height));
 
     // Render PTY grid content
-    render_pty_grid(f, pty_state, inner);
+    if let Some(renderer) = app.pty_renderers.get(&id) {
+        render_pty_grid(f, renderer, inner);
+    }
 }
 
-fn render_pty_grid(f: &mut Frame, pty_state: &SharedPtyState, area: Rect) {
-    let Ok(pty) = pty_state.lock() else {
-        return;
-    };
-    let grid = pty.term.grid();
+fn render_pty_grid(f: &mut Frame, renderer: &PtyRenderer, area: Rect) {
+    let term = renderer.term();
+    let grid = term.grid();
     let screen_lines = grid.screen_lines();
     let cols = grid.columns();
 
@@ -687,10 +697,12 @@ fn convert_flags(flags: CellFlags) -> Modifier {
 fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let (title, content) = match app.selected_prompt() {
         Some(prompt) => {
+            let status = prompt.status_enum();
+            let mode = prompt.mode_enum();
             let cwd_str = prompt.cwd.as_deref().unwrap_or(".");
             let wt_tag = if prompt.worktree_path.is_some() { " [WT]" } else { "" };
             let title = format!(" Output: #{} [{}]{wt_tag} ", prompt.id, cwd_str);
-            let content = match &prompt.status {
+            let content = match status {
                 PromptStatus::Pending => "(pending)".to_string(),
                 PromptStatus::Running => {
                     let elapsed = prompt.elapsed_display().unwrap_or_else(|| "0.0s".into());
@@ -703,7 +715,7 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
                 }
                 PromptStatus::Idle => {
                     let elapsed = prompt.elapsed_display().unwrap_or_else(|| "0.0s".into());
-                    let hint = if prompt.mode == PromptMode::Interactive {
+                    let hint = if mode == PromptMode::Interactive {
                         let key = app.keymap.view_key_hint(ViewAction::Interact);
                         format!(" — press '{key}' to interact")
                     } else {
@@ -740,7 +752,7 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
     // Auto-scroll: compute scroll offset to show the bottom of content
     if app.auto_scroll && matches!(app.mode, AppMode::ViewOutput | AppMode::Interact) {
         if let Some(prompt) = app.selected_prompt() {
-            if prompt.status == PromptStatus::Running {
+            if prompt.status_enum() == PromptStatus::Running {
                 // Estimate total lines (rough: count newlines + wrapping)
                 let inner_height = area.height.saturating_sub(2); // borders
                 let line_count = content.lines().count() as u16;
@@ -764,13 +776,16 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
         Span::raw("")
     };
 
-    let output_border_color = match app.selected_prompt().map(|p| &p.status) {
-        Some(PromptStatus::Running) => Color::Cyan,
-        Some(PromptStatus::Idle) => Color::Magenta,
-        Some(PromptStatus::Completed) => Color::Green,
-        Some(PromptStatus::Failed) => Color::Red,
-        Some(PromptStatus::Pending) => Color::Yellow,
-        None => Color::Rgb(80, 80, 100),
+    let output_border_color = if let Some(prompt) = app.selected_prompt() {
+        match prompt.status_enum() {
+            PromptStatus::Running => Color::Cyan,
+            PromptStatus::Idle => Color::Magenta,
+            PromptStatus::Completed => Color::Green,
+            PromptStatus::Failed => Color::Red,
+            PromptStatus::Pending => Color::Yellow,
+        }
+    } else {
+        Color::Rgb(80, 80, 100)
     };
 
     let paragraph = Paragraph::new(content)
@@ -1297,10 +1312,12 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         AppMode::Normal => {
             let mut help = app.keymap.normal_help();
             if let Some(p) = app.selected_prompt() {
-                let is_pending = p.status == PromptStatus::Pending;
-                let is_running = matches!(p.status, PromptStatus::Running | PromptStatus::Idle);
-                let is_finished = matches!(p.status, PromptStatus::Completed | PromptStatus::Failed);
-                let is_interactive = p.mode == PromptMode::Interactive;
+                let status = p.status_enum();
+                let mode = p.mode_enum();
+                let is_pending = status == PromptStatus::Pending;
+                let is_running = matches!(status, PromptStatus::Running | PromptStatus::Idle);
+                let is_finished = matches!(status, PromptStatus::Completed | PromptStatus::Failed);
+                let is_interactive = mode == PromptMode::Interactive;
                 help.retain(|(_, desc)| match *desc {
                     "move up" | "move down" => is_pending,
                     "interact" => is_interactive && is_running,

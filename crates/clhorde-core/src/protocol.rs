@@ -42,6 +42,10 @@ pub enum ClientRequest {
     SetDefaultMode {
         mode: String,
     },
+    SetPromptMode {
+        prompt_id: usize,
+        mode: String,
+    },
     GetState,
     GetPromptOutput {
         prompt_id: usize,
@@ -154,6 +158,45 @@ pub struct PromptInfo {
     pub elapsed_secs: Option<f64>,
     pub uuid: String,
     pub has_pty: bool,
+}
+
+impl PromptInfo {
+    /// Parse the `status` string back to a `PromptStatus` enum.
+    pub fn status_enum(&self) -> crate::prompt::PromptStatus {
+        match self.status.as_str() {
+            "Pending" => crate::prompt::PromptStatus::Pending,
+            "Running" => crate::prompt::PromptStatus::Running,
+            "Idle" => crate::prompt::PromptStatus::Idle,
+            "Completed" => crate::prompt::PromptStatus::Completed,
+            "Failed" => crate::prompt::PromptStatus::Failed,
+            _ => crate::prompt::PromptStatus::Pending,
+        }
+    }
+
+    /// Parse the `mode` string back to a `PromptMode` enum.
+    pub fn mode_enum(&self) -> crate::prompt::PromptMode {
+        match self.mode.as_str() {
+            "one-shot" | "one_shot" | "oneshot" => crate::prompt::PromptMode::OneShot,
+            _ => crate::prompt::PromptMode::Interactive,
+        }
+    }
+
+    /// Format `elapsed_secs` as a human-readable duration string.
+    pub fn elapsed_display(&self) -> Option<String> {
+        self.elapsed_secs.map(crate::prompt::format_duration)
+    }
+
+    /// Return the status emoji symbol.
+    pub fn status_symbol(&self) -> &'static str {
+        match self.status.as_str() {
+            "Pending" => "⏳",
+            "Running" => "🔄",
+            "Idle" => "💬",
+            "Completed" => "✅",
+            "Failed" => "❌",
+            _ => "⏳",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

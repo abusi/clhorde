@@ -1,25 +1,28 @@
 mod app;
 mod cli;
 mod editor;
+mod ipc_client;
+mod key_encoding;
 mod keymap;
-mod orchestrator;
-mod pty_worker;
+mod pty_renderer;
 mod ui;
-mod worker;
 
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, EnableBracketedPaste, DisableBracketedPaste, Event, KeyEventKind};
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use app::App;
 use cli::{CliAction, LaunchOptions};
-use worker::{SpawnResult, WorkerMessage};
+use clhorde_core::protocol::ClientRequest;
+use ipc_client::DaemonMessage;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -29,16 +32,30 @@ async fn main() -> io::Result<()> {
         CliAction::LaunchTui(opts) => opts,
     };
 
+    // Connect to daemon before terminal setup so errors print cleanly
+    let (daemon_tx, daemon_rx) = match ipc_client::connect().await {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("Failed to connect to clhorded daemon: {e}");
+            eprintln!("Is the daemon running? Start it with: clhorded");
+            std::process::exit(1);
+        }
+    };
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, launch_opts).await;
+    let result = run_app(&mut terminal, launch_opts, daemon_tx, daemon_rx).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     if let Err(e) = result {
@@ -48,119 +65,50 @@ async fn main() -> io::Result<()> {
     Ok(())
 }
 
-async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_opts: LaunchOptions) -> io::Result<()> {
-    let mut app = App::new();
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    launch_opts: LaunchOptions,
+    daemon_tx: mpsc::UnboundedSender<ClientRequest>,
+    mut daemon_rx: mpsc::UnboundedReceiver<DaemonMessage>,
+) -> io::Result<()> {
+    let mut app = App::new(daemon_tx);
 
-    let LaunchOptions { prompts, worktree, run_path } = launch_opts;
+    // Subscribe and request initial state
+    app.send_subscribe();
+    app.send_get_state();
+
+    // Submit prompt-from-files prompts
+    let LaunchOptions {
+        prompts,
+        worktree,
+        run_path,
+    } = launch_opts;
     for text in prompts {
         app.add_prompt(text, run_path.clone(), worktree, Vec::new());
     }
 
-    let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<WorkerMessage>();
-
     // Dedicated thread for crossterm event reading
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
-    std::thread::spawn(move || {
-        loop {
-            if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-                if let Ok(ev) = event::read() {
-                    if event_tx.send(ev).is_err() {
-                        break;
-                    }
+    std::thread::spawn(move || loop {
+        if event::poll(Duration::from_millis(50)).unwrap_or(false) {
+            if let Ok(ev) = event::read() {
+                if event_tx.send(ev).is_err() {
+                    break;
                 }
             }
         }
     });
 
     let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
+    let mut reconnect_interval = tokio::time::interval(Duration::from_secs(2));
 
     loop {
         terminal.draw(|f| ui::render(f, &mut app))?;
 
-        // After draw: check if output panel size changed, resize PTY workers
+        // After draw: check if output panel size changed, resize PTY renderers + notify daemon
         if let Some(panel_size) = app.output_panel_size {
             if app.last_pty_size != Some(panel_size) && panel_size.0 > 0 && panel_size.1 > 0 {
                 app.resize_pty_workers(panel_size.0, panel_size.1);
-            }
-        }
-
-        // Dispatch pending prompts to workers
-        while app.orch.active_workers < app.orch.max_workers {
-            if let Some(idx) = app.orch.next_pending_prompt_index() {
-                let prompt = &app.orch.prompts[idx];
-                let id = prompt.id;
-                let text = prompt.text.clone();
-                let mut cwd = prompt.cwd.clone();
-                let mode = prompt.mode;
-                let wants_worktree = prompt.worktree;
-                let resume_session_id = if prompt.resume {
-                    Some(prompt.session_id.clone().unwrap_or_default())
-                } else {
-                    None
-                };
-
-                // Create git worktree if requested
-                if wants_worktree {
-                    let effective_cwd = cwd.as_deref()
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    match clhorde_core::worktree::repo_root(&effective_cwd) {
-                        Some(root) => {
-                            match clhorde_core::worktree::create_worktree(&root, id) {
-                                Ok(wt_path) => {
-                                    let wt_str = wt_path.to_string_lossy().to_string();
-                                    cwd = Some(wt_str.clone());
-                                    if let Some(p) = app.orch.prompts.get_mut(idx) {
-                                        p.worktree_path = Some(wt_str);
-                                    }
-                                }
-                                Err(e) => {
-                                    app.orch.mark_running(idx);
-                                    app.orch.active_workers += 1;
-                                    app.apply_message(WorkerMessage::SpawnError {
-                                        prompt_id: id,
-                                        error: format!("Worktree creation failed: {e}"),
-                                    });
-                                    continue;
-                                }
-                            }
-                        }
-                        None => {
-                            app.orch.mark_running(idx);
-                            app.orch.active_workers += 1;
-                            app.apply_message(WorkerMessage::SpawnError {
-                                prompt_id: id,
-                                error: "Not inside a git repository — cannot create worktree".to_string(),
-                            });
-                            continue;
-                        }
-                    }
-                }
-
-                app.orch.mark_running(idx);
-                app.orch.active_workers += 1;
-                let pty_size = app.output_panel_size;
-                match worker::spawn_worker(id, text, cwd, mode, worker_tx.clone(), pty_size, resume_session_id)
-                {
-                    SpawnResult::Pty {
-                        input_sender,
-                        pty_handle,
-                    } => {
-                        app.orch.worker_inputs.insert(id, input_sender);
-                        app.orch.pty_handles.insert(id, pty_handle);
-                    }
-                    SpawnResult::OneShot => {
-                        // No input sender for one-shot
-                    }
-                    SpawnResult::Error(e) => {
-                        app.apply_message(WorkerMessage::SpawnError {
-                            prompt_id: id,
-                            error: e,
-                        });
-                    }
-                }
-            } else {
-                break;
             }
         }
 
@@ -181,17 +129,35 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_o
                     }
                     Event::Resize(_, _) => {
                         // Terminal resized — next draw will update output_panel_size
-                        // and resize_pty_workers will be called
                     }
                     _ => {}
                 }
             }
-            Some(msg) = worker_rx.recv() => {
-                app.apply_message(msg);
+            Some(msg) = daemon_rx.recv() => {
+                match msg {
+                    DaemonMessage::Event(event) => {
+                        app.apply_event(*event);
+                    }
+                    DaemonMessage::PtyBytes { prompt_id, data } => {
+                        app.apply_pty_bytes(prompt_id, &data);
+                    }
+                    DaemonMessage::Disconnected => {
+                        app.connected = false;
+                    }
+                }
             }
             _ = tick_interval.tick() => {
                 app.tick = app.tick.wrapping_add(1);
                 app.clear_expired_status();
+            }
+            _ = reconnect_interval.tick(), if !app.connected => {
+                if let Ok((new_tx, new_rx)) = ipc_client::connect().await {
+                    app.daemon_tx = new_tx;
+                    daemon_rx = new_rx;
+                    app.connected = true;
+                    app.send_subscribe();
+                    app.send_get_state();
+                }
             }
         }
 
@@ -204,9 +170,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_o
         }
 
         if app.should_quit {
-            app.orch.shutdown();
-            // Brief sleep for cleanup
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // TUI disconnects — daemon keeps running, workers continue
             return Ok(());
         }
     }
@@ -228,7 +192,11 @@ fn open_editor(
 
     // Suspend terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
 
     // Spawn editor
     let status = std::process::Command::new(&editor)
@@ -236,7 +204,11 @@ fn open_editor(
         .status();
 
     // Restore terminal
-    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableBracketedPaste
+    )?;
     enable_raw_mode()?;
     terminal.clear()?;
 

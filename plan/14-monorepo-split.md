@@ -789,7 +789,7 @@ uuid.workspace = true
 
 ## Migration Phases
 
-### Phase 0: Workspace Setup (no behavior change)
+### Phase 0: Workspace Setup (no behavior change) ✅ DONE
 
 1. Create `Cargo.toml` workspace root, move current crate to `crates/clhorde-tui/`
 2. Create `clhorde-core` crate: move `prompt.rs`, `persistence.rs`, `worktree.rs`
@@ -800,7 +800,7 @@ uuid.workspace = true
 
 **Verification:** `cargo test`, `cargo run` — identical behavior to pre-split.
 
-### Phase 1: Extract CLI Binary
+### Phase 1: Extract CLI Binary ✅ DONE
 
 7. Create `clhorde-cli` crate with `commands/` modules extracted from `cli.rs`
 8. Split `cli.rs` (1223 lines) into: `store.rs`, `qp.rs`, `keys.rs`, `config.rs`
@@ -809,7 +809,7 @@ uuid.workspace = true
 
 **Verification:** Config-only CLI subcommands produce identical output. TUI launches without CLI arg interception. Store commands are deferred to Phase 5 (require running daemon).
 
-### Phase 2: Split App State (refactor only, no IPC)
+### Phase 2: Split App State (refactor only, no IPC) ✅ DONE
 
 11. Split `App` struct into `Orchestrator` + `App` within `clhorde-tui`
 12. `App` holds an owned `Orchestrator`, delegates all business logic calls through it
@@ -819,7 +819,7 @@ uuid.workspace = true
 
 **Verification:** `cargo test`, `cargo run` — still single process, identical behavior. This is the riskiest phase for regressions; thorough manual testing of all modes.
 
-### Phase 3: Build the Daemon
+### Phase 3: Build the Daemon ✅ DONE
 
 16. Create `clhorde-daemon` crate: move `Orchestrator`, `worker.rs`, `pty_worker.rs` from TUI
 17. Implement `ipc_server.rs`: `UnixListener`, per-client tasks, frame read/write

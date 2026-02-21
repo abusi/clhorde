@@ -17,8 +17,7 @@ serde_json.workspace = true
 dirs.workspace = true
 chrono.workspace = true
 alacritty_terminal.workspace = true
-portable-pty.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+uuid.workspace = true

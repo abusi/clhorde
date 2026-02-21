@@ -467,6 +467,18 @@ impl Orchestrator {
                 self.dispatch_workers();
             }
             ClientRequest::SendInput { prompt_id, text } => {
+                // Echo the input to output so all clients see it
+                let echo = format!("\n\n> {text}\n\n");
+                if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
+                    match &mut prompt.output {
+                        Some(existing) => existing.push_str(&echo),
+                        None => prompt.output = Some(echo.clone()),
+                    }
+                }
+                self.sessions.broadcast(&DaemonEvent::OutputChunk {
+                    prompt_id,
+                    text: echo,
+                });
                 if let Some(sender) = self.worker_inputs.get(&prompt_id) {
                     let mut send_text = text;
                     send_text.push('\n');
@@ -525,6 +537,20 @@ impl Orchestrator {
                     "one-shot" | "one_shot" | "oneshot" => PromptMode::OneShot,
                     _ => PromptMode::Interactive,
                 };
+            }
+            ClientRequest::SetPromptMode { prompt_id, mode } => {
+                let new_mode = match mode.as_str() {
+                    "one-shot" | "one_shot" | "oneshot" => PromptMode::OneShot,
+                    _ => PromptMode::Interactive,
+                };
+                if let Some(idx) = self.prompts.iter().position(|p| p.id == prompt_id) {
+                    if self.prompts[idx].status == PromptStatus::Pending {
+                        self.prompts[idx].mode = new_mode;
+                        self.persist_prompt_by_id(prompt_id);
+                        let info = self.to_prompt_info(&self.prompts[idx]);
+                        self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+                    }
+                }
             }
             ClientRequest::GetState => {
                 let state = self.to_daemon_state();

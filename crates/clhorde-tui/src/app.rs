@@ -1,19 +1,20 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
+use tokio::sync::mpsc;
 
 use crate::editor::TextBuffer;
+use crate::key_encoding;
 use crate::keymap::{
     FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction,
 };
-use clhorde_core::prompt::PromptStatus;
-use crate::orchestrator::{MoveResult, MsgEffect, Orchestrator};
-use crate::pty_worker;
-use crate::worker::WorkerMessage;
+use crate::pty_renderer::PtyRenderer;
+use clhorde_core::prompt::{PromptMode, PromptStatus};
+use clhorde_core::protocol::{ClientRequest, DaemonEvent, DaemonState, PromptInfo};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
@@ -27,7 +28,21 @@ pub enum AppMode {
 }
 
 pub struct App {
-    pub orch: Orchestrator,
+    /// Local mirror of prompts from the daemon.
+    pub prompts: Vec<PromptInfo>,
+    /// Send requests to the daemon.
+    pub daemon_tx: mpsc::UnboundedSender<ClientRequest>,
+    /// Local PTY terminal emulators for rendering.
+    pub pty_renderers: HashMap<usize, PtyRenderer>,
+    /// Mirrored from daemon.
+    pub max_workers: usize,
+    /// Mirrored from daemon.
+    pub active_workers: usize,
+    /// Mirrored from daemon.
+    pub default_mode: PromptMode,
+    /// Whether we are connected to the daemon.
+    pub connected: bool,
+
     pub mode: AppMode,
     pub list_state: ListState,
     pub input: TextBuffer,
@@ -97,22 +112,23 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
-        let orch = Orchestrator::new();
-        let mut list_state = ListState::default();
-        if !orch.prompts.is_empty() {
-            list_state.select(Some(0));
-        }
-        let filtered_indices: Vec<usize> = (0..orch.prompts.len()).collect();
+    pub fn new(daemon_tx: mpsc::UnboundedSender<ClientRequest>) -> Self {
         let templates = clhorde_core::config::load_templates();
         let history = clhorde_core::config::load_history();
         let settings = crate::keymap::load_settings();
         let list_ratio = (settings.list_ratio.unwrap_or(40) as u16).clamp(10, 90);
 
         Self {
-            orch,
+            prompts: Vec::new(),
+            daemon_tx,
+            pty_renderers: HashMap::new(),
+            max_workers: 3,
+            active_workers: 0,
+            default_mode: PromptMode::Interactive,
+            connected: true,
+
             mode: AppMode::Normal,
-            list_state,
+            list_state: ListState::default(),
             input: TextBuffer::new(),
             open_external_editor: false,
             scroll_offset: 0,
@@ -127,7 +143,7 @@ impl App {
             confirm_quit: false,
             filter_text: None,
             filter_input: String::new(),
-            filtered_indices,
+            filtered_indices: Vec::new(),
             history,
             history_index: None,
             history_stash: String::new(),
@@ -152,24 +168,50 @@ impl App {
         }
     }
 
-    // ── Delegated counts ──
+    // ── Helper: send request to daemon ──
+
+    fn send(&self, req: ClientRequest) {
+        let _ = self.daemon_tx.send(req);
+    }
+
+    pub fn send_subscribe(&self) {
+        self.send(ClientRequest::Subscribe);
+    }
+
+    pub fn send_get_state(&self) {
+        self.send(ClientRequest::GetState);
+    }
+
+    // ── Counts ──
 
     pub fn pending_count(&self) -> usize {
-        self.orch.pending_count()
+        self.prompts
+            .iter()
+            .filter(|p| p.status_enum() == PromptStatus::Pending)
+            .count()
     }
 
     pub fn completed_count(&self) -> usize {
-        self.orch.completed_count()
+        self.prompts
+            .iter()
+            .filter(|p| {
+                let s = p.status_enum();
+                s == PromptStatus::Completed || s == PromptStatus::Failed
+            })
+            .count()
     }
 
-    // ── Add prompt (delegates + rebuilds filter) ──
+    // ── Add prompt ──
 
     pub fn add_prompt(&mut self, text: String, cwd: Option<String>, worktree: bool, tags: Vec<String>) {
-        self.orch.add_prompt(text, cwd, worktree, tags);
-        self.rebuild_filter();
-        if self.list_state.selected().is_none() {
-            self.list_state.select(Some(0));
-        }
+        self.send(ClientRequest::SubmitPrompt {
+            text,
+            cwd,
+            mode: self.default_mode.label().to_string(),
+            worktree,
+            tags,
+        });
+        // Selection will be updated when PromptAdded event arrives
     }
 
     fn parse_cwd_prefix(input: &str) -> (Option<String>, String) {
@@ -249,18 +291,18 @@ impl App {
         }
     }
 
-    pub fn selected_prompt(&self) -> Option<&clhorde_core::prompt::Prompt> {
+    pub fn selected_prompt(&self) -> Option<&PromptInfo> {
         self.list_state
             .selected()
-            .and_then(|i| self.orch.prompts.get(i))
+            .and_then(|i| self.prompts.get(i))
     }
 
-    /// Mark the currently selected prompt as seen if it's finished.
+    /// Mark the currently selected prompt as seen if it's finished (local-only).
     fn mark_selected_seen(&mut self) {
         if let Some(idx) = self.list_state.selected() {
-            if let Some(prompt) = self.orch.prompts.get_mut(idx) {
-                if prompt.status == PromptStatus::Completed || prompt.status == PromptStatus::Failed
-                {
+            if let Some(prompt) = self.prompts.get_mut(idx) {
+                let s = prompt.status_enum();
+                if s == PromptStatus::Completed || s == PromptStatus::Failed {
                     prompt.seen = true;
                 }
             }
@@ -281,29 +323,158 @@ impl App {
         }
     }
 
-    // ── apply_message wrapper ──
+    // ── apply_event: process daemon events ──
 
-    pub fn apply_message(&mut self, msg: WorkerMessage) {
-        let effect = self.orch.apply_message(msg);
-        self.handle_msg_effect(effect);
-    }
+    pub fn apply_event(&mut self, event: DaemonEvent) {
+        match event {
+            DaemonEvent::StateSnapshot(state) => {
+                self.apply_state_snapshot(state);
+            }
+            DaemonEvent::PromptAdded(info) => {
+                let has_pty = info.has_pty;
+                let id = info.id;
+                self.prompts.push(info);
+                if has_pty {
+                    let (cols, rows) = self.output_panel_size.unwrap_or((80, 24));
+                    self.pty_renderers.insert(id, PtyRenderer::new(cols, rows));
+                }
+                self.rebuild_filter();
+                if self.list_state.selected().is_none() {
+                    self.list_state.select(Some(0));
+                }
+            }
+            DaemonEvent::PromptUpdated(info) => {
+                let id = info.id;
+                if let Some(pos) = self.prompts.iter().position(|p| p.id == id) {
+                    // Preserve local `seen` state
+                    let local_seen = self.prompts[pos].seen;
+                    self.prompts[pos] = info;
+                    self.prompts[pos].seen = local_seen;
 
-    pub fn handle_msg_effect(&mut self, effect: MsgEffect) {
-        if let MsgEffect::PromptFinished { prompt_id } = effect {
-            if self.mode == AppMode::PtyInteract {
-                if let Some(p) = self.selected_prompt() {
-                    if p.id == prompt_id {
-                        self.mode = AppMode::ViewOutput;
+                    // Create PTY renderer if newly has PTY
+                    if self.prompts[pos].has_pty && !self.pty_renderers.contains_key(&id) {
+                        let (cols, rows) = self.output_panel_size.unwrap_or((80, 24));
+                        self.pty_renderers.insert(id, PtyRenderer::new(cols, rows));
+                    }
+                }
+                self.rebuild_filter();
+
+                // Exit PtyInteract if selected prompt finished
+                if self.mode == AppMode::PtyInteract {
+                    if let Some(p) = self.selected_prompt() {
+                        let s = p.status_enum();
+                        if s != PromptStatus::Running && s != PromptStatus::Idle {
+                            self.mode = AppMode::ViewOutput;
+                        }
                     }
                 }
             }
+            DaemonEvent::PromptRemoved { prompt_id } => {
+                self.prompts.retain(|p| p.id != prompt_id);
+                self.pty_renderers.remove(&prompt_id);
+                self.rebuild_filter();
+                // Clamp selection
+                if let Some(idx) = self.list_state.selected() {
+                    if idx >= self.prompts.len() {
+                        if self.prompts.is_empty() {
+                            self.list_state.select(None);
+                        } else {
+                            self.list_state.select(Some(self.prompts.len() - 1));
+                        }
+                    }
+                }
+            }
+            DaemonEvent::OutputChunk { prompt_id, text } => {
+                if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
+                    match &mut prompt.output {
+                        Some(existing) => existing.push_str(&text),
+                        None => prompt.output = Some(text),
+                    }
+                }
+            }
+            DaemonEvent::PromptOutput {
+                prompt_id,
+                full_text,
+            } => {
+                if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
+                    prompt.output = Some(full_text);
+                }
+            }
+            DaemonEvent::WorkerFinished { prompt_id, .. } => {
+                self.pty_renderers.remove(&prompt_id);
+            }
+            DaemonEvent::WorkerError { prompt_id, .. } => {
+                self.pty_renderers.remove(&prompt_id);
+            }
+            DaemonEvent::MaxWorkersChanged { count } => {
+                self.max_workers = count;
+            }
+            DaemonEvent::ActiveWorkersChanged { count } => {
+                self.active_workers = count;
+            }
+            // Events we don't need to handle
+            DaemonEvent::PtyUpdate { .. }
+            | DaemonEvent::TurnComplete { .. }
+            | DaemonEvent::SessionId { .. }
+            | DaemonEvent::WorkerStarted { .. }
+            | DaemonEvent::Pong
+            | DaemonEvent::StoreListResult { .. }
+            | DaemonEvent::StoreCountResult { .. }
+            | DaemonEvent::StorePathResult { .. }
+            | DaemonEvent::StoreOpComplete { .. }
+            | DaemonEvent::Error { .. } => {}
         }
     }
 
-    // ── resize PTY wrapper (updates last_pty_size) ──
+    fn apply_state_snapshot(&mut self, state: DaemonState) {
+        self.prompts = state.prompts;
+        self.max_workers = state.max_workers;
+        self.active_workers = state.active_workers;
+        self.default_mode = match state.default_mode.as_str() {
+            "one-shot" | "one_shot" | "oneshot" => PromptMode::OneShot,
+            _ => PromptMode::Interactive,
+        };
+
+        // Create PTY renderers for prompts that have PTY
+        let (cols, rows) = self.output_panel_size.unwrap_or((80, 24));
+        self.pty_renderers.clear();
+        for prompt in &self.prompts {
+            if prompt.has_pty {
+                self.pty_renderers
+                    .insert(prompt.id, PtyRenderer::new(cols, rows));
+            }
+        }
+
+        self.rebuild_filter();
+        if self.list_state.selected().is_none() && !self.prompts.is_empty() {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    /// Feed raw PTY bytes to the local renderer.
+    pub fn apply_pty_bytes(&mut self, prompt_id: usize, data: &[u8]) {
+        if let Some(renderer) = self.pty_renderers.get_mut(&prompt_id) {
+            renderer.feed_bytes(data);
+        }
+    }
+
+    // ── resize PTY workers ──
 
     pub fn resize_pty_workers(&mut self, cols: u16, rows: u16) {
-        self.orch.resize_pty_workers(cols, rows);
+        // Resize all local renderers
+        for renderer in self.pty_renderers.values_mut() {
+            renderer.resize(cols, rows);
+        }
+        // Send resize requests to daemon for each PTY prompt
+        for prompt in &self.prompts {
+            if prompt.has_pty {
+                self.send(ClientRequest::ResizePty {
+                    prompt_id: prompt.id,
+                    cols,
+                    rows,
+                });
+            }
+        }
         self.last_pty_size = Some((cols, rows));
     }
 
@@ -411,10 +582,7 @@ impl App {
         };
         match action {
             NormalAction::Quit => {
-                let has_active = self.orch.prompts.iter().any(|p| {
-                    p.status == PromptStatus::Running || p.status == PromptStatus::Idle
-                });
-                if has_active {
+                if self.active_workers > 0 {
                     self.confirm_quit = true;
                 } else {
                     self.should_quit = true;
@@ -434,7 +602,7 @@ impl App {
                 self.select_next();
                 if self.visual_select_active {
                     if let Some(idx) = self.list_state.selected() {
-                        if let Some(prompt) = self.orch.prompts.get(idx) {
+                        if let Some(prompt) = self.prompts.get(idx) {
                             self.selected_ids.insert(prompt.id);
                         }
                     }
@@ -445,7 +613,7 @@ impl App {
                 self.select_prev();
                 if self.visual_select_active {
                     if let Some(idx) = self.list_state.selected() {
-                        if let Some(prompt) = self.orch.prompts.get(idx) {
+                        if let Some(prompt) = self.prompts.get(idx) {
                             self.selected_ids.insert(prompt.id);
                         }
                     }
@@ -454,8 +622,8 @@ impl App {
             }
             NormalAction::ViewOutput => {
                 if let Some(idx) = self.list_state.selected() {
-                    if idx < self.orch.prompts.len() {
-                        self.orch.prompts[idx].seen = true;
+                    if idx < self.prompts.len() {
+                        self.prompts[idx].seen = true;
                         self.scroll_offset = 0;
                         self.mode = AppMode::ViewOutput;
                         self.list_collapsed = true;
@@ -464,10 +632,13 @@ impl App {
             }
             NormalAction::Interact => {
                 let target_mode = {
-                    let prompt_info = self.selected_prompt().map(|p| (p.id, p.status.clone()));
-                    prompt_info.and_then(|(id, status)| {
+                    let prompt_info = self.selected_prompt().map(|p| {
+                        let s = p.status_enum();
+                        (p.id, s, p.has_pty)
+                    });
+                    prompt_info.and_then(|(_, status, has_pty)| {
                         if status == PromptStatus::Running || status == PromptStatus::Idle {
-                            if self.orch.pty_handles.contains_key(&id) {
+                            if has_pty {
                                 Some(AppMode::PtyInteract)
                             } else {
                                 Some(AppMode::Interact)
@@ -487,16 +658,23 @@ impl App {
                 }
             }
             NormalAction::IncreaseWorkers => {
-                self.orch.max_workers = (self.orch.max_workers + 1).min(20);
+                let new_count = (self.max_workers + 1).min(20);
+                self.send(ClientRequest::SetMaxWorkers(new_count));
             }
             NormalAction::DecreaseWorkers => {
-                self.orch.max_workers = self.orch.max_workers.saturating_sub(1).max(1);
+                let new_count = self.max_workers.saturating_sub(1).max(1);
+                self.send(ClientRequest::SetMaxWorkers(new_count));
             }
             NormalAction::ToggleMode => {
                 if !self.selected_ids.is_empty() {
                     self.batch_toggle_mode();
                 } else {
-                    self.orch.default_mode = self.orch.default_mode.toggle();
+                    let new_mode = self.default_mode.toggle();
+                    self.send(ClientRequest::SetDefaultMode {
+                        mode: new_mode.label().to_string(),
+                    });
+                    // Optimistic update
+                    self.default_mode = new_mode;
                 }
             }
             NormalAction::Retry => {
@@ -564,7 +742,7 @@ impl App {
             NormalAction::ToggleSelect => {
                 self.visual_select_active = false;
                 if let Some(idx) = self.list_state.selected() {
-                    if let Some(prompt) = self.orch.prompts.get(idx) {
+                    if let Some(prompt) = self.prompts.get(idx) {
                         let id = prompt.id;
                         if !self.selected_ids.remove(&id) {
                             self.selected_ids.insert(id);
@@ -576,7 +754,7 @@ impl App {
                 let visible_ids: Vec<usize> = self
                     .visible_prompt_indices()
                     .iter()
-                    .filter_map(|&idx| self.orch.prompts.get(idx).map(|p| p.id))
+                    .filter_map(|&idx| self.prompts.get(idx).map(|p| p.id))
                     .collect();
                 let all_selected = visible_ids.iter().all(|id| self.selected_ids.contains(id));
                 if all_selected {
@@ -593,7 +771,7 @@ impl App {
                 self.visual_select_active = !self.visual_select_active;
                 if self.visual_select_active {
                     if let Some(idx) = self.list_state.selected() {
-                        if let Some(prompt) = self.orch.prompts.get(idx) {
+                        if let Some(prompt) = self.prompts.get(idx) {
                             self.selected_ids.insert(prompt.id);
                         }
                     }
@@ -602,7 +780,7 @@ impl App {
             NormalAction::DeleteSelected => {
                 if self.selected_ids.is_empty() {
                     if let Some(idx) = self.list_state.selected() {
-                        if let Some(prompt) = self.orch.prompts.get(idx) {
+                        if let Some(prompt) = self.prompts.get(idx) {
                             self.selected_ids.insert(prompt.id);
                         }
                     }
@@ -616,14 +794,15 @@ impl App {
                     self.batch_kill();
                 } else {
                     let kill_id = self.selected_prompt().and_then(|p| {
-                        if p.status == PromptStatus::Running || p.status == PromptStatus::Idle {
+                        let s = p.status_enum();
+                        if s == PromptStatus::Running || s == PromptStatus::Idle {
                             Some(p.id)
                         } else {
                             None
                         }
                     });
                     if let Some(id) = kill_id {
-                        self.orch.kill_worker(id);
+                        self.send(ClientRequest::KillWorker { prompt_id: id });
                     }
                 }
             }
@@ -814,10 +993,13 @@ impl App {
             }
             ViewAction::Interact => {
                 let target_mode = {
-                    let prompt_info = self.selected_prompt().map(|p| (p.id, p.status.clone()));
-                    prompt_info.and_then(|(id, status)| {
+                    let prompt_info = self.selected_prompt().map(|p| {
+                        let s = p.status_enum();
+                        (s, p.has_pty)
+                    });
+                    prompt_info.and_then(|(status, has_pty)| {
                         if status == PromptStatus::Running || status == PromptStatus::Idle {
-                            if self.orch.pty_handles.contains_key(&id) {
+                            if has_pty {
                                 Some(AppMode::PtyInteract)
                             } else {
                                 Some(AppMode::Interact)
@@ -841,14 +1023,15 @@ impl App {
             }
             ViewAction::KillWorker => {
                 let kill_id = self.selected_prompt().and_then(|p| {
-                    if p.status == PromptStatus::Running || p.status == PromptStatus::Idle {
+                    let s = p.status_enum();
+                    if s == PromptStatus::Running || s == PromptStatus::Idle {
                         Some(p.id)
                     } else {
                         None
                     }
                 });
                 if let Some(id) = kill_id {
-                    self.orch.kill_worker(id);
+                    self.send(ClientRequest::KillWorker { prompt_id: id });
                 }
             }
             ViewAction::Export => {
@@ -869,9 +1052,10 @@ impl App {
                     self.list_collapsed = false;
                 }
                 InteractAction::Send => {
-                    if let Some(idx) = self.list_state.selected() {
+                    if let Some(prompt) = self.selected_prompt() {
+                        let prompt_id = prompt.id;
                         let text = self.interact_input.clone();
-                        self.orch.send_interact_input(idx, &text);
+                        self.send(ClientRequest::SendInput { prompt_id, text });
                     }
                     self.interact_input.clear();
                 }
@@ -941,20 +1125,24 @@ impl App {
 
         // If prompt is no longer running, exit back to view
         if let Some(prompt) = self.selected_prompt() {
-            if prompt.status != PromptStatus::Running && prompt.status != PromptStatus::Idle {
+            let s = prompt.status_enum();
+            if s != PromptStatus::Running && s != PromptStatus::Idle {
                 self.mode = AppMode::ViewOutput;
                 return;
             }
         }
 
         // Forward all other keys to PTY as raw bytes
-        let bytes = pty_worker::key_event_to_bytes(key);
+        let bytes = key_encoding::key_event_to_bytes(key);
         if bytes.is_empty() {
             return;
         }
         if let Some(prompt) = self.selected_prompt() {
             let id = prompt.id;
-            self.orch.send_pty_bytes(id, bytes);
+            self.send(ClientRequest::SendBytes {
+                prompt_id: id,
+                data: bytes,
+            });
         }
     }
 
@@ -962,22 +1150,33 @@ impl App {
         let Some(message) = self.keymap.quick_prompts.get(&key.code) else {
             return;
         };
-        let Some(idx) = self.list_state.selected() else {
+        let Some(prompt) = self.selected_prompt() else {
             return;
         };
-        let Some(prompt) = self.orch.prompts.get(idx) else {
-            return;
-        };
-        if prompt.status != PromptStatus::Running && prompt.status != PromptStatus::Idle {
+        let s = prompt.status_enum();
+        if s != PromptStatus::Running && s != PromptStatus::Idle {
             return;
         }
         let id = prompt.id;
-        let is_pty = self.orch.pty_handles.contains_key(&id);
-        self.orch.try_quick_prompt_send(id, message, is_pty);
+        let has_pty = prompt.has_pty;
+        if has_pty {
+            // Send as raw bytes + carriage return
+            let mut bytes = message.as_bytes().to_vec();
+            bytes.push(b'\r');
+            self.send(ClientRequest::SendBytes {
+                prompt_id: id,
+                data: bytes,
+            });
+        } else {
+            self.send(ClientRequest::SendInput {
+                prompt_id: id,
+                text: message.to_string(),
+            });
+        }
     }
 
     fn select_next(&mut self) {
-        if self.orch.prompts.is_empty() {
+        if self.prompts.is_empty() {
             return;
         }
         if self.filter_text.is_some() && !self.filtered_indices.is_empty() {
@@ -992,7 +1191,7 @@ impl App {
                 .select(Some(self.filtered_indices[next_pos]));
         } else {
             let i = match self.list_state.selected() {
-                Some(i) => (i + 1).min(self.orch.prompts.len() - 1),
+                Some(i) => (i + 1).min(self.prompts.len() - 1),
                 None => 0,
             };
             self.list_state.select(Some(i));
@@ -1000,7 +1199,7 @@ impl App {
     }
 
     fn select_prev(&mut self) {
-        if self.orch.prompts.is_empty() {
+        if self.prompts.is_empty() {
             return;
         }
         if self.filter_text.is_some() && !self.filtered_indices.is_empty() {
@@ -1028,7 +1227,7 @@ impl App {
     }
 
     fn select_half_page_down(&mut self) {
-        if self.orch.prompts.is_empty() {
+        if self.prompts.is_empty() {
             return;
         }
         let step = self.half_page_size();
@@ -1044,7 +1243,7 @@ impl App {
                 .select(Some(self.filtered_indices[next_pos]));
         } else {
             let i = match self.list_state.selected() {
-                Some(i) => (i + step).min(self.orch.prompts.len() - 1),
+                Some(i) => (i + step).min(self.prompts.len() - 1),
                 None => 0,
             };
             self.list_state.select(Some(i));
@@ -1052,7 +1251,7 @@ impl App {
     }
 
     fn select_half_page_up(&mut self) {
-        if self.orch.prompts.is_empty() {
+        if self.prompts.is_empty() {
             return;
         }
         let step = self.half_page_size();
@@ -1076,7 +1275,7 @@ impl App {
     }
 
     fn select_first(&mut self) {
-        if self.orch.prompts.is_empty() {
+        if self.prompts.is_empty() {
             return;
         }
         if self.filter_text.is_some() && !self.filtered_indices.is_empty() {
@@ -1088,18 +1287,16 @@ impl App {
     }
 
     fn select_last(&mut self) {
-        if self.orch.prompts.is_empty() {
+        if self.prompts.is_empty() {
             return;
         }
         if self.filter_text.is_some() && !self.filtered_indices.is_empty() {
             self.list_state
                 .select(Some(*self.filtered_indices.last().unwrap()));
         } else {
-            self.list_state.select(Some(self.orch.prompts.len() - 1));
+            self.list_state.select(Some(self.prompts.len() - 1));
         }
     }
-
-    // ── Worktree cleanup ── (handled by Orchestrator now)
 
     // ── Feature 1: Export ──
 
@@ -1115,11 +1312,12 @@ impl App {
         }
 
         let id = prompt.id;
+        let text = prompt.text.clone();
         let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let filename = home.join(format!("clhorde-output-{id}-{timestamp}.md"));
 
-        let header = format!("# clhorde output #{id}\n\nPrompt: {}\n\n---\n\n", prompt.text);
+        let header = format!("# clhorde output #{id}\n\nPrompt: {text}\n\n---\n\n");
         let content = format!("{header}{output}");
 
         match fs::write(&filename, &content) {
@@ -1142,23 +1340,20 @@ impl App {
         let Some(prompt) = self.selected_prompt() else {
             return;
         };
-        if prompt.status != PromptStatus::Completed && prompt.status != PromptStatus::Failed {
+        let s = prompt.status_enum();
+        if s != PromptStatus::Completed && s != PromptStatus::Failed {
             return;
         }
-        let text = prompt.text.clone();
-        let cwd = prompt.cwd.clone();
-        let mode = prompt.mode;
-        let wt = prompt.worktree;
-        let tags = prompt.tags.clone();
-        self.orch.retry_prompt(text, cwd, mode, wt, tags);
-        self.rebuild_filter();
+        let id = prompt.id;
+        self.send(ClientRequest::RetryPrompt { prompt_id: id });
     }
 
     fn resume_selected(&mut self) {
-        let Some(idx) = self.list_state.selected() else {
+        let Some(prompt) = self.selected_prompt() else {
             return;
         };
-        self.orch.resume_prompt(idx);
+        let id = prompt.id;
+        self.send(ClientRequest::ResumePrompt { prompt_id: id });
     }
 
     // ── Feature 4: Reorder ──
@@ -1167,35 +1362,41 @@ impl App {
         let Some(idx) = self.list_state.selected() else {
             return;
         };
-        match self.orch.move_prompt_up(idx) {
-            MoveResult::Moved { prompt_id } => {
-                self.list_state.select(Some(idx - 1));
-                self.recently_moved = Some((prompt_id, Instant::now()));
-                self.status_message = Some((format!("Moved #{prompt_id} up"), Instant::now()));
-                self.rebuild_filter();
-            }
-            MoveResult::NotMoved => {}
+        let Some(prompt) = self.prompts.get(idx) else {
+            return;
+        };
+        if prompt.status_enum() != PromptStatus::Pending || idx == 0 {
+            return;
         }
+        let prompt_id = prompt.id;
+        self.send(ClientRequest::MovePromptUp { prompt_id });
+        // Optimistic cursor move
+        self.list_state.select(Some(idx - 1));
+        self.recently_moved = Some((prompt_id, Instant::now()));
+        self.status_message = Some((format!("Moved #{prompt_id} up"), Instant::now()));
     }
 
     fn move_selected_down(&mut self) {
         let Some(idx) = self.list_state.selected() else {
             return;
         };
-        match self.orch.move_prompt_down(idx) {
-            MoveResult::Moved { prompt_id } => {
-                self.list_state.select(Some(idx + 1));
-                self.recently_moved = Some((prompt_id, Instant::now()));
-                self.status_message = Some((format!("Moved #{prompt_id} down"), Instant::now()));
-                self.rebuild_filter();
-            }
-            MoveResult::NotMoved => {}
+        let Some(prompt) = self.prompts.get(idx) else {
+            return;
+        };
+        if prompt.status_enum() != PromptStatus::Pending || idx >= self.prompts.len() - 1 {
+            return;
         }
+        let prompt_id = prompt.id;
+        self.send(ClientRequest::MovePromptDown { prompt_id });
+        // Optimistic cursor move
+        self.list_state.select(Some(idx + 1));
+        self.recently_moved = Some((prompt_id, Instant::now()));
+        self.status_message = Some((format!("Moved #{prompt_id} down"), Instant::now()));
     }
 
     // ── Feature 5: Filter ──
 
-    fn rebuild_filter(&mut self) {
+    pub fn rebuild_filter(&mut self) {
         self.filtered_indices = match &self.filter_text {
             Some(filter) => {
                 let mut tag_filters = Vec::new();
@@ -1211,8 +1412,7 @@ impl App {
                 }
                 let text_filter = text_parts.join(" ");
 
-                self.orch
-                    .prompts
+                self.prompts
                     .iter()
                     .enumerate()
                     .filter(|(_, p)| {
@@ -1226,7 +1426,7 @@ impl App {
                     .map(|(i, _)| i)
                     .collect()
             }
-            None => (0..self.orch.prompts.len()).collect(),
+            None => (0..self.prompts.len()).collect(),
         };
     }
 
@@ -1270,7 +1470,7 @@ impl App {
         let lo = a.min(b);
         let hi = a.max(b);
         for idx in lo..=hi {
-            if let Some(prompt) = self.orch.prompts.get(idx) {
+            if let Some(prompt) = self.prompts.get(idx) {
                 self.selected_ids.insert(prompt.id);
             }
         }
@@ -1279,16 +1479,43 @@ impl App {
     // ── Batch operations ──
 
     fn batch_retry(&mut self) {
-        let count = self.orch.batch_retry_prompts(&self.selected_ids);
+        let eligible: Vec<usize> = self
+            .prompts
+            .iter()
+            .filter(|p| {
+                self.selected_ids.contains(&p.id) && {
+                    let s = p.status_enum();
+                    s == PromptStatus::Completed || s == PromptStatus::Failed
+                }
+            })
+            .map(|p| p.id)
+            .collect();
+        let count = eligible.len();
+        for id in eligible {
+            self.send(ClientRequest::RetryPrompt { prompt_id: id });
+        }
         self.clear_selection();
-        self.rebuild_filter();
         if count > 0 {
             self.status_message = Some((format!("Retried {count} prompts"), Instant::now()));
         }
     }
 
     fn batch_kill(&mut self) {
-        let count = self.orch.batch_kill_prompts(&self.selected_ids);
+        let eligible: Vec<usize> = self
+            .prompts
+            .iter()
+            .filter(|p| {
+                self.selected_ids.contains(&p.id) && {
+                    let s = p.status_enum();
+                    s == PromptStatus::Running || s == PromptStatus::Idle
+                }
+            })
+            .map(|p| p.id)
+            .collect();
+        let count = eligible.len();
+        for id in eligible {
+            self.send(ClientRequest::KillWorker { prompt_id: id });
+        }
         self.clear_selection();
         if count > 0 {
             self.status_message = Some((format!("Killed {count} workers"), Instant::now()));
@@ -1296,17 +1523,31 @@ impl App {
     }
 
     fn execute_batch_delete(&mut self) {
-        let count = self.orch.batch_delete_prompts(&self.selected_ids);
+        let ids: Vec<usize> = self.selected_ids.iter().copied().collect();
+        let count = ids.len();
+        for id in ids {
+            self.send(ClientRequest::DeletePrompt { prompt_id: id });
+        }
         self.clear_selection();
-        self.rebuild_filter();
-        self.clamp_selection_to_filter();
         if count > 0 {
             self.status_message = Some((format!("Deleted {count} prompts"), Instant::now()));
         }
     }
 
     fn batch_toggle_mode(&mut self) {
-        let count = self.orch.batch_toggle_mode_prompts(&self.selected_ids);
+        let eligible: Vec<(usize, PromptMode)> = self
+            .prompts
+            .iter()
+            .filter(|p| self.selected_ids.contains(&p.id) && p.status_enum() == PromptStatus::Pending)
+            .map(|p| (p.id, p.mode_enum().toggle()))
+            .collect();
+        let count = eligible.len();
+        for (id, new_mode) in eligible {
+            self.send(ClientRequest::SetPromptMode {
+                prompt_id: id,
+                mode: new_mode.label().to_string(),
+            });
+        }
         self.clear_selection();
         if count > 0 {
             self.status_message =
@@ -1410,19 +1651,46 @@ impl App {
 mod tests {
     use super::*;
     use crate::keymap::Keymap;
-    use crate::orchestrator::Orchestrator;
-    use crate::worker::WorkerMessage;
     use clhorde_core::prompt::PromptMode;
+    use clhorde_core::protocol::PromptInfo;
 
-    /// Test-only constructor that skips persistence loading.
-    fn new_test_app() -> App {
-        let orch = Orchestrator::new_test();
-        let mut list_state = ListState::default();
-        list_state.select(None);
-        App {
-            orch,
+    fn make_prompt_info(id: usize, text: &str) -> PromptInfo {
+        PromptInfo {
+            id,
+            text: text.to_string(),
+            cwd: None,
+            mode: "interactive".to_string(),
+            status: "Pending".to_string(),
+            output: None,
+            error: None,
+            worktree: false,
+            worktree_path: None,
+            session_id: None,
+            tags: Vec::new(),
+            queue_rank: id as f64,
+            seen: false,
+            resume: false,
+            output_len: 0,
+            elapsed_secs: None,
+            uuid: format!("test-uuid-{id}"),
+            has_pty: false,
+        }
+    }
+
+    /// Test-only constructor that skips persistence loading and uses a dummy daemon_tx.
+    fn new_test_app() -> (App, mpsc::UnboundedReceiver<ClientRequest>) {
+        let (daemon_tx, daemon_rx) = mpsc::unbounded_channel();
+        let mut app = App {
+            prompts: Vec::new(),
+            daemon_tx,
+            pty_renderers: HashMap::new(),
+            max_workers: 3,
+            active_workers: 0,
+            default_mode: PromptMode::Interactive,
+            connected: true,
+
             mode: AppMode::Normal,
-            list_state,
+            list_state: ListState::default(),
             input: TextBuffer::new(),
             open_external_editor: false,
             scroll_offset: 0,
@@ -1459,6 +1727,16 @@ mod tests {
             selected_ids: HashSet::new(),
             visual_select_active: false,
             confirm_batch_delete: false,
+        };
+        app.list_state.select(None);
+        (app, daemon_rx)
+    }
+
+    fn add_test_prompt(app: &mut App, id: usize, text: &str) {
+        app.prompts.push(make_prompt_info(id, text));
+        app.rebuild_filter();
+        if app.list_state.selected().is_none() {
+            app.list_state.select(Some(0));
         }
     }
 
@@ -1466,56 +1744,55 @@ mod tests {
 
     #[test]
     fn app_new_defaults() {
-        let app = new_test_app();
-        assert_eq!(app.orch.max_workers, 3);
-        assert_eq!(app.orch.active_workers, 0);
+        let (app, _rx) = new_test_app();
+        assert_eq!(app.max_workers, 3);
+        assert_eq!(app.active_workers, 0);
         assert_eq!(app.mode, AppMode::Normal);
         assert!(app.auto_scroll);
-        assert!(app.orch.prompts.is_empty());
-        assert_eq!(app.orch.next_id, 1);
+        assert!(app.prompts.is_empty());
         assert!(!app.should_quit);
         assert!(!app.confirm_quit);
-        assert_eq!(app.orch.default_mode, PromptMode::Interactive);
+        assert_eq!(app.default_mode, PromptMode::Interactive);
         assert!(app.filter_text.is_none());
         assert!(app.history_index.is_none());
     }
 
-    // ── add_prompt / pending_count / completed_count ──
+    // ── add_prompt sends SubmitPrompt ──
 
     #[test]
-    fn add_prompt_increments_id() {
-        let mut app = new_test_app();
-        app.add_prompt("first".to_string(), None, false, Vec::new());
-        app.add_prompt("second".to_string(), None, false, Vec::new());
-        app.add_prompt("third".to_string(), None, false, Vec::new());
-
-        assert_eq!(app.orch.prompts.len(), 3);
-        assert_eq!(app.orch.prompts[0].id, 1);
-        assert_eq!(app.orch.prompts[1].id, 2);
-        assert_eq!(app.orch.prompts[2].id, 3);
-        assert_eq!(app.orch.next_id, 4);
+    fn add_prompt_sends_submit() {
+        let (mut app, mut rx) = new_test_app();
+        app.add_prompt("test prompt".to_string(), None, false, Vec::new());
+        let msg = rx.try_recv().unwrap();
+        assert!(matches!(msg, ClientRequest::SubmitPrompt { .. }));
     }
 
+    // ── PromptAdded event adds to list ──
+
     #[test]
-    fn add_prompt_selects_first() {
-        let mut app = new_test_app();
-        assert!(app.list_state.selected().is_none());
-        app.add_prompt("test".to_string(), None, false, Vec::new());
+    fn prompt_added_event() {
+        let (mut app, _rx) = new_test_app();
+        let info = make_prompt_info(1, "hello");
+        app.apply_event(DaemonEvent::PromptAdded(info));
+        assert_eq!(app.prompts.len(), 1);
+        assert_eq!(app.prompts[0].text, "hello");
         assert_eq!(app.list_state.selected(), Some(0));
     }
 
+    // ── Counts ──
+
     #[test]
     fn pending_and_completed_counts() {
-        let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None, false, Vec::new());
-        app.add_prompt("b".to_string(), None, false, Vec::new());
-        app.add_prompt("c".to_string(), None, false, Vec::new());
+        let (mut app, _rx) = new_test_app();
+        add_test_prompt(&mut app, 1, "a");
+        add_test_prompt(&mut app, 2, "b");
+        add_test_prompt(&mut app, 3, "c");
 
         assert_eq!(app.pending_count(), 3);
         assert_eq!(app.completed_count(), 0);
 
-        app.orch.prompts[0].status = PromptStatus::Completed;
-        app.orch.prompts[1].status = PromptStatus::Failed;
+        app.prompts[0].status = "Completed".to_string();
+        app.prompts[1].status = "Failed".to_string();
 
         assert_eq!(app.pending_count(), 1);
         assert_eq!(app.completed_count(), 2);
@@ -1525,23 +1802,23 @@ mod tests {
 
     #[test]
     fn select_next_empty_list() {
-        let mut app = new_test_app();
+        let (mut app, _rx) = new_test_app();
         app.select_next(); // should not panic
         assert!(app.list_state.selected().is_none());
     }
 
     #[test]
     fn select_prev_empty_list() {
-        let mut app = new_test_app();
+        let (mut app, _rx) = new_test_app();
         app.select_prev(); // should not panic
         assert!(app.list_state.selected().is_none());
     }
 
     #[test]
     fn select_next_clamps_to_end() {
-        let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None, false, Vec::new());
-        app.add_prompt("b".to_string(), None, false, Vec::new());
+        let (mut app, _rx) = new_test_app();
+        add_test_prompt(&mut app, 1, "a");
+        add_test_prompt(&mut app, 2, "b");
         app.list_state.select(Some(1));
 
         app.select_next();
@@ -1550,9 +1827,9 @@ mod tests {
 
     #[test]
     fn select_prev_clamps_to_start() {
-        let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None, false, Vec::new());
-        app.add_prompt("b".to_string(), None, false, Vec::new());
+        let (mut app, _rx) = new_test_app();
+        add_test_prompt(&mut app, 1, "a");
+        add_test_prompt(&mut app, 2, "b");
         app.list_state.select(Some(0));
 
         app.select_prev();
@@ -1561,10 +1838,10 @@ mod tests {
 
     #[test]
     fn select_next_advances() {
-        let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None, false, Vec::new());
-        app.add_prompt("b".to_string(), None, false, Vec::new());
-        app.add_prompt("c".to_string(), None, false, Vec::new());
+        let (mut app, _rx) = new_test_app();
+        add_test_prompt(&mut app, 1, "a");
+        add_test_prompt(&mut app, 2, "b");
+        add_test_prompt(&mut app, 3, "c");
         app.list_state.select(Some(0));
 
         app.select_next();
@@ -1575,9 +1852,9 @@ mod tests {
 
     #[test]
     fn select_prev_goes_back() {
-        let mut app = new_test_app();
-        app.add_prompt("a".to_string(), None, false, Vec::new());
-        app.add_prompt("b".to_string(), None, false, Vec::new());
+        let (mut app, _rx) = new_test_app();
+        add_test_prompt(&mut app, 1, "a");
+        add_test_prompt(&mut app, 2, "b");
         app.list_state.select(Some(1));
 
         app.select_prev();
@@ -1586,71 +1863,69 @@ mod tests {
 
     // ── move_selected_up / move_selected_down ──
 
-    fn app_with_prompts(texts: &[&str]) -> App {
-        let mut app = new_test_app();
-        for t in texts {
-            app.add_prompt(t.to_string(), None, false, Vec::new());
+    fn app_with_prompts(texts: &[&str]) -> (App, mpsc::UnboundedReceiver<ClientRequest>) {
+        let (mut app, rx) = new_test_app();
+        for (i, t) in texts.iter().enumerate() {
+            add_test_prompt(&mut app, i + 1, t);
         }
-        app
+        (app, rx)
     }
 
     #[test]
-    fn move_down_swaps_pending() {
-        let mut app = app_with_prompts(&["a", "b", "c"]);
+    fn move_down_sends_request() {
+        let (mut app, mut rx) = app_with_prompts(&["a", "b", "c"]);
         app.list_state.select(Some(0));
 
         app.move_selected_down();
-        assert_eq!(app.orch.prompts[0].text, "b");
-        assert_eq!(app.orch.prompts[1].text, "a");
-        assert_eq!(app.list_state.selected(), Some(1));
+        assert_eq!(app.list_state.selected(), Some(1)); // optimistic
+        let msg = rx.try_recv().unwrap();
+        assert!(matches!(msg, ClientRequest::MovePromptDown { prompt_id: 1 }));
     }
 
     #[test]
-    fn move_up_swaps_pending() {
-        let mut app = app_with_prompts(&["a", "b", "c"]);
+    fn move_up_sends_request() {
+        let (mut app, mut rx) = app_with_prompts(&["a", "b", "c"]);
         app.list_state.select(Some(2));
 
         app.move_selected_up();
-        assert_eq!(app.orch.prompts[1].text, "c");
-        assert_eq!(app.orch.prompts[2].text, "b");
-        assert_eq!(app.list_state.selected(), Some(1));
+        assert_eq!(app.list_state.selected(), Some(1)); // optimistic
+        let msg = rx.try_recv().unwrap();
+        assert!(matches!(msg, ClientRequest::MovePromptUp { prompt_id: 3 }));
     }
 
     #[test]
     fn move_down_at_end_is_noop() {
-        let mut app = app_with_prompts(&["a", "b"]);
+        let (mut app, mut rx) = app_with_prompts(&["a", "b"]);
         app.list_state.select(Some(1));
 
         app.move_selected_down();
-        assert_eq!(app.orch.prompts[0].text, "a");
-        assert_eq!(app.orch.prompts[1].text, "b");
         assert_eq!(app.list_state.selected(), Some(1));
+        assert!(rx.try_recv().is_err()); // no request sent
     }
 
     #[test]
     fn move_up_at_start_is_noop() {
-        let mut app = app_with_prompts(&["a", "b"]);
+        let (mut app, mut rx) = app_with_prompts(&["a", "b"]);
         app.list_state.select(Some(0));
 
         app.move_selected_up();
-        assert_eq!(app.orch.prompts[0].text, "a");
         assert_eq!(app.list_state.selected(), Some(0));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn move_non_pending_is_noop() {
-        let mut app = app_with_prompts(&["a", "b"]);
-        app.orch.prompts[0].status = PromptStatus::Running;
+        let (mut app, mut rx) = app_with_prompts(&["a", "b"]);
+        app.prompts[0].status = "Running".to_string();
         app.list_state.select(Some(0));
 
         app.move_selected_down();
-        assert_eq!(app.orch.prompts[0].text, "a");
-        assert_eq!(app.orch.prompts[1].text, "b");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn move_no_selection_is_noop() {
-        let mut app = app_with_prompts(&["a", "b"]);
+        let (mut app, _rx) = app_with_prompts(&["a", "b"]);
         app.list_state.select(None);
         app.move_selected_up(); // should not panic
         app.move_selected_down(); // should not panic
@@ -1659,67 +1934,50 @@ mod tests {
     // ── retry_selected ──
 
     #[test]
-    fn retry_completed_creates_new_prompt() {
-        let mut app = app_with_prompts(&["hello world"]);
-        app.orch.prompts[0].status = PromptStatus::Completed;
-        app.orch.prompts[0].cwd = Some("/tmp".to_string());
+    fn retry_completed_sends_request() {
+        let (mut app, mut rx) = app_with_prompts(&["hello world"]);
+        app.prompts[0].status = "Completed".to_string();
         app.list_state.select(Some(0));
 
         app.retry_selected();
-
-        assert_eq!(app.orch.prompts.len(), 2);
-        let retried = &app.orch.prompts[1];
-        assert_eq!(retried.text, "hello world");
-        assert_eq!(retried.cwd, Some("/tmp".to_string()));
-        assert_eq!(retried.status, PromptStatus::Pending);
-        assert!(retried.id > app.orch.prompts[0].id);
-    }
-
-    #[test]
-    fn retry_failed_creates_new_prompt() {
-        let mut app = app_with_prompts(&["fail"]);
-        app.orch.prompts[0].status = PromptStatus::Failed;
-        app.list_state.select(Some(0));
-
-        app.retry_selected();
-        assert_eq!(app.orch.prompts.len(), 2);
-        assert_eq!(app.orch.prompts[1].status, PromptStatus::Pending);
+        let msg = rx.try_recv().unwrap();
+        assert!(matches!(msg, ClientRequest::RetryPrompt { prompt_id: 1 }));
     }
 
     #[test]
     fn retry_running_is_noop() {
-        let mut app = app_with_prompts(&["running"]);
-        app.orch.prompts[0].status = PromptStatus::Running;
+        let (mut app, mut rx) = app_with_prompts(&["running"]);
+        app.prompts[0].status = "Running".to_string();
         app.list_state.select(Some(0));
 
         app.retry_selected();
-        assert_eq!(app.orch.prompts.len(), 1);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn retry_pending_is_noop() {
-        let mut app = app_with_prompts(&["pending"]);
+        let (mut app, mut rx) = app_with_prompts(&["pending"]);
         app.list_state.select(Some(0));
 
         app.retry_selected();
-        assert_eq!(app.orch.prompts.len(), 1);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn retry_no_selection_is_noop() {
-        let mut app = app_with_prompts(&["test"]);
-        app.orch.prompts[0].status = PromptStatus::Completed;
+        let (mut app, mut rx) = app_with_prompts(&["test"]);
+        app.prompts[0].status = "Completed".to_string();
         app.list_state.select(None);
 
         app.retry_selected();
-        assert_eq!(app.orch.prompts.len(), 1);
+        assert!(rx.try_recv().is_err());
     }
 
     // ── rebuild_filter ──
 
     #[test]
     fn filter_no_text_includes_all() {
-        let mut app = app_with_prompts(&["foo", "bar", "baz"]);
+        let (mut app, _rx) = app_with_prompts(&["foo", "bar", "baz"]);
         app.filter_text = None;
         app.rebuild_filter();
         assert_eq!(app.filtered_indices, vec![0, 1, 2]);
@@ -1727,7 +1985,7 @@ mod tests {
 
     #[test]
     fn filter_matches_case_insensitive() {
-        let mut app = app_with_prompts(&["Hello World", "goodbye", "HELLO again"]);
+        let (mut app, _rx) = app_with_prompts(&["Hello World", "goodbye", "HELLO again"]);
         app.filter_text = Some("hello".to_string());
         app.rebuild_filter();
         assert_eq!(app.filtered_indices, vec![0, 2]);
@@ -1735,7 +1993,7 @@ mod tests {
 
     #[test]
     fn filter_no_matches() {
-        let mut app = app_with_prompts(&["foo", "bar"]);
+        let (mut app, _rx) = app_with_prompts(&["foo", "bar"]);
         app.filter_text = Some("xyz".to_string());
         app.rebuild_filter();
         assert!(app.filtered_indices.is_empty());
@@ -1743,7 +2001,7 @@ mod tests {
 
     #[test]
     fn filter_partial_match() {
-        let mut app = app_with_prompts(&["refactor auth", "fix auth bug", "add tests"]);
+        let (mut app, _rx) = app_with_prompts(&["refactor auth", "fix auth bug", "add tests"]);
         app.filter_text = Some("auth".to_string());
         app.rebuild_filter();
         assert_eq!(app.filtered_indices, vec![0, 1]);
@@ -1751,7 +2009,7 @@ mod tests {
 
     #[test]
     fn clamp_selection_when_filtered_out() {
-        let mut app = app_with_prompts(&["foo", "bar", "baz"]);
+        let (mut app, _rx) = app_with_prompts(&["foo", "bar", "baz"]);
         app.list_state.select(Some(1)); // "bar" selected
         app.filter_text = Some("foo".to_string());
         app.rebuild_filter();
@@ -1761,7 +2019,7 @@ mod tests {
 
     #[test]
     fn clamp_selection_empty_filter_result() {
-        let mut app = app_with_prompts(&["foo"]);
+        let (mut app, _rx) = app_with_prompts(&["foo"]);
         app.list_state.select(Some(0));
         app.filter_text = Some("xyz".to_string());
         app.rebuild_filter();
@@ -1773,10 +2031,16 @@ mod tests {
 
     #[test]
     fn filter_by_tag() {
-        let mut app = new_test_app();
-        app.add_prompt("Fix navbar".to_string(), None, false, vec!["frontend".to_string()]);
-        app.add_prompt("Fix API".to_string(), None, false, vec!["backend".to_string()]);
-        app.add_prompt("Fix styles".to_string(), None, false, vec!["frontend".to_string()]);
+        let (mut app, _rx) = new_test_app();
+        let mut p1 = make_prompt_info(1, "Fix navbar");
+        p1.tags = vec!["frontend".to_string()];
+        app.prompts.push(p1);
+        let mut p2 = make_prompt_info(2, "Fix API");
+        p2.tags = vec!["backend".to_string()];
+        app.prompts.push(p2);
+        let mut p3 = make_prompt_info(3, "Fix styles");
+        p3.tags = vec!["frontend".to_string()];
+        app.prompts.push(p3);
         app.filter_text = Some("@frontend".to_string());
         app.rebuild_filter();
         assert_eq!(app.filtered_indices, vec![0, 2]);
@@ -1784,10 +2048,16 @@ mod tests {
 
     #[test]
     fn filter_by_tag_and_text() {
-        let mut app = new_test_app();
-        app.add_prompt("Fix navbar".to_string(), None, false, vec!["frontend".to_string()]);
-        app.add_prompt("Fix styles".to_string(), None, false, vec!["frontend".to_string()]);
-        app.add_prompt("Fix API".to_string(), None, false, vec!["backend".to_string()]);
+        let (mut app, _rx) = new_test_app();
+        let mut p1 = make_prompt_info(1, "Fix navbar");
+        p1.tags = vec!["frontend".to_string()];
+        app.prompts.push(p1);
+        let mut p2 = make_prompt_info(2, "Fix styles");
+        p2.tags = vec!["frontend".to_string()];
+        app.prompts.push(p2);
+        let mut p3 = make_prompt_info(3, "Fix API");
+        p3.tags = vec!["backend".to_string()];
+        app.prompts.push(p3);
         app.filter_text = Some("@frontend navbar".to_string());
         app.rebuild_filter();
         assert_eq!(app.filtered_indices, vec![0]);
@@ -1795,10 +2065,16 @@ mod tests {
 
     #[test]
     fn filter_by_multiple_tags() {
-        let mut app = new_test_app();
-        app.add_prompt("Fix".to_string(), None, false, vec!["frontend".to_string(), "urgent".to_string()]);
-        app.add_prompt("Fix2".to_string(), None, false, vec!["frontend".to_string()]);
-        app.add_prompt("Fix3".to_string(), None, false, vec!["backend".to_string()]);
+        let (mut app, _rx) = new_test_app();
+        let mut p1 = make_prompt_info(1, "Fix");
+        p1.tags = vec!["frontend".to_string(), "urgent".to_string()];
+        app.prompts.push(p1);
+        let mut p2 = make_prompt_info(2, "Fix2");
+        p2.tags = vec!["frontend".to_string()];
+        app.prompts.push(p2);
+        let mut p3 = make_prompt_info(3, "Fix3");
+        p3.tags = vec!["backend".to_string()];
+        app.prompts.push(p3);
         app.filter_text = Some("@frontend @urgent".to_string());
         app.rebuild_filter();
         assert_eq!(app.filtered_indices, vec![0]);
@@ -1808,7 +2084,7 @@ mod tests {
 
     #[test]
     fn history_empty_is_noop() {
-        let mut app = new_test_app();
+        let (mut app, _rx) = new_test_app();
         app.history.clear();
         app.input.set("current");
         app.history_prev();
@@ -1818,7 +2094,7 @@ mod tests {
 
     #[test]
     fn history_prev_stashes_and_navigates() {
-        let mut app = new_test_app();
+        let (mut app, _rx) = new_test_app();
         app.history = vec!["first".to_string(), "second".to_string()];
         app.input.set("typing");
 
@@ -1834,7 +2110,7 @@ mod tests {
 
     #[test]
     fn history_prev_stops_at_beginning() {
-        let mut app = new_test_app();
+        let (mut app, _rx) = new_test_app();
         app.history = vec!["only".to_string()];
         app.input.set("typing");
 
@@ -1849,7 +2125,7 @@ mod tests {
 
     #[test]
     fn history_next_restores_stash() {
-        let mut app = new_test_app();
+        let (mut app, _rx) = new_test_app();
         app.history = vec!["first".to_string(), "second".to_string()];
         app.input.set("typing");
 
@@ -1861,7 +2137,7 @@ mod tests {
 
     #[test]
     fn history_next_without_navigating_is_noop() {
-        let mut app = new_test_app();
+        let (mut app, _rx) = new_test_app();
         app.history = vec!["first".to_string()];
         app.input.set("current");
         app.history_next();
@@ -1870,7 +2146,7 @@ mod tests {
 
     #[test]
     fn history_prev_next_roundtrip() {
-        let mut app = new_test_app();
+        let (mut app, _rx) = new_test_app();
         app.history = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         app.input.set("now");
 
@@ -1916,101 +2192,63 @@ mod tests {
         assert_eq!(text, ": after colon");
     }
 
-    // ── apply_message ──
+    // ── apply_event: OutputChunk ──
 
     #[test]
     fn apply_output_chunk() {
-        let mut app = app_with_prompts(&["test"]);
-        app.orch.prompts[0].status = PromptStatus::Running;
+        let (mut app, _rx) = app_with_prompts(&["test"]);
+        app.prompts[0].status = "Running".to_string();
 
-        app.apply_message(WorkerMessage::OutputChunk {
+        app.apply_event(DaemonEvent::OutputChunk {
             prompt_id: 1,
             text: "hello ".to_string(),
         });
-        app.apply_message(WorkerMessage::OutputChunk {
+        app.apply_event(DaemonEvent::OutputChunk {
             prompt_id: 1,
             text: "world".to_string(),
         });
 
-        assert_eq!(app.orch.prompts[0].output, Some("hello world".to_string()));
+        assert_eq!(app.prompts[0].output, Some("hello world".to_string()));
     }
 
+    // ── apply_event: StateSnapshot ──
+
     #[test]
-    fn apply_turn_complete_transitions_to_idle() {
-        let mut app = app_with_prompts(&["test"]);
-        app.orch.prompts[0].status = PromptStatus::Running;
-        app.orch.prompts[0].output = Some("output".to_string());
-
-        app.apply_message(WorkerMessage::TurnComplete { prompt_id: 1 });
-
-        assert_eq!(app.orch.prompts[0].status, PromptStatus::Idle);
-        assert_eq!(app.orch.prompts[0].output, Some("output\n".to_string()));
+    fn apply_state_snapshot_replaces_prompts() {
+        let (mut app, _rx) = new_test_app();
+        let state = DaemonState {
+            prompts: vec![
+                make_prompt_info(1, "a"),
+                make_prompt_info(2, "b"),
+            ],
+            max_workers: 5,
+            active_workers: 2,
+            default_mode: "one-shot".to_string(),
+        };
+        app.apply_event(DaemonEvent::StateSnapshot(state));
+        assert_eq!(app.prompts.len(), 2);
+        assert_eq!(app.max_workers, 5);
+        assert_eq!(app.active_workers, 2);
+        assert_eq!(app.default_mode, PromptMode::OneShot);
     }
 
-    #[test]
-    fn apply_finished_success() {
-        let mut app = app_with_prompts(&["test"]);
-        app.orch.prompts[0].status = PromptStatus::Running;
-        app.orch.active_workers = 1;
-
-        app.apply_message(WorkerMessage::Finished {
-            prompt_id: 1,
-            exit_code: Some(0),
-        });
-
-        assert_eq!(app.orch.prompts[0].status, PromptStatus::Completed);
-        assert!(app.orch.prompts[0].finished_at_ms.is_some());
-        assert_eq!(app.orch.active_workers, 0);
-    }
+    // ── apply_event: PromptRemoved ──
 
     #[test]
-    fn apply_finished_failure() {
-        let mut app = app_with_prompts(&["test"]);
-        app.orch.prompts[0].status = PromptStatus::Running;
-        app.orch.active_workers = 1;
+    fn apply_prompt_removed() {
+        let (mut app, _rx) = app_with_prompts(&["a", "b", "c"]);
+        app.list_state.select(Some(2));
 
-        app.apply_message(WorkerMessage::Finished {
-            prompt_id: 1,
-            exit_code: Some(1),
-        });
-
-        assert_eq!(app.orch.prompts[0].status, PromptStatus::Failed);
-        assert!(app.orch.prompts[0].error.is_some());
-    }
-
-    #[test]
-    fn apply_spawn_error() {
-        let mut app = app_with_prompts(&["test"]);
-        app.orch.active_workers = 1;
-
-        app.apply_message(WorkerMessage::SpawnError {
-            prompt_id: 1,
-            error: "not found".to_string(),
-        });
-
-        assert_eq!(app.orch.prompts[0].status, PromptStatus::Failed);
-        assert_eq!(app.orch.prompts[0].error, Some("not found".to_string()));
-        assert_eq!(app.orch.active_workers, 0);
-    }
-
-    #[test]
-    fn output_chunk_on_idle_transitions_to_running() {
-        let mut app = app_with_prompts(&["test"]);
-        app.orch.prompts[0].status = PromptStatus::Idle;
-
-        app.apply_message(WorkerMessage::OutputChunk {
-            prompt_id: 1,
-            text: "more".to_string(),
-        });
-
-        assert_eq!(app.orch.prompts[0].status, PromptStatus::Running);
+        app.apply_event(DaemonEvent::PromptRemoved { prompt_id: 3 });
+        assert_eq!(app.prompts.len(), 2);
+        assert_eq!(app.list_state.selected(), Some(1)); // clamped
     }
 
     // ── select_first / select_last ──
 
     #[test]
     fn select_first_goes_to_zero() {
-        let mut app = app_with_prompts(&["a", "b", "c", "d", "e"]);
+        let (mut app, _rx) = app_with_prompts(&["a", "b", "c", "d", "e"]);
         app.list_state.select(Some(3));
 
         app.select_first();
@@ -2019,7 +2257,7 @@ mod tests {
 
     #[test]
     fn select_last_goes_to_end() {
-        let mut app = app_with_prompts(&["a", "b", "c", "d", "e"]);
+        let (mut app, _rx) = app_with_prompts(&["a", "b", "c", "d", "e"]);
         app.list_state.select(Some(1));
 
         app.select_last();
@@ -2028,31 +2266,31 @@ mod tests {
 
     #[test]
     fn select_first_empty_is_noop() {
-        let mut app = new_test_app();
+        let (mut app, _rx) = new_test_app();
         app.select_first();
         assert!(app.list_state.selected().is_none());
     }
 
     #[test]
     fn select_last_empty_is_noop() {
-        let mut app = new_test_app();
+        let (mut app, _rx) = new_test_app();
         app.select_last();
         assert!(app.list_state.selected().is_none());
     }
 
     // ── select_half_page_down / select_half_page_up ──
 
-    fn app_with_many_prompts(n: usize) -> App {
-        let mut app = new_test_app();
+    fn app_with_many_prompts(n: usize) -> (App, mpsc::UnboundedReceiver<ClientRequest>) {
+        let (mut app, rx) = new_test_app();
         for i in 0..n {
-            app.add_prompt(format!("prompt {i}"), None, false, Vec::new());
+            add_test_prompt(&mut app, i + 1, &format!("prompt {i}"));
         }
-        app
+        (app, rx)
     }
 
     #[test]
     fn half_page_down_jumps_by_half_list_height() {
-        let mut app = app_with_many_prompts(50);
+        let (mut app, _rx) = app_with_many_prompts(50);
         app.list_height = 22; // inner height = 20, half = 10
         app.list_state.select(Some(0));
 
@@ -2062,7 +2300,7 @@ mod tests {
 
     #[test]
     fn half_page_up_jumps_by_half_list_height() {
-        let mut app = app_with_many_prompts(50);
+        let (mut app, _rx) = app_with_many_prompts(50);
         app.list_height = 22;
         app.list_state.select(Some(30));
 
@@ -2072,7 +2310,7 @@ mod tests {
 
     #[test]
     fn half_page_down_clamps_to_end() {
-        let mut app = app_with_many_prompts(10);
+        let (mut app, _rx) = app_with_many_prompts(10);
         app.list_height = 22;
         app.list_state.select(Some(5));
 
@@ -2082,7 +2320,7 @@ mod tests {
 
     #[test]
     fn half_page_up_clamps_to_start() {
-        let mut app = app_with_many_prompts(10);
+        let (mut app, _rx) = app_with_many_prompts(10);
         app.list_height = 22;
         app.list_state.select(Some(3));
 
@@ -2092,7 +2330,7 @@ mod tests {
 
     #[test]
     fn half_page_empty_is_noop() {
-        let mut app = new_test_app();
+        let (mut app, _rx) = new_test_app();
         app.select_half_page_down();
         app.select_half_page_up();
         assert!(app.list_state.selected().is_none());
@@ -2100,7 +2338,7 @@ mod tests {
 
     #[test]
     fn half_page_defaults_to_10_when_no_height() {
-        let mut app = app_with_many_prompts(50);
+        let (mut app, _rx) = app_with_many_prompts(50);
         app.list_height = 0; // not rendered yet
         app.list_state.select(Some(0));
 
@@ -2112,7 +2350,7 @@ mod tests {
 
     #[test]
     fn select_first_with_filter() {
-        let mut app = app_with_prompts(&["foo", "bar", "foo2", "baz", "foo3"]);
+        let (mut app, _rx) = app_with_prompts(&["foo", "bar", "foo2", "baz", "foo3"]);
         app.filter_text = Some("foo".to_string());
         app.rebuild_filter();
         app.list_state.select(Some(4));
@@ -2123,7 +2361,7 @@ mod tests {
 
     #[test]
     fn select_last_with_filter() {
-        let mut app = app_with_prompts(&["foo", "bar", "foo2", "baz", "foo3"]);
+        let (mut app, _rx) = app_with_prompts(&["foo", "bar", "foo2", "baz", "foo3"]);
         app.filter_text = Some("foo".to_string());
         app.rebuild_filter();
         app.list_state.select(Some(0));
@@ -2135,7 +2373,7 @@ mod tests {
     #[test]
     fn half_page_down_with_filter() {
         let texts: Vec<&str> = (0..30).map(|i| if i % 2 == 0 { "even" } else { "odd" }).collect();
-        let mut app = app_with_prompts(&texts);
+        let (mut app, _rx) = app_with_prompts(&texts);
         app.filter_text = Some("even".to_string());
         app.rebuild_filter();
         app.list_height = 22;
