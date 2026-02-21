@@ -120,18 +120,26 @@
 
       <div class="cheat-grid">
         <div class="cheat-card">
-          <div class="cheat-card-header cli">CLI Commands</div>
+          <div class="cheat-card-header cli">Binaries</div>
           <table>
+            <tr><td><code>clhorded &amp;</code></td><td>Start daemon (background)</td></tr>
             <tr><td><code>clhorde</code></td><td>Launch TUI</td></tr>
+            <tr><td><code>clhorde-cli</code></td><td>CLI tool</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header cli">CLI Commands (clhorde-cli)</div>
+          <table>
+            <tr><td><code>submit "text"</code></td><td>Submit prompt to daemon</td></tr>
+            <tr><td><code>status</code></td><td>Show daemon status</td></tr>
+            <tr><td><code>attach &lt;id&gt;</code></td><td>Stream prompt output</td></tr>
             <tr><td><code>store list</code></td><td>List stored prompts</td></tr>
             <tr><td><code>store drop all</code></td><td>Drop all prompts</td></tr>
             <tr><td><code>store clean-worktrees</code></td><td>Clean worktrees</td></tr>
             <tr><td><code>keys list</code></td><td>List keybindings</td></tr>
-            <tr><td><code>keys set &lt;m&gt; &lt;a&gt; &lt;k&gt;</code></td><td>Set a keybinding</td></tr>
             <tr><td><code>qp add &lt;k&gt; &lt;msg&gt;</code></td><td>Add quick prompt</td></tr>
             <tr><td><code>config init</code></td><td>Create default config</td></tr>
-            <tr><td><code>config edit</code></td><td>Open config in editor</td></tr>
-            <tr><td><code>prompt-from-files &lt;f&gt;</code></td><td>Load prompts from files (worktree auto)</td></tr>
           </table>
         </div>
 
@@ -142,6 +150,8 @@
             <tr><td><code>keymap.toml</code></td><td>Keys, settings, quick prompts</td></tr>
             <tr><td><code>templates.toml</code></td><td>Prompt templates</td></tr>
             <tr><td><code>~/.local/share/clhorde/</code></td><td>Data directory</td></tr>
+            <tr><td><code>daemon.sock</code></td><td>Daemon Unix socket</td></tr>
+            <tr><td><code>daemon.pid</code></td><td>Daemon PID file</td></tr>
           </table>
           <table>
             <tr><td>&#10004;</td><td>Completed</td></tr>

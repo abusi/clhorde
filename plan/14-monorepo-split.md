@@ -830,7 +830,7 @@ uuid.workspace = true
 
 **Verification:** `clhorded` starts, accepts connections, test client receives events. Workers spawn and produce output visible through test client.
 
-### Phase 4: TUI Connects to Daemon
+### Phase 4: TUI Connects to Daemon ✅ DONE
 
 22. Implement `ipc_client.rs` in TUI: async connect, frame splitting (JSON vs binary PTY)
 23. Implement `pty_renderer.rs`: local `Term` instances, `feed_bytes()`, `get_term()`
@@ -842,7 +842,7 @@ uuid.workspace = true
 
 **Verification:** Full workflow: submit, view, interact, retry, resume, kill, filter, export. PTY rendering works. Multiple TUI connections to same daemon.
 
-### Phase 5: New CLI Commands + Polish
+### Phase 5: New CLI Commands + Polish ✅ DONE
 
 29. Add `clhorde-cli store {list, count, path, drop, keep, clean-worktrees}` — all go through daemon via new `ClientRequest` variants
 30. Add `clhorde-cli submit "prompt"` — connect to daemon, submit, print ID

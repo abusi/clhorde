@@ -25,22 +25,82 @@
 
   <main>
     <h1>CLI Reference</h1>
-    <p class="lead">All subcommands for managing clhorde outside the TUI.</p>
+    <p class="lead">Command-line tools for managing clhorde. The system uses three binaries: <code>clhorded</code> (daemon), <code>clhorde</code> (TUI), and <code>clhorde-cli</code> (CLI).</p>
 
-    <pre><code><span class="tok-prompt">$ </span>clhorde [command] [options]</code></pre>
+    <div class="callout info">
+      <div class="callout-title">Daemon required</div>
+      <p>Most <code>clhorde-cli</code> commands require the <code>clhorded</code> daemon to be running. Start it with: <code>clhorded &amp;</code></p>
+      <p>Local config commands (<code>qp</code>, <code>keys</code>, <code>config</code>) work without the daemon.</p>
+    </div>
 
-    <p>Running <code>clhorde</code> with no arguments launches the TUI. Subcommands provide non-interactive management.</p>
+    <hr>
+
+    <!-- ── submit ── -->
+    <section id="submit">
+      <h2><code>clhorde-cli submit</code></h2>
+      <p>Submit a prompt to the running daemon. Requires <code>clhorded</code>.</p>
+
+      <h3>Synopsis</h3>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli submit "prompt text" [--mode interactive|one-shot] [--cwd path] [--worktree]</code></pre>
+
+      <h3>Options</h3>
+      <table>
+        <tr><td><code>--mode &lt;mode&gt;</code></td><td>Prompt mode: <code>interactive</code> (default) or <code>one-shot</code></td></tr>
+        <tr><td><code>--cwd &lt;path&gt;</code></td><td>Working directory for the prompt</td></tr>
+        <tr><td><code>--worktree</code></td><td>Enable git worktree isolation</td></tr>
+      </table>
+
+      <h3>Examples</h3>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli submit "Review the auth module"
+Submitted prompt #1
+
+<span class="tok-prompt">$ </span>clhorde-cli submit "Fix login bug" --mode one-shot --worktree
+Submitted prompt #2
+
+<span class="tok-prompt">$ </span>clhorde-cli submit "Explain this code" --cwd /path/to/project
+Submitted prompt #3</code></pre>
+    </section>
+
+    <hr>
+
+    <!-- ── status ── -->
+    <section id="status">
+      <h2><code>clhorde-cli status</code></h2>
+      <p>Show daemon status and prompt summary. Requires <code>clhorded</code>.</p>
+
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli status
+Workers: 2/3 active
+Mode: interactive
+
+ID   STATUS         MODE          PROMPT
+----------------------------------------------------------------------
+1    &#10004; completed   interactive   Review the auth module...
+2    &#8635; running      interactive   Fix the login bug...</code></pre>
+    </section>
+
+    <hr>
+
+    <!-- ── attach ── -->
+    <section id="attach">
+      <h2><code>clhorde-cli attach &lt;id&gt;</code></h2>
+      <p>Attach to a prompt and stream its output to stdout. Requires <code>clhorded</code>.</p>
+
+      <p>For completed/failed prompts, prints the full output and exits. For running prompts, streams live output until the worker finishes.</p>
+
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli attach 1
+<span class="tok-cmt"># Output streams to stdout...</span></code></pre>
+    </section>
 
     <hr>
 
     <!-- ── store ── -->
     <section id="store">
-      <h2><code>clhorde store</code></h2>
-      <p>Manage persisted prompts stored in <code>~/.local/share/clhorde/prompts/</code>.</p>
+      <h2><code>clhorde-cli store</code></h2>
+      <p>Manage persisted prompts. All store commands route through the daemon. Requires <code>clhorded</code>.</p>
 
       <h3><code>store list</code></h3>
       <p>List all stored prompts with their UUID, state, mode, and truncated prompt text.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde store list
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli store list
 UUID                                   STATE       MODE          PROMPT
 ----------------------------------------------------------------------
 019462ab-...                           completed   interactive   Review auth code...
@@ -48,7 +108,7 @@ UUID                                   STATE       MODE          PROMPT
 
       <h3><code>store count</code></h3>
       <p>Show prompt counts grouped by state.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde store count
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli store count
 completed: 12
 failed: 3
 pending: 2
@@ -56,29 +116,29 @@ total: 17</code></pre>
 
       <h3><code>store path</code></h3>
       <p>Print the storage directory path.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde store path
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli store path
 /home/user/.local/share/clhorde/prompts</code></pre>
 
       <h3><code>store drop &lt;filter&gt;</code></h3>
       <p>Delete stored prompts matching the filter.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde store drop all          <span class="tok-cmt"># Drop everything</span>
-<span class="tok-prompt">$ </span>clhorde store drop completed    <span class="tok-cmt"># Drop completed only</span>
-<span class="tok-prompt">$ </span>clhorde store drop failed       <span class="tok-cmt"># Drop failed only</span>
-<span class="tok-prompt">$ </span>clhorde store drop pending      <span class="tok-cmt"># Drop pending only</span>
-<span class="tok-prompt">$ </span>clhorde store drop running      <span class="tok-cmt"># Drop running only</span></code></pre>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli store drop all          <span class="tok-cmt"># Drop everything</span>
+<span class="tok-prompt">$ </span>clhorde-cli store drop completed    <span class="tok-cmt"># Drop completed only</span>
+<span class="tok-prompt">$ </span>clhorde-cli store drop failed       <span class="tok-cmt"># Drop failed only</span>
+<span class="tok-prompt">$ </span>clhorde-cli store drop pending      <span class="tok-cmt"># Drop pending only</span>
+<span class="tok-prompt">$ </span>clhorde-cli store drop running      <span class="tok-cmt"># Drop running only</span></code></pre>
 
       <p><strong>Valid filters:</strong> <code>all</code>, <code>completed</code>, <code>failed</code>, <code>pending</code>, <code>running</code></p>
 
       <h3><code>store keep &lt;filter&gt;</code></h3>
       <p>Keep only prompts matching the filter, delete everything else.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde store keep completed    <span class="tok-cmt"># Keep completed, drop rest</span>
-<span class="tok-prompt">$ </span>clhorde store keep failed       <span class="tok-cmt"># Keep failed, drop rest</span></code></pre>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli store keep completed    <span class="tok-cmt"># Keep completed, drop rest</span>
+<span class="tok-prompt">$ </span>clhorde-cli store keep failed       <span class="tok-cmt"># Keep failed, drop rest</span></code></pre>
 
       <p><strong>Valid filters:</strong> <code>completed</code>, <code>failed</code>, <code>pending</code>, <code>running</code></p>
 
       <h3><code>store clean-worktrees</code></h3>
       <p>Scan all persisted prompts for associated git worktree paths and remove them via <code>git worktree remove</code>. Clears the <code>worktree_path</code> from each prompt file.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde store clean-worktrees
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli store clean-worktrees
   removed: /home/user/projects/myrepo-wt-3/
   skip (already gone): /home/user/projects/myrepo-wt-5/
 Cleaned 1 worktree(s), 1 already gone, 0 error(s).</code></pre>
@@ -88,25 +148,25 @@ Cleaned 1 worktree(s), 1 already gone, 0 error(s).</code></pre>
 
     <!-- ── keys ── -->
     <section id="keys">
-      <h2><code>clhorde keys</code></h2>
-      <p>Manage keybindings without editing TOML by hand.</p>
+      <h2><code>clhorde-cli keys</code></h2>
+      <p>Manage keybindings without editing TOML by hand. Works without the daemon.</p>
 
       <h3><code>keys list [mode]</code></h3>
       <p>List all keybindings, or bindings for a specific mode.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde keys list              <span class="tok-cmt"># All modes</span>
-<span class="tok-prompt">$ </span>clhorde keys list normal       <span class="tok-cmt"># Normal mode only</span></code></pre>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli keys list              <span class="tok-cmt"># All modes</span>
+<span class="tok-prompt">$ </span>clhorde-cli keys list normal       <span class="tok-cmt"># Normal mode only</span></code></pre>
 
       <p>Output format matches TOML syntax so you can copy-paste into your config.</p>
 
       <h3><code>keys set &lt;mode&gt; &lt;action&gt; &lt;key1&gt; [key2...]</code></h3>
       <p>Set the keys for an action. Replaces any existing keys.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde keys set normal quit Q          <span class="tok-cmt"># Remap quit to Q</span>
-<span class="tok-prompt">$ </span>clhorde keys set view back Esc q        <span class="tok-cmt"># Multiple keys</span></code></pre>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli keys set normal quit Q          <span class="tok-cmt"># Remap quit to Q</span>
+<span class="tok-prompt">$ </span>clhorde-cli keys set view back Esc q        <span class="tok-cmt"># Multiple keys</span></code></pre>
 
       <h3><code>keys reset &lt;mode&gt; [action]</code></h3>
       <p>Reset bindings to defaults. Without an action, resets the entire mode.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde keys reset normal quit          <span class="tok-cmt"># Reset one action</span>
-<span class="tok-prompt">$ </span>clhorde keys reset normal               <span class="tok-cmt"># Reset entire mode</span></code></pre>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli keys reset normal quit          <span class="tok-cmt"># Reset one action</span>
+<span class="tok-prompt">$ </span>clhorde-cli keys reset normal               <span class="tok-cmt"># Reset entire mode</span></code></pre>
 
       <h3>Valid modes</h3>
       <p><code>normal</code>, <code>insert</code>, <code>view</code>, <code>interact</code>, <code>filter</code></p>
@@ -128,24 +188,24 @@ Cleaned 1 worktree(s), 1 already gone, 0 error(s).</code></pre>
 
     <!-- ── qp ── -->
     <section id="qp">
-      <h2><code>clhorde qp</code></h2>
-      <p>Manage quick prompts&mdash;single-keypress messages for running workers.</p>
+      <h2><code>clhorde-cli qp</code></h2>
+      <p>Manage quick prompts&mdash;single-keypress messages for running workers. Works without the daemon.</p>
 
       <h3><code>qp list</code></h3>
       <p>List all configured quick prompts.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde qp list
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli qp list
 c = "continue"
 g = "let's go"
 y = "yes"</code></pre>
 
       <h3><code>qp add &lt;key&gt; &lt;message...&gt;</code></h3>
       <p>Add or update a quick prompt. The message is everything after the key.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde qp add g <span class="tok-str">"let's go"</span>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli qp add g <span class="tok-str">"let's go"</span>
 Added quick prompt: g = "let's go"</code></pre>
 
       <h3><code>qp remove &lt;key&gt;</code></h3>
       <p>Remove a quick prompt.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde qp remove g
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli qp remove g
 Removed quick prompt: g</code></pre>
     </section>
 
@@ -153,24 +213,24 @@ Removed quick prompt: g</code></pre>
 
     <!-- ── config ── -->
     <section id="config">
-      <h2><code>clhorde config</code></h2>
-      <p>Manage the config file.</p>
+      <h2><code>clhorde-cli config</code></h2>
+      <p>Manage the config file. Works without the daemon.</p>
 
       <h3><code>config path</code></h3>
       <p>Print the config file path.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde config path
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli config path
 /home/user/.config/clhorde/keymap.toml</code></pre>
 
       <h3><code>config init [--force]</code></h3>
       <p>Create a config file with all default values populated. Use <code>--force</code> to overwrite an existing file.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde config init
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli config init
 Created config: /home/user/.config/clhorde/keymap.toml
 
-<span class="tok-prompt">$ </span>clhorde config init --force    <span class="tok-cmt"># Overwrite existing</span></code></pre>
+<span class="tok-prompt">$ </span>clhorde-cli config init --force    <span class="tok-cmt"># Overwrite existing</span></code></pre>
 
       <h3><code>config edit</code></h3>
       <p>Open the config file in <code>$EDITOR</code> (falls back to <code>vi</code>). Creates the file with defaults if it doesn't exist.</p>
-      <pre><code><span class="tok-prompt">$ </span>clhorde config edit</code></pre>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli config edit</code></pre>
     </section>
 
     <hr>

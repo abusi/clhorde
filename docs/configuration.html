@@ -36,6 +36,8 @@
         <tr><td><code>templates.toml</code></td><td><code>~/.config/clhorde/templates.toml</code></td><td>Prompt templates</td></tr>
         <tr><td><code>history</code></td><td><code>~/.local/share/clhorde/history</code></td><td>Prompt history (auto-managed)</td></tr>
         <tr><td><code>prompts/</code></td><td><code>~/.local/share/clhorde/prompts/</code></td><td>Per-prompt persistence (UUID v7 JSON)</td></tr>
+        <tr><td><code>daemon.sock</code></td><td><code>~/.local/share/clhorde/daemon.sock</code></td><td>Daemon Unix domain socket</td></tr>
+        <tr><td><code>daemon.pid</code></td><td><code>~/.local/share/clhorde/daemon.pid</code></td><td>Daemon PID file (stale detection)</td></tr>
       </tbody>
     </table>
 
@@ -180,10 +182,10 @@
 
     <h2 id="config-cli">Config CLI Management</h2>
 
-    <pre><code><span class="tok-prompt">$ </span>clhorde config path           <span class="tok-cmt"># Print config file path</span>
-<span class="tok-prompt">$ </span>clhorde config init           <span class="tok-cmt"># Create config with all defaults</span>
-<span class="tok-prompt">$ </span>clhorde config init --force   <span class="tok-cmt"># Overwrite existing config</span>
-<span class="tok-prompt">$ </span>clhorde config edit           <span class="tok-cmt"># Open config in $EDITOR (or vi)</span></code></pre>
+    <pre><code><span class="tok-prompt">$ </span>clhorde-cli config path           <span class="tok-cmt"># Print config file path</span>
+<span class="tok-prompt">$ </span>clhorde-cli config init           <span class="tok-cmt"># Create config with all defaults</span>
+<span class="tok-prompt">$ </span>clhorde-cli config init --force   <span class="tok-cmt"># Overwrite existing config</span>
+<span class="tok-prompt">$ </span>clhorde-cli config edit           <span class="tok-cmt"># Open config in $EDITOR (or vi)</span></code></pre>
 
     <p><code>config init</code> creates a fully populated <code>keymap.toml</code> with all default values, making it easy to see every available option.</p>
 

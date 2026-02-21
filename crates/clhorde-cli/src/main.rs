@@ -1,4 +1,5 @@
 mod commands;
+mod daemon_client;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -10,6 +11,9 @@ fn run(args: &[String]) -> i32 {
     match args.get(1).map(|s| s.as_str()) {
         Some("help") | Some("--help") | Some("-h") => cmd_help(),
         Some("store") => commands::store::cmd_store(&args[2..]),
+        Some("submit") => commands::submit::cmd_submit(&args[2..]),
+        Some("status") => commands::status::cmd_status(&args[2..]),
+        Some("attach") => commands::attach::cmd_attach(&args[2..]),
         Some("qp") => commands::qp::cmd_qp(&args[2..]),
         Some("keys") => commands::keys::cmd_keys(&args[2..]),
         Some("config") => commands::config::cmd_config(&args[2..]),
@@ -26,7 +30,15 @@ fn cmd_help() -> i32 {
     println!();
     println!("Usage: clhorde-cli <command> [options]");
     println!();
-    println!("Commands:");
+    println!("Daemon commands (requires clhorded):");
+    println!("  submit <text>       Submit a prompt to the daemon");
+    println!("    --mode <mode>     interactive (default) or one-shot");
+    println!("    --cwd <path>      Working directory for the prompt");
+    println!("    --worktree        Enable git worktree isolation");
+    println!("  status              Show daemon status and prompt summary");
+    println!("  attach <id>         Attach to a prompt and stream output");
+    println!();
+    println!("Store commands (requires clhorded):");
     println!("  store               Manage persisted prompts");
     println!("    list              List all stored prompts");
     println!("    count             Show prompt counts by state");
@@ -34,6 +46,8 @@ fn cmd_help() -> i32 {
     println!("    drop <filter>     Delete stored prompts");
     println!("    keep <filter>     Keep only matching, delete rest");
     println!("    clean-worktrees   Remove lingering git worktrees");
+    println!();
+    println!("Local commands:");
     println!("  qp                  Manage quick prompts");
     println!("    list              List all quick prompts");
     println!("    add <key> <msg>   Add a quick prompt");
@@ -54,6 +68,10 @@ fn cmd_help() -> i32 {
     println!("Filters for drop/keep: all, completed, failed, pending");
     println!();
     println!("Examples:");
+    println!("  clhorde-cli submit \"Review the auth module\"");
+    println!("  clhorde-cli submit \"Fix login bug\" --mode one-shot --worktree");
+    println!("  clhorde-cli status");
+    println!("  clhorde-cli attach 1");
     println!("  clhorde-cli store list");
     println!("  clhorde-cli store drop all");
     println!("  clhorde-cli store drop failed");
@@ -93,5 +111,18 @@ mod tests {
     #[test]
     fn run_no_args_shows_help() {
         assert_eq!(run(&["clhorde-cli".into()]), 1);
+    }
+
+    #[test]
+    fn run_dispatches_new_commands() {
+        // submit with no args → error
+        assert_eq!(run(&["clhorde-cli".into(), "submit".into()]), 1);
+        // attach with no args → error
+        assert_eq!(run(&["clhorde-cli".into(), "attach".into()]), 1);
+        // status with extra args → error
+        assert_eq!(
+            run(&["clhorde-cli".into(), "status".into(), "extra".into()]),
+            1
+        );
     }
 }
