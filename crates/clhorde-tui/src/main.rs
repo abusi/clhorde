@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod editor;
 mod keymap;
+mod orchestrator;
 mod pty_worker;
 mod ui;
 mod worker;
@@ -18,7 +19,7 @@ use tokio::sync::mpsc;
 
 use app::App;
 use cli::{CliAction, LaunchOptions};
-use worker::{SpawnResult, WorkerInput, WorkerMessage};
+use worker::{SpawnResult, WorkerMessage};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -84,9 +85,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_o
         }
 
         // Dispatch pending prompts to workers
-        while app.active_workers < app.max_workers {
-            if let Some(idx) = app.next_pending_prompt_index() {
-                let prompt = &app.prompts[idx];
+        while app.orch.active_workers < app.orch.max_workers {
+            if let Some(idx) = app.orch.next_pending_prompt_index() {
+                let prompt = &app.orch.prompts[idx];
                 let id = prompt.id;
                 let text = prompt.text.clone();
                 let mut cwd = prompt.cwd.clone();
@@ -109,13 +110,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_o
                                 Ok(wt_path) => {
                                     let wt_str = wt_path.to_string_lossy().to_string();
                                     cwd = Some(wt_str.clone());
-                                    if let Some(p) = app.prompts.get_mut(idx) {
+                                    if let Some(p) = app.orch.prompts.get_mut(idx) {
                                         p.worktree_path = Some(wt_str);
                                     }
                                 }
                                 Err(e) => {
-                                    app.mark_running(idx);
-                                    app.active_workers += 1;
+                                    app.orch.mark_running(idx);
+                                    app.orch.active_workers += 1;
                                     app.apply_message(WorkerMessage::SpawnError {
                                         prompt_id: id,
                                         error: format!("Worktree creation failed: {e}"),
@@ -125,8 +126,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_o
                             }
                         }
                         None => {
-                            app.mark_running(idx);
-                            app.active_workers += 1;
+                            app.orch.mark_running(idx);
+                            app.orch.active_workers += 1;
                             app.apply_message(WorkerMessage::SpawnError {
                                 prompt_id: id,
                                 error: "Not inside a git repository — cannot create worktree".to_string(),
@@ -136,8 +137,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_o
                     }
                 }
 
-                app.mark_running(idx);
-                app.active_workers += 1;
+                app.orch.mark_running(idx);
+                app.orch.active_workers += 1;
                 let pty_size = app.output_panel_size;
                 match worker::spawn_worker(id, text, cwd, mode, worker_tx.clone(), pty_size, resume_session_id)
                 {
@@ -145,8 +146,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_o
                         input_sender,
                         pty_handle,
                     } => {
-                        app.worker_inputs.insert(id, input_sender);
-                        app.pty_handles.insert(id, pty_handle);
+                        app.orch.worker_inputs.insert(id, input_sender);
+                        app.orch.pty_handles.insert(id, pty_handle);
                     }
                     SpawnResult::OneShot => {
                         // No input sender for one-shot
@@ -203,12 +204,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_o
         }
 
         if app.should_quit {
-            // Send Kill to all active workers
-            for (_id, sender) in app.worker_inputs.drain() {
-                let _ = sender.send(WorkerInput::Kill);
-            }
-            // Clear PTY handles (drops masters → children get SIGHUP)
-            app.pty_handles.clear();
+            app.orch.shutdown();
             // Brief sleep for cleanup
             tokio::time::sleep(Duration::from_millis(100)).await;
             return Ok(());

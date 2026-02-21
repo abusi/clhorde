@@ -68,9 +68,9 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let sep = Span::styled(" │ ", Style::default().fg(Color::DarkGray));
 
     // --- Worker utilization progress bar ---
-    let bar_width = app.max_workers.min(8); // cap visual width at 8
-    let filled = if app.max_workers > 0 {
-        (app.active_workers * bar_width).div_ceil(app.max_workers)
+    let bar_width = app.orch.max_workers.min(8); // cap visual width at 8
+    let filled = if app.orch.max_workers > 0 {
+        (app.orch.active_workers * bar_width).div_ceil(app.orch.max_workers)
     } else {
         0
     };
@@ -81,7 +81,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     // --- Condensed counters ---
     let pending = app.pending_count();
     let done = app.completed_count();
-    let total = app.prompts.len();
+    let total = app.orch.prompts.len();
 
     // --- Selected prompt inline status ---
     let selected_info: Vec<Span> = if let Some(prompt) = app.selected_prompt() {
@@ -143,7 +143,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Span::styled(bar_filled, Style::default().fg(Color::Cyan)),
         Span::styled(bar_empty, Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!(" {}/{}", app.active_workers, app.max_workers),
+            format!(" {}/{}", app.orch.active_workers, app.orch.max_workers),
             Style::default().fg(Color::Gray),
         ),
         sep.clone(),
@@ -182,8 +182,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     spans.push(sep);
     spans.push(Span::styled(
-        format!("[{}]", app.default_mode.label()),
-        Style::default().fg(match app.default_mode {
+        format!("[{}]", app.orch.default_mode.label()),
+        Style::default().fg(match app.orch.default_mode {
             PromptMode::Interactive => Color::Magenta,
             PromptMode::OneShot => Color::Yellow,
         }).add_modifier(Modifier::BOLD),
@@ -271,7 +271,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
     let items: Vec<ListItem> = visible_indices
         .iter()
         .map(|&idx| {
-            let prompt = &app.prompts[idx];
+            let prompt = &app.orch.prompts[idx];
             let elapsed = prompt
                 .elapsed_display()
                 .map(|d| format!(" ({d})"))
@@ -475,7 +475,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
     // Render prompt preview pane
     if let Some(preview_rect) = preview_area {
         if let Some(selected) = app.list_state.selected() {
-            let prompt_text = &app.prompts[selected].text;
+            let prompt_text = &app.orch.prompts[selected].text;
             let preview = Paragraph::new(prompt_text.as_str())
                 .style(Style::default().fg(Color::White))
                 .block(
@@ -496,7 +496,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
 fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     // Check if we should render the PTY grid
     if let Some(prompt) = app.selected_prompt() {
-        if let Some(pty_state) = app.pty_handles.get(&prompt.id).map(|h| h.state.clone()) {
+        if let Some(pty_state) = app.orch.pty_handles.get(&prompt.id).map(|h| h.state.clone()) {
             let id = prompt.id;
             let cwd_str = prompt.cwd.as_deref().unwrap_or(".").to_string();
             let is_pty_interact = app.mode == AppMode::PtyInteract;

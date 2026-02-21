@@ -10,7 +10,9 @@ path = "src/main.rs"
 [dependencies]
 clhorde-core.workspace = true
 tokio.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 alacritty_terminal.workspace = true
 portable-pty.workspace = true
 uuid.workspace = true
+libc = "0.2"

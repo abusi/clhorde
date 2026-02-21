@@ -10,7 +10,7 @@ toml.workspace = true
 dirs.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-crossterm = { workspace = true, default-features = false }
+crossterm = { workspace = true, default-features = false, features = ["events"] }
 
 [dev-dependencies]
 tempfile.workspace = true

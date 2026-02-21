@@ -202,8 +202,10 @@ name = "clhorde-cli"
 version = "0.2.0"
 dependencies = [
  "clhorde-core",
+ "crossterm 0.28.1",
  "serde_json",
- "tokio",
+ "tempfile",
+ "toml",
  "uuid",
 ]
 
@@ -227,7 +229,9 @@ version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "clhorde-core",
+ "libc",
  "portable-pty",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",
@@ -248,7 +252,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "toml",
  "uuid",
 ]
 

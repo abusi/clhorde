@@ -5,6 +5,15 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
+/// Controls whether git worktrees are cleaned up automatically or manually.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum WorktreeCleanup {
+    Manual,
+    Auto,
+}
+
 /// Base data directory: `~/.local/share/clhorde/`
 pub fn data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("clhorde"))
