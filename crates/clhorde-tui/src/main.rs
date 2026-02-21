@@ -2,12 +2,9 @@ mod app;
 mod cli;
 mod editor;
 mod keymap;
-mod persistence;
-mod prompt;
 mod pty_worker;
 mod ui;
 mod worker;
-mod worktree;
 
 use std::io;
 use std::time::Duration;
@@ -106,9 +103,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_o
                     let effective_cwd = cwd.as_deref()
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    match worktree::repo_root(&effective_cwd) {
+                    match clhorde_core::worktree::repo_root(&effective_cwd) {
                         Some(root) => {
-                            match worktree::create_worktree(&root, id) {
+                            match clhorde_core::worktree::create_worktree(&root, id) {
                                 Ok(wt_path) => {
                                     let wt_str = wt_path.to_string_lossy().to_string();
                                     cwd = Some(wt_str.clone());
@@ -149,10 +146,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_o
                         pty_handle,
                     } => {
                         app.worker_inputs.insert(id, input_sender);
-                        // Store PTY state on the prompt
-                        if let Some(p) = app.prompts.iter_mut().find(|p| p.id == id) {
-                            p.pty_state = Some(pty_handle.state.clone());
-                        }
                         app.pty_handles.insert(id, pty_handle);
                     }
                     SpawnResult::OneShot => {

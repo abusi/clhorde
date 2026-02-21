@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -12,9 +11,8 @@ use crate::editor::TextBuffer;
 use crate::keymap::{
     self, FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction,
 };
-use crate::worktree;
-use crate::persistence;
-use crate::prompt::{Prompt, PromptMode, PromptStatus};
+use clhorde_core::persistence;
+use clhorde_core::prompt::{Prompt, PromptMode, PromptStatus};
 use crate::pty_worker::{self, PtyHandle};
 use crate::worker::{WorkerInput, WorkerMessage};
 
@@ -123,8 +121,8 @@ impl App {
     pub fn new() -> Self {
         let mut list_state = ListState::default();
         list_state.select(None);
-        let templates = Self::load_templates();
-        let history = Self::load_history();
+        let templates = clhorde_core::config::load_templates();
+        let history = clhorde_core::config::load_history();
         let settings = keymap::load_settings();
         let max_saved_prompts = settings.max_saved_prompts.unwrap_or(100);
         let list_ratio = (settings.list_ratio.unwrap_or(40) as u16).clamp(10, 90);
@@ -356,7 +354,7 @@ impl App {
     pub fn mark_running(&mut self, index: usize) {
         if let Some(prompt) = self.prompts.get_mut(index) {
             prompt.status = PromptStatus::Running;
-            prompt.started_at = Some(Instant::now());
+            prompt.mark_started();
         }
         if let Some(prompt) = self.prompts.get(index) {
             self.persist_prompt(prompt);
@@ -405,21 +403,22 @@ impl App {
                 prompt_id,
                 exit_code,
             } => {
+                // For PTY workers: extract text from terminal grid before borrowing prompt
+                let pty_text = if let Some(handle) = self.pty_handles.get(&prompt_id) {
+                    let text = pty_worker::extract_text_from_term(&handle.state);
+                    if !text.is_empty() { Some(text) } else { None }
+                } else {
+                    None
+                };
+
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
-                    // For PTY workers: extract text from terminal grid before clearing state
-                    if prompt.pty_state.is_some() {
-                        let text = pty_worker::extract_text_from_term(
-                            prompt.pty_state.as_ref().unwrap(),
-                        );
-                        if !text.is_empty() {
-                            prompt.output = Some(text);
-                        }
-                        prompt.pty_state = None;
+                    if let Some(text) = pty_text {
+                        prompt.output = Some(text);
                     } else if let Some(output) = &mut prompt.output {
                         output.push('\n');
                     }
 
-                    prompt.finished_at = Some(Instant::now());
+                    prompt.mark_finished();
                     if exit_code == Some(0) || exit_code.is_none() {
                         prompt.status = PromptStatus::Completed;
                     } else {
@@ -447,9 +446,8 @@ impl App {
             WorkerMessage::SpawnError { prompt_id, error } => {
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
                     prompt.status = PromptStatus::Failed;
-                    prompt.finished_at = Some(Instant::now());
+                    prompt.mark_finished();
                     prompt.error = Some(error);
-                    prompt.pty_state = None;
                 }
                 self.persist_prompt_by_id(prompt_id);
                 self.maybe_cleanup_worktree(prompt_id);
@@ -647,17 +645,20 @@ impl App {
                 }
             }
             NormalAction::Interact => {
-                let target_mode = self.selected_prompt().and_then(|p| {
-                    if p.status == PromptStatus::Running || p.status == PromptStatus::Idle {
-                        if p.pty_state.is_some() {
-                            Some(AppMode::PtyInteract)
+                let target_mode = {
+                    let prompt_info = self.selected_prompt().map(|p| (p.id, p.status.clone()));
+                    prompt_info.and_then(|(id, status)| {
+                        if status == PromptStatus::Running || status == PromptStatus::Idle {
+                            if self.pty_handles.contains_key(&id) {
+                                Some(AppMode::PtyInteract)
+                            } else {
+                                Some(AppMode::Interact)
+                            }
                         } else {
-                            Some(AppMode::Interact)
+                            None
                         }
-                    } else {
-                        None
-                    }
-                });
+                    })
+                };
                 if let Some(mode) = target_mode {
                     self.scroll_offset = 0;
                     if mode == AppMode::Interact {
@@ -879,7 +880,7 @@ impl App {
                     if !text.is_empty() {
                         let (cwd, prompt_text) = Self::parse_cwd_prefix(&text);
                         if !prompt_text.is_empty() {
-                            let (tags, clean_text) = crate::prompt::parse_tags(&prompt_text);
+                            let (tags, clean_text) = clhorde_core::prompt::parse_tags(&prompt_text);
                             if !clean_text.is_empty() {
                                 self.add_prompt(clean_text, cwd, self.worktree_pending, tags);
                             }
@@ -1004,17 +1005,20 @@ impl App {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
             }
             ViewAction::Interact => {
-                let target_mode = self.selected_prompt().and_then(|p| {
-                    if p.status == PromptStatus::Running || p.status == PromptStatus::Idle {
-                        if p.pty_state.is_some() {
-                            Some(AppMode::PtyInteract)
+                let target_mode = {
+                    let prompt_info = self.selected_prompt().map(|p| (p.id, p.status.clone()));
+                    prompt_info.and_then(|(id, status)| {
+                        if status == PromptStatus::Running || status == PromptStatus::Idle {
+                            if self.pty_handles.contains_key(&id) {
+                                Some(AppMode::PtyInteract)
+                            } else {
+                                Some(AppMode::Interact)
+                            }
                         } else {
-                            Some(AppMode::Interact)
+                            None
                         }
-                    } else {
-                        None
-                    }
-                });
+                    })
+                };
                 if let Some(mode) = target_mode {
                     self.show_quick_prompts_popup = false;
                     if mode == AppMode::Interact {
@@ -1182,11 +1186,12 @@ impl App {
             return;
         }
         let id = prompt.id;
+        let is_pty = self.pty_handles.contains_key(&id);
         let Some(sender) = self.worker_inputs.get(&id) else {
             return;
         };
 
-        if prompt.pty_state.is_some() {
+        if is_pty {
             // PTY worker: send message as typed text + Enter (no echo needed,
             // the PTY terminal will show it)
             let mut bytes = message.as_bytes().to_vec();
@@ -1366,10 +1371,10 @@ impl App {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_dir() && path != wt_path
-                            && worktree::is_git_repo(&path)
+                            && clhorde_core::worktree::is_git_repo(&path)
                         {
-                            if let Some(root) = worktree::repo_root(&path) {
-                                let _ = worktree::remove_worktree(&root, &wt_path);
+                            if let Some(root) = clhorde_core::worktree::repo_root(&path) {
+                                let _ = clhorde_core::worktree::remove_worktree(&root, &wt_path);
                                 return;
                             }
                         }
@@ -1454,10 +1459,9 @@ impl App {
         prompt.resume = true;
         prompt.output = None;
         prompt.error = None;
-        prompt.started_at = None;
-        prompt.finished_at = None;
+        prompt.started_at_ms = None;
+        prompt.finished_at_ms = None;
         prompt.seen = false;
-        prompt.pty_state = None;
         if let Some(ref dir) = self.prompts_dir {
             persistence::save_prompt(dir, &self.prompts[idx].uuid, &persistence::PromptFile::from_prompt(&self.prompts[idx]));
         }
@@ -1725,49 +1729,13 @@ impl App {
 
     // ── Feature 6: History ──
 
-    fn data_dir() -> Option<PathBuf> {
-        dirs::data_dir().map(|d| d.join("clhorde"))
-    }
-
-    fn history_path() -> Option<PathBuf> {
-        Self::data_dir().map(|d| d.join("history"))
-    }
-
-    fn load_history() -> Vec<String> {
-        let Some(path) = Self::history_path() else {
-            return Vec::new();
-        };
-        match fs::read_to_string(&path) {
-            Ok(content) => content
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.replace("\\n", "\n"))
-                .collect(),
-            Err(_) => Vec::new(),
-        }
-    }
-
     fn append_history(&mut self, text: &str) {
         // Avoid duplicating the most recent entry
         if self.history.last().map(|s| s.as_str()) == Some(text) {
             return;
         }
         self.history.push(text.to_string());
-
-        // Persist to file
-        if let Some(path) = Self::history_path() {
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                let escaped = text.replace('\n', "\\n");
-                let _ = writeln!(file, "{escaped}");
-            }
-        }
+        clhorde_core::config::append_history(text);
     }
 
     fn history_prev(&mut self) {
@@ -1810,41 +1778,6 @@ impl App {
     }
 
     // ── Feature 8: Templates ──
-
-    fn templates_path() -> Option<PathBuf> {
-        let config_dir = std::env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .ok()
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| PathBuf::from(h).join(".config"))
-            })?;
-        Some(config_dir.join("clhorde").join("templates.toml"))
-    }
-
-    fn load_templates() -> HashMap<String, String> {
-        let Some(path) = Self::templates_path() else {
-            return HashMap::new();
-        };
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return HashMap::new(),
-        };
-
-        #[derive(serde::Deserialize)]
-        struct TemplateConfig {
-            templates: Option<HashMap<String, String>>,
-        }
-
-        match toml::from_str::<TemplateConfig>(&content) {
-            Ok(config) => config.templates.unwrap_or_default(),
-            Err(_) => {
-                // Try as flat key-value pairs (no [templates] section)
-                toml::from_str::<HashMap<String, String>>(&content).unwrap_or_default()
-            }
-        }
-    }
 
     fn update_template_suggestions(&mut self) {
         self.template_suggestions.clear();
@@ -2450,7 +2383,7 @@ mod tests {
         });
 
         assert_eq!(app.prompts[0].status, PromptStatus::Completed);
-        assert!(app.prompts[0].finished_at.is_some());
+        assert!(app.prompts[0].finished_at_ms.is_some());
         assert_eq!(app.active_workers, 0);
     }
 

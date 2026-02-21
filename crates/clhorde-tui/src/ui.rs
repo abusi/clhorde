@@ -10,8 +10,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use crate::app::{App, AppMode};
 use crate::keymap::{NormalAction, ViewAction};
-use crate::prompt::{PromptMode, PromptStatus};
 use crate::pty_worker::SharedPtyState;
+use clhorde_core::prompt::{PromptMode, PromptStatus};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let input_bar_height = if app.mode == AppMode::Insert && app.input.is_multiline() {
@@ -496,8 +496,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
 fn render_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     // Check if we should render the PTY grid
     if let Some(prompt) = app.selected_prompt() {
-        if prompt.pty_state.is_some() {
-            let pty_state = prompt.pty_state.clone().unwrap();
+        if let Some(pty_state) = app.pty_handles.get(&prompt.id).map(|h| h.state.clone()) {
             let id = prompt.id;
             let cwd_str = prompt.cwd.as_deref().unwrap_or(".").to_string();
             let is_pty_interact = app.mode == AppMode::PtyInteract;

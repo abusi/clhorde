@@ -7,8 +7,8 @@ use crate::keymap::{
     TomlFilterBindings, TomlInsertBindings, TomlInteractBindings, TomlNormalBindings,
     TomlViewBindings, ViewAction,
 };
-use crate::persistence;
-use crate::worktree;
+use clhorde_core::persistence;
+use clhorde_core::worktree;
 
 pub struct LaunchOptions {
     pub prompts: Vec<String>,
@@ -762,7 +762,7 @@ fn config_edit() -> i32 {
 
     // Create file with defaults if it doesn't exist
     if !path.exists() {
-        let config = keymap::default_toml_config();
+        let config = Keymap::default_toml_config();
         if let Err(e) = keymap::save_toml_config(&config) {
             eprintln!("Failed to create config file: {e}");
             return 1;
@@ -803,7 +803,7 @@ fn config_init(force: bool) -> i32 {
         return 1;
     }
 
-    let config = keymap::default_toml_config();
+    let config = Keymap::default_toml_config();
     if let Err(e) = keymap::save_toml_config(&config) {
         eprintln!("Failed to write config: {e}");
         return 1;
@@ -1150,7 +1150,7 @@ mod tests {
 
     #[test]
     fn roundtrip_serialization() {
-        let config = keymap::default_toml_config();
+        let config = Keymap::default_toml_config();
         let serialized = toml::to_string_pretty(&config).unwrap();
         let deserialized: TomlConfig = toml::from_str(&serialized).unwrap();
 
@@ -1328,7 +1328,7 @@ mod tests {
     // ── store subcommand tests ──
 
     use std::fs;
-    use crate::persistence::{PromptFile, PromptOptions};
+    use clhorde_core::persistence::{PromptFile, PromptOptions};
 
     fn temp_store_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("clhorde-cli-test-{}", uuid::Uuid::now_v7()));

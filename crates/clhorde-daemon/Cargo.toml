@@ -1,0 +1,16 @@
+[package]
+name = "clhorde-daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "clhorded"
+path = "src/main.rs"
+
+[dependencies]
+clhorde-core.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+alacritty_terminal.workspace = true
+portable-pty.workspace = true
+uuid.workspace = true

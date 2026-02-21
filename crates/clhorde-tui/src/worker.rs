@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 
 use tokio::sync::mpsc;
 
-use crate::prompt::PromptMode;
+use clhorde_core::prompt::PromptMode;
 use crate::pty_worker::PtyHandle;
 
 #[allow(dead_code)]
