@@ -3,17 +3,43 @@ use std::process::{Command, Stdio};
 
 use tokio::sync::mpsc;
 
-use crate::prompt::PromptMode;
 use crate::pty_worker::PtyHandle;
+use clhorde_core::prompt::PromptMode;
 
 #[allow(dead_code)]
 pub enum WorkerMessage {
-    OutputChunk { prompt_id: usize, text: String },
-    TurnComplete { prompt_id: usize },
-    Finished { prompt_id: usize, exit_code: Option<i32> },
-    SpawnError { prompt_id: usize, error: String },
-    PtyUpdate { #[allow(dead_code)] prompt_id: usize },
-    SessionId { prompt_id: usize, session_id: String },
+    OutputChunk {
+        prompt_id: usize,
+        text: String,
+    },
+    TurnComplete {
+        prompt_id: usize,
+    },
+    Finished {
+        prompt_id: usize,
+        exit_code: Option<i32>,
+    },
+    SpawnError {
+        prompt_id: usize,
+        error: String,
+    },
+    PtyUpdate {
+        #[allow(dead_code)]
+        prompt_id: usize,
+    },
+    SessionId {
+        prompt_id: usize,
+        session_id: String,
+    },
+    /// PTY reader hit EOF — child process output is done but we haven't reaped it yet.
+    PtyEof {
+        prompt_id: usize,
+    },
+    /// Async worktree creation completed (spawned in a background thread).
+    WorktreeCreated {
+        prompt_id: usize,
+        result: Result<String, String>,
+    },
 }
 
 pub enum WorkerInput {
@@ -37,14 +63,16 @@ pub enum SpawnResult {
 
 /// Spawns a claude worker. For interactive mode, uses PTY when `pty_size` is
 /// provided. For one-shot mode, uses stream-json as before.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_worker(
     prompt_id: usize,
     prompt_text: String,
     cwd: Option<String>,
     mode: PromptMode,
-    tx: mpsc::UnboundedSender<WorkerMessage>,
+    tx: mpsc::Sender<WorkerMessage>,
     pty_size: Option<(u16, u16)>,
     resume_session_id: Option<String>,
+    pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
 ) -> SpawnResult {
     match mode {
         PromptMode::Interactive => {
@@ -57,10 +85,12 @@ pub fn spawn_worker(
                 rows,
                 tx,
                 resume_session_id,
+                pty_byte_tx,
             ) {
-                Ok((input_sender, pty_handle)) => {
-                    SpawnResult::Pty { input_sender, pty_handle }
-                }
+                Ok((input_sender, pty_handle)) => SpawnResult::Pty {
+                    input_sender,
+                    pty_handle,
+                },
                 Err(e) => SpawnResult::Error(e),
             }
         }
@@ -75,7 +105,7 @@ fn spawn_oneshot(
     prompt_id: usize,
     prompt_text: String,
     cwd: Option<String>,
-    tx: mpsc::UnboundedSender<WorkerMessage>,
+    tx: mpsc::Sender<WorkerMessage>,
     resume_session_id: Option<String>,
 ) {
     std::thread::spawn(move || {
@@ -108,7 +138,7 @@ fn spawn_oneshot(
         {
             Ok(child) => child,
             Err(e) => {
-                let _ = tx.send(WorkerMessage::SpawnError {
+                let _ = tx.blocking_send(WorkerMessage::SpawnError {
                     prompt_id,
                     error: format!("Failed to spawn claude: {e}"),
                 });
@@ -131,7 +161,7 @@ fn spawn_oneshot(
 
         let _ = reader_handle.join();
 
-        let _ = tx.send(WorkerMessage::Finished {
+        let _ = tx.blocking_send(WorkerMessage::Finished {
             prompt_id,
             exit_code,
         });
@@ -142,7 +172,7 @@ fn spawn_oneshot(
 fn read_stream_json(
     prompt_id: usize,
     stdout: std::process::ChildStdout,
-    tx: &mpsc::UnboundedSender<WorkerMessage>,
+    tx: &mpsc::Sender<WorkerMessage>,
 ) {
     let reader = BufReader::new(stdout);
     for line in reader.lines() {
@@ -162,7 +192,7 @@ fn read_stream_json(
         // Capture session_id from init message
         if json["type"] == "system" {
             if let Some(session_id) = json["session_id"].as_str() {
-                let _ = tx.send(WorkerMessage::SessionId {
+                let _ = tx.blocking_send(WorkerMessage::SessionId {
                     prompt_id,
                     session_id: session_id.to_string(),
                 });
@@ -173,7 +203,7 @@ fn read_stream_json(
         if json["type"] == "stream_event" {
             if let Some(text) = json["event"]["delta"]["text"].as_str() {
                 if !text.is_empty() {
-                    let _ = tx.send(WorkerMessage::OutputChunk {
+                    let _ = tx.blocking_send(WorkerMessage::OutputChunk {
                         prompt_id,
                         text: text.to_string(),
                     });

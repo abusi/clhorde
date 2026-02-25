@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PromptMode {
@@ -11,6 +11,17 @@ impl PromptMode {
         match self {
             PromptMode::Interactive => "interactive",
             PromptMode::OneShot => "one-shot",
+        }
+    }
+
+    /// Parse a mode string into a `PromptMode`.
+    ///
+    /// Accepts `"one-shot"`, `"one_shot"`, and `"oneshot"` as `OneShot`.
+    /// All other values (including `"interactive"`) return `Interactive`.
+    pub fn from_mode_str(s: &str) -> Self {
+        match s {
+            "one-shot" | "one_shot" | "oneshot" => PromptMode::OneShot,
+            _ => PromptMode::Interactive,
         }
     }
 
@@ -44,6 +55,8 @@ impl PromptStatus {
     }
 }
 
+/// Core prompt data model. Fully serializable — no runtime types like `Instant`
+/// or `Arc<Mutex<PtyState>>`.
 pub struct Prompt {
     pub id: usize,
     pub text: String,
@@ -52,12 +65,12 @@ pub struct Prompt {
     pub status: PromptStatus,
     pub output: Option<String>,
     pub error: Option<String>,
-    pub started_at: Option<Instant>,
-    pub finished_at: Option<Instant>,
+    /// Epoch milliseconds when the prompt started running.
+    pub started_at_ms: Option<u64>,
+    /// Epoch milliseconds when the prompt finished.
+    pub finished_at_ms: Option<u64>,
     /// Whether the user has seen/acknowledged this prompt's completion.
     pub seen: bool,
-    /// Live PTY terminal state (only for running interactive/PTY workers).
-    pub pty_state: Option<crate::pty_worker::SharedPtyState>,
     /// UUID v7 for persistence (unique file name).
     pub uuid: String,
     /// Ordering rank for persistence/restore.
@@ -84,10 +97,9 @@ impl Prompt {
             status: PromptStatus::Pending,
             output: None,
             error: None,
-            started_at: None,
-            finished_at: None,
+            started_at_ms: None,
+            finished_at_ms: None,
             seen: false,
-            pty_state: None,
             uuid: uuid::Uuid::now_v7().to_string(),
             queue_rank: 0.0,
             session_id: None,
@@ -98,16 +110,34 @@ impl Prompt {
         }
     }
 
+    /// Mark this prompt as started (sets started_at_ms to now).
+    pub fn mark_started(&mut self) {
+        self.started_at_ms = Some(epoch_ms_now());
+    }
+
+    /// Mark this prompt as finished (sets finished_at_ms to now).
+    pub fn mark_finished(&mut self) {
+        self.finished_at_ms = Some(epoch_ms_now());
+    }
+
     pub fn elapsed_secs(&self) -> Option<f64> {
-        let start = self.started_at?;
-        let end = self.finished_at.unwrap_or_else(Instant::now);
-        Some(end.duration_since(start).as_secs_f64())
+        let start = self.started_at_ms?;
+        let end = self.finished_at_ms.unwrap_or_else(epoch_ms_now);
+        Some((end.saturating_sub(start)) as f64 / 1000.0)
     }
 
     /// Human-readable elapsed time, e.g. "4.2s", "2m 30s", "1h 5m".
     pub fn elapsed_display(&self) -> Option<String> {
         self.elapsed_secs().map(format_duration)
     }
+}
+
+/// Get current epoch time in milliseconds.
+pub fn epoch_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Format seconds into a human-readable duration string.
@@ -174,7 +204,10 @@ mod tests {
 
     #[test]
     fn toggle_roundtrip() {
-        assert_eq!(PromptMode::Interactive.toggle().toggle(), PromptMode::Interactive);
+        assert_eq!(
+            PromptMode::Interactive.toggle().toggle(),
+            PromptMode::Interactive
+        );
     }
 
     #[test]
@@ -185,6 +218,39 @@ mod tests {
     #[test]
     fn label_oneshot() {
         assert_eq!(PromptMode::OneShot.label(), "one-shot");
+    }
+
+    // ── from_mode_str ──
+
+    #[test]
+    fn from_mode_str_one_dash_shot() {
+        assert_eq!(PromptMode::from_mode_str("one-shot"), PromptMode::OneShot);
+    }
+
+    #[test]
+    fn from_mode_str_one_underscore_shot() {
+        assert_eq!(PromptMode::from_mode_str("one_shot"), PromptMode::OneShot);
+    }
+
+    #[test]
+    fn from_mode_str_oneshot() {
+        assert_eq!(PromptMode::from_mode_str("oneshot"), PromptMode::OneShot);
+    }
+
+    #[test]
+    fn from_mode_str_interactive() {
+        assert_eq!(
+            PromptMode::from_mode_str("interactive"),
+            PromptMode::Interactive
+        );
+    }
+
+    #[test]
+    fn from_mode_str_unknown_defaults_to_interactive() {
+        assert_eq!(
+            PromptMode::from_mode_str("unknown"),
+            PromptMode::Interactive
+        );
     }
 
     // ── PromptStatus::symbol ──
@@ -210,14 +276,19 @@ mod tests {
         assert_eq!(p.status, PromptStatus::Pending);
         assert!(p.output.is_none());
         assert!(p.error.is_none());
-        assert!(p.started_at.is_none());
-        assert!(p.finished_at.is_none());
+        assert!(p.started_at_ms.is_none());
+        assert!(p.finished_at_ms.is_none());
         assert!(!p.seen);
     }
 
     #[test]
     fn new_prompt_with_cwd() {
-        let p = Prompt::new(5, "test".to_string(), Some("/tmp".to_string()), PromptMode::OneShot);
+        let p = Prompt::new(
+            5,
+            "test".to_string(),
+            Some("/tmp".to_string()),
+            PromptMode::OneShot,
+        );
         assert_eq!(p.cwd, Some("/tmp".to_string()));
         assert_eq!(p.mode, PromptMode::OneShot);
     }
