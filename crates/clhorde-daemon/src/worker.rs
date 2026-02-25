@@ -35,6 +35,11 @@ pub enum WorkerMessage {
     PtyEof {
         prompt_id: usize,
     },
+    /// Async worktree creation completed (spawned in a background thread).
+    WorktreeCreated {
+        prompt_id: usize,
+        result: Result<String, String>,
+    },
 }
 
 pub enum WorkerInput {

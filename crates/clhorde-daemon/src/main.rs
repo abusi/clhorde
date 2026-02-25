@@ -14,15 +14,25 @@ use tokio::sync::mpsc;
 use clhorde_core::ipc::{daemon_pid_path, daemon_socket_path};
 use clhorde_core::protocol::ClientRequest;
 
+/// Check if a process with the given PID is alive.
+/// Returns true if the process exists (even if owned by another user — EPERM).
+fn is_process_alive(pid: i32) -> bool {
+    let ret = unsafe { libc::kill(pid, 0) };
+    if ret == 0 {
+        return true;
+    }
+    // kill() returned -1; check errno
+    let err = std::io::Error::last_os_error();
+    // EPERM means the process exists but we lack permission to signal it
+    err.raw_os_error() == Some(libc::EPERM)
+}
+
 fn check_pid_file(pid_path: &PathBuf) -> Result<(), String> {
     if pid_path.exists() {
         let content = fs::read_to_string(pid_path).unwrap_or_default();
         if let Ok(pid) = content.trim().parse::<i32>() {
-            // Check if the process is alive
-            unsafe {
-                if libc::kill(pid, 0) == 0 {
-                    return Err(format!("Daemon already running (PID {pid})"));
-                }
+            if is_process_alive(pid) {
+                return Err(format!("Daemon already running (PID {pid})"));
             }
         }
         // Stale PID file — clean up
@@ -178,4 +188,27 @@ async fn main() {
     server_handle.abort();
     cleanup_files(&pid_path, &socket_path);
     eprintln!("clhorded: stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_process_alive_self() {
+        let pid = std::process::id() as i32;
+        assert!(is_process_alive(pid));
+    }
+
+    #[test]
+    fn is_process_alive_nonexistent() {
+        // PID near i32::MAX is extremely unlikely to be in use
+        assert!(!is_process_alive(i32::MAX - 1));
+    }
+
+    #[test]
+    fn is_process_alive_pid_1() {
+        // PID 1 (init/systemd) always exists; may return true via EPERM or 0
+        assert!(is_process_alive(1));
+    }
 }

@@ -78,4 +78,111 @@ impl SessionManager {
         }
         false
     }
+
+    /// Number of currently registered sessions (for testing).
+    #[cfg(test)]
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_session_returns_incrementing_ids() {
+        let mut sm = SessionManager::new();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let id1 = sm.add_session(tx1);
+        let id2 = sm.add_session(tx2);
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(sm.session_count(), 2);
+    }
+
+    #[test]
+    fn remove_session_drops_session() {
+        let mut sm = SessionManager::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let id = sm.add_session(tx);
+        assert_eq!(sm.session_count(), 1);
+        sm.remove_session(id);
+        assert_eq!(sm.session_count(), 0);
+    }
+
+    #[test]
+    fn broadcast_only_sends_to_subscribed() {
+        let mut sm = SessionManager::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let id1 = sm.add_session(tx1);
+        let _id2 = sm.add_session(tx2);
+        sm.set_subscribed(id1, true);
+        // id2 is NOT subscribed
+
+        sm.broadcast(&DaemonEvent::Pong);
+
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_err()); // unsubscribed, no message
+    }
+
+    #[test]
+    fn broadcast_removes_disconnected_sessions() {
+        let mut sm = SessionManager::new();
+        let (tx1, rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let id1 = sm.add_session(tx1);
+        let id2 = sm.add_session(tx2);
+        sm.set_subscribed(id1, true);
+        sm.set_subscribed(id2, true);
+
+        // Drop rx1 to simulate disconnect
+        drop(rx1);
+
+        sm.broadcast(&DaemonEvent::Pong);
+        // Session 1 should have been removed
+        assert_eq!(sm.session_count(), 1);
+    }
+
+    #[test]
+    fn send_to_unknown_session_returns_false() {
+        let mut sm = SessionManager::new();
+        let result = sm.send_to(999, DaemonEvent::Pong);
+        assert!(!result);
+    }
+
+    #[test]
+    fn send_to_disconnected_removes_and_returns_false() {
+        let mut sm = SessionManager::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = sm.add_session(tx);
+        drop(rx); // simulate disconnect
+
+        let result = sm.send_to(id, DaemonEvent::Pong);
+        assert!(!result);
+        assert_eq!(sm.session_count(), 0);
+    }
+
+    #[test]
+    fn set_subscribed_toggles() {
+        let mut sm = SessionManager::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let id = sm.add_session(tx);
+
+        // Not subscribed — broadcast should not deliver
+        sm.broadcast(&DaemonEvent::Pong);
+        assert!(rx.try_recv().is_err());
+
+        // Subscribe — broadcast should deliver
+        sm.set_subscribed(id, true);
+        sm.broadcast(&DaemonEvent::Pong);
+        assert!(rx.try_recv().is_ok());
+
+        // Unsubscribe — broadcast should not deliver
+        sm.set_subscribed(id, false);
+        sm.broadcast(&DaemonEvent::Pong);
+        assert!(rx.try_recv().is_err());
+    }
 }

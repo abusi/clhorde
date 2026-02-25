@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use tokio::sync::mpsc;
@@ -26,6 +26,8 @@ pub struct Orchestrator {
     pub worker_tx: mpsc::UnboundedSender<WorkerMessage>,
     pub worker_rx: mpsc::UnboundedReceiver<WorkerMessage>,
     pub pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
+    /// Prompt IDs currently awaiting async worktree creation.
+    pub worktree_creating: HashSet<usize>,
     #[allow(dead_code)]
     max_saved_prompts: usize,
     prompts_dir: Option<PathBuf>,
@@ -50,6 +52,7 @@ impl Orchestrator {
             worker_tx,
             worker_rx,
             pty_byte_tx,
+            worktree_creating: HashSet::new(),
             max_saved_prompts: 100,
             prompts_dir: None,
             worktree_cleanup: WorktreeCleanup::Manual,
@@ -112,6 +115,7 @@ impl Orchestrator {
             worker_tx,
             worker_rx,
             pty_byte_tx,
+            worktree_creating: HashSet::new(),
             max_saved_prompts,
             prompts_dir,
             worktree_cleanup,
@@ -202,9 +206,9 @@ impl Orchestrator {
     }
 
     fn next_pending_prompt_index(&self) -> Option<usize> {
-        self.prompts
-            .iter()
-            .position(|p| p.status == PromptStatus::Pending)
+        self.prompts.iter().position(|p| {
+            p.status == PromptStatus::Pending && !self.worktree_creating.contains(&p.id)
+        })
     }
 
     fn mark_running(&mut self, index: usize) {
@@ -253,26 +257,17 @@ impl Orchestrator {
                     });
                     let repo_path = std::path::Path::new(&effective_cwd);
                     if clhorde_core::worktree::is_git_repo(repo_path) {
-                        match clhorde_core::worktree::create_worktree(repo_path, prompt_id) {
-                            Ok(wt_path) => {
-                                let wt_str = wt_path.to_string_lossy().to_string();
-                                self.prompts[idx].worktree_path = Some(wt_str.clone());
-                                Some(wt_str)
-                            }
-                            Err(e) => {
-                                self.prompts[idx].status = PromptStatus::Failed;
-                                self.prompts[idx].error =
-                                    Some(format!("Failed to create worktree: {e}"));
-                                self.persist_prompt(&self.prompts[idx]);
-                                let info = self.to_prompt_info(&self.prompts[idx]);
-                                self.sessions.broadcast(&DaemonEvent::WorkerError {
-                                    prompt_id,
-                                    error: format!("Failed to create worktree: {e}"),
-                                });
-                                self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
-                                continue;
-                            }
-                        }
+                        // Spawn worktree creation in a background thread to avoid
+                        // blocking the async event loop (Fix #5).
+                        self.worktree_creating.insert(prompt_id);
+                        let tx = self.worker_tx.clone();
+                        let repo = repo_path.to_path_buf();
+                        std::thread::spawn(move || {
+                            let result = clhorde_core::worktree::create_worktree(&repo, prompt_id)
+                                .map(|p| p.to_string_lossy().to_string());
+                            let _ = tx.send(WorkerMessage::WorktreeCreated { prompt_id, result });
+                        });
+                        continue;
                     } else {
                         prompt_cwd
                     }
@@ -497,6 +492,34 @@ impl Orchestrator {
                     count: self.active_workers,
                 });
             }
+            WorkerMessage::WorktreeCreated { prompt_id, result } => {
+                self.worktree_creating.remove(&prompt_id);
+                match result {
+                    Ok(wt_path) => {
+                        if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
+                            prompt.worktree_path = Some(wt_path);
+                        }
+                        self.persist_prompt_by_id(prompt_id);
+                        // dispatch_workers() is called after apply_message() in main loop,
+                        // which will pick up this prompt now that it has worktree_path set.
+                    }
+                    Err(e) => {
+                        if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
+                            prompt.status = PromptStatus::Failed;
+                            prompt.error = Some(format!("Failed to create worktree: {e}"));
+                        }
+                        self.persist_prompt_by_id(prompt_id);
+                        self.sessions.broadcast(&DaemonEvent::WorkerError {
+                            prompt_id,
+                            error: format!("Failed to create worktree: {e}"),
+                        });
+                        if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
+                            let info = self.to_prompt_info(prompt);
+                            self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+                        }
+                    }
+                }
+            }
             WorkerMessage::SpawnError { prompt_id, error } => {
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
                     prompt.status = PromptStatus::Failed;
@@ -547,22 +570,32 @@ impl Orchestrator {
                 self.dispatch_workers();
             }
             ClientRequest::SendInput { prompt_id, text } => {
-                // Echo the input to output so all clients see it
-                let echo = format!("\n\n> {text}\n\n");
-                if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
-                    match &mut prompt.output {
-                        Some(existing) => existing.push_str(&echo),
-                        None => prompt.output = Some(echo.clone()),
-                    }
-                }
-                self.sessions.broadcast(&DaemonEvent::OutputChunk {
-                    prompt_id,
-                    text: echo,
-                });
+                // Only echo and send if a worker input channel exists (interactive workers).
+                // One-shot workers have no input channel — return an error instead.
                 if let Some(sender) = self.worker_inputs.get(&prompt_id) {
+                    let echo = format!("\n\n> {text}\n\n");
+                    if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
+                        match &mut prompt.output {
+                            Some(existing) => existing.push_str(&echo),
+                            None => prompt.output = Some(echo.clone()),
+                        }
+                    }
+                    self.sessions.broadcast(&DaemonEvent::OutputChunk {
+                        prompt_id,
+                        text: echo,
+                    });
                     let mut send_text = text;
                     send_text.push('\n');
                     let _ = sender.send(WorkerInput::SendInput(send_text));
+                } else {
+                    self.sessions.send_to(
+                        session_id,
+                        DaemonEvent::Error {
+                            message: format!(
+                                "Cannot send input to prompt {prompt_id}: no input channel (one-shot worker?)"
+                            ),
+                        },
+                    );
                 }
             }
             ClientRequest::SendBytes { prompt_id, data } => {
@@ -1187,5 +1220,355 @@ mod tests {
         orch.handle_request(ClientRequest::Unsubscribe, 1);
         let event = event_rx.try_recv().expect("should receive Unsubscribed");
         assert!(matches!(event, DaemonEvent::Unsubscribed));
+    }
+
+    // ── add_prompt ──
+
+    #[tokio::test]
+    async fn add_prompt_increments_next_id_and_adds_prompt() {
+        let mut orch = Orchestrator::new_for_test();
+        assert_eq!(orch.next_id, 1);
+
+        orch.add_prompt("hello".into(), None, PromptMode::Interactive, false, vec![]);
+        assert_eq!(orch.prompts.len(), 1);
+        assert_eq!(orch.prompts[0].id, 1);
+        assert_eq!(orch.next_id, 2);
+
+        orch.add_prompt("world".into(), None, PromptMode::OneShot, false, vec![]);
+        assert_eq!(orch.prompts.len(), 2);
+        assert_eq!(orch.prompts[1].id, 2);
+        assert_eq!(orch.next_id, 3);
+    }
+
+    #[tokio::test]
+    async fn add_prompt_broadcasts_prompt_added() {
+        let mut orch = Orchestrator::new_for_test();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        orch.sessions.add_session_with_id(1, tx);
+        orch.sessions.set_subscribed(1, true);
+
+        orch.add_prompt("test".into(), None, PromptMode::Interactive, false, vec![]);
+
+        let event = rx.try_recv().expect("should receive PromptAdded");
+        assert!(matches!(event, DaemonEvent::PromptAdded(_)));
+    }
+
+    // ── retry / resume ──
+
+    #[tokio::test]
+    async fn retry_completed_prompt_creates_new_pending() {
+        let mut orch = Orchestrator::new_for_test();
+        orch.max_workers = 0; // prevent dispatch from running the new prompt
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+
+        orch.handle_request(
+            clhorde_core::protocol::ClientRequest::RetryPrompt { prompt_id: 1 },
+            0,
+        );
+
+        // Original stays, new pending prompt is added
+        assert_eq!(orch.prompts.len(), 2);
+        assert_eq!(orch.prompts[1].status, PromptStatus::Pending);
+        assert_eq!(orch.prompts[1].text, "prompt-1");
+    }
+
+    #[tokio::test]
+    async fn retry_running_prompt_is_noop() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Running);
+
+        orch.handle_request(
+            clhorde_core::protocol::ClientRequest::RetryPrompt { prompt_id: 1 },
+            0,
+        );
+
+        assert_eq!(orch.prompts.len(), 1); // no new prompt
+    }
+
+    #[tokio::test]
+    async fn resume_completed_prompt_resets_to_pending() {
+        let mut orch = Orchestrator::new_for_test();
+        orch.max_workers = 0; // prevent dispatch from running the prompt
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+        orch.prompts[0].output = Some("old output".into());
+
+        orch.handle_request(
+            clhorde_core::protocol::ClientRequest::ResumePrompt { prompt_id: 1 },
+            0,
+        );
+
+        assert_eq!(orch.prompts[0].status, PromptStatus::Pending);
+        assert!(orch.prompts[0].resume);
+        assert!(orch.prompts[0].output.is_none());
+    }
+
+    // ── delete ──
+
+    #[tokio::test]
+    async fn delete_prompt_removes_from_list() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+        insert_prompt(&mut orch, 2, PromptStatus::Pending);
+
+        orch.delete_prompt(1);
+        assert_eq!(orch.prompts.len(), 1);
+        assert_eq!(orch.prompts[0].id, 2);
+    }
+
+    // ── set_max_workers ──
+
+    #[tokio::test]
+    async fn set_max_workers_clamps_and_broadcasts() {
+        let mut orch = Orchestrator::new_for_test();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        orch.sessions.add_session_with_id(1, tx);
+        orch.sessions.set_subscribed(1, true);
+
+        orch.handle_request(clhorde_core::protocol::ClientRequest::SetMaxWorkers(10), 1);
+
+        assert_eq!(orch.max_workers, 10);
+        let event = rx.try_recv().expect("should receive MaxWorkersChanged");
+        assert!(matches!(
+            event,
+            DaemonEvent::MaxWorkersChanged { count: 10 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_max_workers_clamps_to_minimum_1() {
+        let mut orch = Orchestrator::new_for_test();
+        orch.handle_request(clhorde_core::protocol::ClientRequest::SetMaxWorkers(0), 0);
+        assert_eq!(orch.max_workers, 1);
+    }
+
+    // ── get_state ──
+
+    #[tokio::test]
+    async fn get_state_sends_snapshot_to_requesting_session() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        orch.sessions.add_session_with_id(1, tx);
+
+        orch.handle_request(clhorde_core::protocol::ClientRequest::GetState, 1);
+
+        let event = rx.try_recv().expect("should receive StateSnapshot");
+        match event {
+            DaemonEvent::StateSnapshot(state) => {
+                assert_eq!(state.prompts.len(), 1);
+                assert_eq!(state.max_workers, 3);
+            }
+            _ => panic!("expected StateSnapshot"),
+        }
+    }
+
+    // ── get_prompt_output ──
+
+    #[tokio::test]
+    async fn get_prompt_output_sends_output_text() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+        orch.prompts[0].output = Some("hello world".into());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        orch.sessions.add_session_with_id(1, tx);
+
+        orch.handle_request(
+            clhorde_core::protocol::ClientRequest::GetPromptOutput { prompt_id: 1 },
+            1,
+        );
+
+        let event = rx.try_recv().expect("should receive PromptOutput");
+        match event {
+            DaemonEvent::PromptOutput {
+                prompt_id,
+                full_text,
+            } => {
+                assert_eq!(prompt_id, 1);
+                assert_eq!(full_text, "hello world");
+            }
+            _ => panic!("expected PromptOutput"),
+        }
+    }
+
+    // ── apply_message variants ──
+
+    #[tokio::test]
+    async fn apply_output_chunk_appends_to_prompt() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Running);
+
+        orch.apply_message(WorkerMessage::OutputChunk {
+            prompt_id: 1,
+            text: "first ".into(),
+        });
+        orch.apply_message(WorkerMessage::OutputChunk {
+            prompt_id: 1,
+            text: "second".into(),
+        });
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(prompt.output.as_deref(), Some("first second"));
+    }
+
+    #[tokio::test]
+    async fn apply_turn_complete_sets_idle() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Running);
+
+        orch.apply_message(WorkerMessage::TurnComplete { prompt_id: 1 });
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(prompt.status, PromptStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn apply_session_id_sets_on_prompt() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Running);
+
+        orch.apply_message(WorkerMessage::SessionId {
+            prompt_id: 1,
+            session_id: "sess-abc".into(),
+        });
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(prompt.session_id.as_deref(), Some("sess-abc"));
+    }
+
+    #[tokio::test]
+    async fn apply_spawn_error_marks_failed_and_decrements_workers() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Running);
+        orch.active_workers = 1;
+
+        orch.apply_message(WorkerMessage::SpawnError {
+            prompt_id: 1,
+            error: "boom".into(),
+        });
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(prompt.status, PromptStatus::Failed);
+        assert_eq!(prompt.error.as_deref(), Some("boom"));
+        assert_eq!(orch.active_workers, 0);
+    }
+
+    // ── Fix 9 tests: SendInput ──
+
+    #[tokio::test]
+    async fn send_input_without_worker_input_returns_error() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Running);
+        // No worker_inputs entry for prompt 1 (simulates one-shot worker)
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        orch.sessions.add_session_with_id(1, tx);
+
+        orch.handle_request(
+            clhorde_core::protocol::ClientRequest::SendInput {
+                prompt_id: 1,
+                text: "hello".into(),
+            },
+            1,
+        );
+
+        // Should get Error, not OutputChunk
+        let event = rx.try_recv().expect("should receive Error");
+        assert!(matches!(event, DaemonEvent::Error { .. }));
+
+        // Output should NOT have been modified
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert!(prompt.output.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_input_with_worker_input_echoes_and_sends() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Running);
+
+        // Create a worker input channel
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        orch.worker_inputs.insert(1, input_tx);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        orch.sessions.add_session_with_id(1, tx);
+        orch.sessions.set_subscribed(1, true);
+
+        orch.handle_request(
+            clhorde_core::protocol::ClientRequest::SendInput {
+                prompt_id: 1,
+                text: "hello".into(),
+            },
+            1,
+        );
+
+        // Should get OutputChunk broadcast (echo)
+        let event = rx.try_recv().expect("should receive OutputChunk");
+        assert!(matches!(event, DaemonEvent::OutputChunk { .. }));
+
+        // Worker should receive the input
+        let worker_msg = input_rx.try_recv().expect("worker should receive input");
+        match worker_msg {
+            WorkerInput::SendInput(text) => assert_eq!(text, "hello\n"),
+            _ => panic!("expected SendInput"),
+        }
+    }
+
+    // ── Fix 5 tests: worktree_creating ──
+
+    #[tokio::test]
+    async fn next_pending_skips_worktree_creating() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        insert_prompt(&mut orch, 2, PromptStatus::Pending);
+
+        orch.worktree_creating.insert(1);
+
+        let idx = orch.next_pending_prompt_index();
+        assert_eq!(idx, Some(1)); // prompt at index 1 (id=2)
+        assert_eq!(orch.prompts[idx.unwrap()].id, 2);
+    }
+
+    #[tokio::test]
+    async fn next_pending_returns_none_when_all_creating() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+
+        orch.worktree_creating.insert(1);
+
+        assert!(orch.next_pending_prompt_index().is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_worktree_created_ok_sets_path() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        orch.worktree_creating.insert(1);
+
+        orch.apply_message(WorkerMessage::WorktreeCreated {
+            prompt_id: 1,
+            result: Ok("/tmp/repo-wt-1".into()),
+        });
+
+        assert!(!orch.worktree_creating.contains(&1));
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(prompt.worktree_path.as_deref(), Some("/tmp/repo-wt-1"));
+        assert_eq!(prompt.status, PromptStatus::Pending); // still pending, ready for dispatch
+    }
+
+    #[tokio::test]
+    async fn apply_worktree_created_err_marks_failed() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        orch.worktree_creating.insert(1);
+
+        orch.apply_message(WorkerMessage::WorktreeCreated {
+            prompt_id: 1,
+            result: Err("git failed".into()),
+        });
+
+        assert!(!orch.worktree_creating.contains(&1));
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(prompt.status, PromptStatus::Failed);
+        assert!(prompt.error.as_ref().unwrap().contains("worktree"));
     }
 }

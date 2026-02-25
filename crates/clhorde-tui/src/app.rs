@@ -2404,4 +2404,93 @@ mod tests {
         app.select_half_page_down();
         assert_eq!(app.list_state.selected(), Some(20));
     }
+
+    // ── apply_event: PromptUpdated ──
+
+    #[test]
+    fn apply_prompt_updated_preserves_local_seen() {
+        let (mut app, _rx) = app_with_prompts(&["test"]);
+        app.prompts[0].seen = true; // locally marked seen
+
+        let mut updated = make_prompt_info(1, "test");
+        updated.seen = false; // daemon doesn't know about local seen
+        updated.status = "Completed".to_string();
+        app.apply_event(DaemonEvent::PromptUpdated(updated));
+
+        assert!(app.prompts[0].seen); // local seen preserved
+    }
+
+    #[test]
+    fn apply_prompt_updated_exits_pty_interact_on_finish() {
+        let (mut app, _rx) = app_with_prompts(&["test"]);
+        app.prompts[0].status = "Running".to_string();
+        app.mode = AppMode::PtyInteract;
+        app.list_state.select(Some(0));
+
+        let mut updated = make_prompt_info(1, "test");
+        updated.status = "Completed".to_string();
+        app.apply_event(DaemonEvent::PromptUpdated(updated));
+
+        assert_eq!(app.mode, AppMode::ViewOutput);
+    }
+
+    #[test]
+    fn apply_worker_finished_removes_pty_renderer() {
+        let (mut app, _rx) = app_with_prompts(&["test"]);
+        let (cols, rows) = (80, 24);
+        app.pty_renderers.insert(1, PtyRenderer::new(cols, rows));
+        assert!(app.pty_renderers.contains_key(&1));
+
+        app.apply_event(DaemonEvent::WorkerFinished {
+            prompt_id: 1,
+            exit_code: Some(0),
+        });
+
+        assert!(!app.pty_renderers.contains_key(&1));
+    }
+
+    #[test]
+    fn apply_worker_error_removes_pty_renderer() {
+        let (mut app, _rx) = app_with_prompts(&["test"]);
+        let (cols, rows) = (80, 24);
+        app.pty_renderers.insert(1, PtyRenderer::new(cols, rows));
+
+        app.apply_event(DaemonEvent::WorkerError {
+            prompt_id: 1,
+            error: "boom".to_string(),
+        });
+
+        assert!(!app.pty_renderers.contains_key(&1));
+    }
+
+    #[test]
+    fn apply_max_workers_changed() {
+        let (mut app, _rx) = new_test_app();
+        assert_eq!(app.max_workers, 3);
+
+        app.apply_event(DaemonEvent::MaxWorkersChanged { count: 7 });
+        assert_eq!(app.max_workers, 7);
+    }
+
+    #[test]
+    fn apply_active_workers_changed() {
+        let (mut app, _rx) = new_test_app();
+        assert_eq!(app.active_workers, 0);
+
+        app.apply_event(DaemonEvent::ActiveWorkersChanged { count: 2 });
+        assert_eq!(app.active_workers, 2);
+    }
+
+    #[test]
+    fn apply_prompt_output_replaces() {
+        let (mut app, _rx) = app_with_prompts(&["test"]);
+        app.prompts[0].output = Some("old".into());
+
+        app.apply_event(DaemonEvent::PromptOutput {
+            prompt_id: 1,
+            full_text: "new full output".into(),
+        });
+
+        assert_eq!(app.prompts[0].output.as_deref(), Some("new full output"));
+    }
 }
