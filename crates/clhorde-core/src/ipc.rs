@@ -18,7 +18,7 @@ pub fn daemon_pid_path() -> PathBuf {
 }
 
 /// Maximum frame payload size (16 MiB).
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 /// Marker byte that distinguishes binary PTY frames from JSON text frames.
 pub const PTY_FRAME_MARKER: u8 = 0x01;

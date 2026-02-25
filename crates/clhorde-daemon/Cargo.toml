@@ -16,3 +16,5 @@ alacritty_terminal.workspace = true
 portable-pty.workspace = true
 uuid.workspace = true
 libc = "0.2"
+tracing.workspace = true
+tracing-subscriber.workspace = true

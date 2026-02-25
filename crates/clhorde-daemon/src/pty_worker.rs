@@ -11,6 +11,8 @@ use alacritty_terminal::Term;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tokio::sync::mpsc;
 
+use clhorde_core::pty::PtyDimensions;
+
 use crate::worker::{WorkerInput, WorkerMessage};
 
 /// Fixed-size circular buffer for PTY output bytes (for late-join replay).
@@ -73,23 +75,6 @@ pub struct PtyHandle {
     pub ring_buffer: Arc<Mutex<PtyRingBuffer>>,
 }
 
-struct PtyDimensions {
-    cols: usize,
-    lines: usize,
-}
-
-impl Dimensions for PtyDimensions {
-    fn total_lines(&self) -> usize {
-        self.lines
-    }
-    fn screen_lines(&self) -> usize {
-        self.lines
-    }
-    fn columns(&self) -> usize {
-        self.cols
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_pty_worker(
     prompt_id: usize,
@@ -97,7 +82,7 @@ pub fn spawn_pty_worker(
     cwd: Option<String>,
     cols: u16,
     rows: u16,
-    tx: mpsc::UnboundedSender<WorkerMessage>,
+    tx: mpsc::Sender<WorkerMessage>,
     resume_session_id: Option<String>,
     pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
 ) -> Result<(mpsc::UnboundedSender<WorkerInput>, PtyHandle), String> {
@@ -186,13 +171,13 @@ pub fn spawn_pty_worker(
                     // Broadcast raw bytes to connected clients
                     let _ = pty_byte_tx.send((prompt_id, bytes.to_vec()));
 
-                    let _ = tx.send(WorkerMessage::PtyUpdate { prompt_id });
+                    let _ = tx.blocking_send(WorkerMessage::PtyUpdate { prompt_id });
                 }
                 Err(_) => break,
             }
         }
         // PTY EOF — child process output is done, but we need to wait() for real exit code
-        let _ = tx.send(WorkerMessage::PtyEof { prompt_id });
+        let _ = tx.blocking_send(WorkerMessage::PtyEof { prompt_id });
     });
 
     // Writer thread: receives WorkerInput, writes bytes to PTY

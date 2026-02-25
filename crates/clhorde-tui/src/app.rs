@@ -440,13 +440,17 @@ impl App {
     }
 
     fn apply_state_snapshot(&mut self, state: DaemonState) {
+        if state.protocol_version != clhorde_core::protocol::PROTOCOL_VERSION {
+            eprintln!(
+                "Warning: protocol version mismatch (daemon={}, client={}). Consider restarting the daemon.",
+                state.protocol_version,
+                clhorde_core::protocol::PROTOCOL_VERSION
+            );
+        }
         self.prompts = state.prompts;
         self.max_workers = state.max_workers;
         self.active_workers = state.active_workers;
-        self.default_mode = match state.default_mode.as_str() {
-            "one-shot" | "one_shot" | "oneshot" => PromptMode::OneShot,
-            _ => PromptMode::Interactive,
-        };
+        self.default_mode = PromptMode::from_mode_str(&state.default_mode);
 
         // Create PTY renderers for prompts that have PTY
         let (cols, rows) = self.output_panel_size.unwrap_or((80, 24));
@@ -2244,6 +2248,7 @@ mod tests {
             max_workers: 5,
             active_workers: 2,
             default_mode: "one-shot".to_string(),
+            protocol_version: clhorde_core::protocol::PROTOCOL_VERSION,
         };
         app.apply_event(DaemonEvent::StateSnapshot(state));
         assert_eq!(app.prompts.len(), 2);

@@ -14,6 +14,17 @@ impl PromptMode {
         }
     }
 
+    /// Parse a mode string into a `PromptMode`.
+    ///
+    /// Accepts `"one-shot"`, `"one_shot"`, and `"oneshot"` as `OneShot`.
+    /// All other values (including `"interactive"`) return `Interactive`.
+    pub fn from_mode_str(s: &str) -> Self {
+        match s {
+            "one-shot" | "one_shot" | "oneshot" => PromptMode::OneShot,
+            _ => PromptMode::Interactive,
+        }
+    }
+
     pub fn toggle(&self) -> Self {
         match self {
             PromptMode::Interactive => PromptMode::OneShot,
@@ -207,6 +218,39 @@ mod tests {
     #[test]
     fn label_oneshot() {
         assert_eq!(PromptMode::OneShot.label(), "one-shot");
+    }
+
+    // ── from_mode_str ──
+
+    #[test]
+    fn from_mode_str_one_dash_shot() {
+        assert_eq!(PromptMode::from_mode_str("one-shot"), PromptMode::OneShot);
+    }
+
+    #[test]
+    fn from_mode_str_one_underscore_shot() {
+        assert_eq!(PromptMode::from_mode_str("one_shot"), PromptMode::OneShot);
+    }
+
+    #[test]
+    fn from_mode_str_oneshot() {
+        assert_eq!(PromptMode::from_mode_str("oneshot"), PromptMode::OneShot);
+    }
+
+    #[test]
+    fn from_mode_str_interactive() {
+        assert_eq!(
+            PromptMode::from_mode_str("interactive"),
+            PromptMode::Interactive
+        );
+    }
+
+    #[test]
+    fn from_mode_str_unknown_defaults_to_interactive() {
+        assert_eq!(
+            PromptMode::from_mode_str("unknown"),
+            PromptMode::Interactive
+        );
     }
 
     // ── PromptStatus::symbol ──

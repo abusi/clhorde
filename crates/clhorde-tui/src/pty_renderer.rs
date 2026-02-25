@@ -1,25 +1,9 @@
 use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::Config;
 use alacritty_terminal::vte::ansi::Processor;
 use alacritty_terminal::Term;
 
-struct PtyDimensions {
-    cols: usize,
-    lines: usize,
-}
-
-impl Dimensions for PtyDimensions {
-    fn total_lines(&self) -> usize {
-        self.lines
-    }
-    fn screen_lines(&self) -> usize {
-        self.lines
-    }
-    fn columns(&self) -> usize {
-        self.cols
-    }
-}
+use clhorde_core::pty::PtyDimensions;
 
 /// Local headless terminal emulator for PTY rendering.
 /// Lives in App's HashMap, accessed synchronously — no Arc<Mutex<>> needed.

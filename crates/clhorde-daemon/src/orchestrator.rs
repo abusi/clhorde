@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
+use tracing::{debug, info, warn};
+
 use clhorde_core::config::WorktreeCleanup;
 use clhorde_core::keymap::load_settings;
 use clhorde_core::persistence;
@@ -23,12 +25,11 @@ pub struct Orchestrator {
     pub worker_inputs: HashMap<usize, mpsc::UnboundedSender<WorkerInput>>,
     pub pty_handles: HashMap<usize, PtyHandle>,
     pub sessions: SessionManager,
-    pub worker_tx: mpsc::UnboundedSender<WorkerMessage>,
-    pub worker_rx: mpsc::UnboundedReceiver<WorkerMessage>,
+    pub worker_tx: mpsc::Sender<WorkerMessage>,
+    pub worker_rx: mpsc::Receiver<WorkerMessage>,
     pub pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
     /// Prompt IDs currently awaiting async worktree creation.
     pub worktree_creating: HashSet<usize>,
-    #[allow(dead_code)]
     max_saved_prompts: usize,
     prompts_dir: Option<PathBuf>,
     worktree_cleanup: WorktreeCleanup,
@@ -38,7 +39,7 @@ impl Orchestrator {
     /// Create an Orchestrator for tests — no persistence, no settings loading.
     #[cfg(test)]
     pub fn new_for_test() -> Self {
-        let (worker_tx, worker_rx) = mpsc::unbounded_channel();
+        let (worker_tx, worker_rx) = mpsc::channel(4096);
         let (pty_byte_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             prompts: Vec::new(),
@@ -100,7 +101,7 @@ impl Orchestrator {
             persistence::prune_old_prompts(dir, max_saved_prompts);
         }
 
-        let (worker_tx, worker_rx) = mpsc::unbounded_channel();
+        let (worker_tx, worker_rx) = mpsc::channel(4096);
         let (pty_byte_tx, _) = tokio::sync::broadcast::channel(256);
 
         Self {
@@ -140,6 +141,13 @@ impl Orchestrator {
         }
     }
 
+    /// Prune old prompt files if the count exceeds `max_saved_prompts`.
+    fn maybe_prune(&self) {
+        if let Some(ref dir) = self.prompts_dir {
+            persistence::prune_old_prompts(dir, self.max_saved_prompts);
+        }
+    }
+
     // ── Convert to wire types ──
 
     pub fn to_prompt_info(&self, prompt: &Prompt) -> PromptInfo {
@@ -175,6 +183,7 @@ impl Orchestrator {
             max_workers: self.max_workers,
             active_workers: self.active_workers,
             default_mode: self.default_mode.label().to_string(),
+            protocol_version: clhorde_core::protocol::PROTOCOL_VERSION,
         }
     }
 
@@ -199,10 +208,12 @@ impl Orchestrator {
         prompt.queue_rank = max_rank + 1.0;
         self.next_id += 1;
         self.persist_prompt(&prompt);
+        self.maybe_prune();
 
-        let info = self.to_prompt_info(&prompt);
+        info!(prompt_id = prompt.id, mode = %prompt.mode.label(), "prompt added");
+        let info_msg = self.to_prompt_info(&prompt);
         self.prompts.push(prompt);
-        self.sessions.broadcast(&DaemonEvent::PromptAdded(info));
+        self.sessions.broadcast(&DaemonEvent::PromptAdded(info_msg));
     }
 
     fn next_pending_prompt_index(&self) -> Option<usize> {
@@ -265,7 +276,10 @@ impl Orchestrator {
                         std::thread::spawn(move || {
                             let result = clhorde_core::worktree::create_worktree(&repo, prompt_id)
                                 .map(|p| p.to_string_lossy().to_string());
-                            let _ = tx.send(WorkerMessage::WorktreeCreated { prompt_id, result });
+                            let _ = tx.blocking_send(WorkerMessage::WorktreeCreated {
+                                prompt_id,
+                                result,
+                            });
                         });
                         continue;
                     } else {
@@ -280,6 +294,7 @@ impl Orchestrator {
 
             self.mark_running(idx);
             self.active_workers += 1;
+            info!(prompt_id, mode = %mode.label(), active_workers = self.active_workers, "dispatching worker");
             self.sessions.broadcast(&DaemonEvent::ActiveWorkersChanged {
                 count: self.active_workers,
             });
@@ -413,14 +428,14 @@ impl Orchestrator {
                             }
                             Err(_) => Some(1),
                         };
-                        let _ = tx.send(WorkerMessage::Finished {
+                        let _ = tx.blocking_send(WorkerMessage::Finished {
                             prompt_id,
                             exit_code,
                         });
                     });
                 } else {
                     // Handle already removed (kill race) — send synthetic Finished
-                    let _ = self.worker_tx.send(WorkerMessage::Finished {
+                    let _ = self.worker_tx.try_send(WorkerMessage::Finished {
                         prompt_id,
                         exit_code: None,
                     });
@@ -480,6 +495,12 @@ impl Orchestrator {
                 self.worker_inputs.remove(&prompt_id);
                 self.active_workers = self.active_workers.saturating_sub(1);
 
+                info!(
+                    prompt_id,
+                    ?exit_code,
+                    active_workers = self.active_workers,
+                    "worker finished"
+                );
                 self.sessions.broadcast(&DaemonEvent::WorkerFinished {
                     prompt_id,
                     exit_code,
@@ -521,6 +542,7 @@ impl Orchestrator {
                 }
             }
             WorkerMessage::SpawnError { prompt_id, error } => {
+                warn!(prompt_id, %error, "worker spawn error");
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
                     prompt.status = PromptStatus::Failed;
                     prompt.mark_finished();
@@ -562,10 +584,7 @@ impl Orchestrator {
                 worktree,
                 tags,
             } => {
-                let prompt_mode = match mode.as_str() {
-                    "one-shot" | "one_shot" | "oneshot" => PromptMode::OneShot,
-                    _ => PromptMode::Interactive,
-                };
+                let prompt_mode = PromptMode::from_mode_str(&mode);
                 self.add_prompt(text, cwd, prompt_mode, worktree, tags);
                 self.dispatch_workers();
             }
@@ -656,16 +675,10 @@ impl Orchestrator {
                 self.dispatch_workers();
             }
             ClientRequest::SetDefaultMode { mode } => {
-                self.default_mode = match mode.as_str() {
-                    "one-shot" | "one_shot" | "oneshot" => PromptMode::OneShot,
-                    _ => PromptMode::Interactive,
-                };
+                self.default_mode = PromptMode::from_mode_str(&mode);
             }
             ClientRequest::SetPromptMode { prompt_id, mode } => {
-                let new_mode = match mode.as_str() {
-                    "one-shot" | "one_shot" | "oneshot" => PromptMode::OneShot,
-                    _ => PromptMode::Interactive,
-                };
+                let new_mode = PromptMode::from_mode_str(&mode);
                 if let Some(idx) = self.prompts.iter().position(|p| p.id == prompt_id) {
                     if self.prompts[idx].status == PromptStatus::Pending {
                         self.prompts[idx].mode = new_mode;
@@ -821,6 +834,7 @@ impl Orchestrator {
     // ── Kill ──
 
     fn kill_worker(&mut self, id: usize) {
+        info!(prompt_id = id, "killing worker");
         if let Some(sender) = self.worker_inputs.get(&id) {
             let _ = sender.send(WorkerInput::Kill);
         }
@@ -929,6 +943,9 @@ impl Orchestrator {
             .map(|p| p.id)
             .collect();
         let count = to_remove.len();
+        if count > 0 {
+            debug!(filter, count, "store drop");
+        }
         for id in to_remove {
             self.delete_prompt(id);
         }
@@ -1204,7 +1221,7 @@ mod tests {
         // the session receives the expected events.
 
         // Register a session
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::channel(1024);
         orch.sessions.add_session_with_id(1, event_tx);
 
         // Manually insert a pty_handle with our ring buffer
@@ -1243,7 +1260,7 @@ mod tests {
     #[tokio::test]
     async fn add_prompt_broadcasts_prompt_added() {
         let mut orch = Orchestrator::new_for_test();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1024);
         orch.sessions.add_session_with_id(1, tx);
         orch.sessions.set_subscribed(1, true);
 
@@ -1320,7 +1337,7 @@ mod tests {
     #[tokio::test]
     async fn set_max_workers_clamps_and_broadcasts() {
         let mut orch = Orchestrator::new_for_test();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1024);
         orch.sessions.add_session_with_id(1, tx);
         orch.sessions.set_subscribed(1, true);
 
@@ -1347,7 +1364,7 @@ mod tests {
     async fn get_state_sends_snapshot_to_requesting_session() {
         let mut orch = Orchestrator::new_for_test();
         insert_prompt(&mut orch, 1, PromptStatus::Pending);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1024);
         orch.sessions.add_session_with_id(1, tx);
 
         orch.handle_request(clhorde_core::protocol::ClientRequest::GetState, 1);
@@ -1369,7 +1386,7 @@ mod tests {
         let mut orch = Orchestrator::new_for_test();
         insert_prompt(&mut orch, 1, PromptStatus::Completed);
         orch.prompts[0].output = Some("hello world".into());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1024);
         orch.sessions.add_session_with_id(1, tx);
 
         orch.handle_request(
@@ -1460,7 +1477,7 @@ mod tests {
         insert_prompt(&mut orch, 1, PromptStatus::Running);
         // No worker_inputs entry for prompt 1 (simulates one-shot worker)
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1024);
         orch.sessions.add_session_with_id(1, tx);
 
         orch.handle_request(
@@ -1489,7 +1506,7 @@ mod tests {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel();
         orch.worker_inputs.insert(1, input_tx);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1024);
         orch.sessions.add_session_with_id(1, tx);
         orch.sessions.set_subscribed(1, true);
 
@@ -1570,5 +1587,36 @@ mod tests {
         let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
         assert_eq!(prompt.status, PromptStatus::Failed);
         assert!(prompt.error.as_ref().unwrap().contains("worktree"));
+    }
+
+    // ── runtime pruning ──
+
+    #[tokio::test]
+    async fn add_prompt_prunes_beyond_max_saved() {
+        let dir = std::env::temp_dir().join(format!("clhorde-prune-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut orch = Orchestrator::new_for_test();
+        orch.prompts_dir = Some(dir.clone());
+        orch.max_saved_prompts = 3;
+        orch.max_workers = 0; // prevent dispatch
+
+        // Add 5 prompts — only 3 should remain on disk
+        for _ in 0..5 {
+            orch.add_prompt(
+                "test".to_string(),
+                None,
+                PromptMode::Interactive,
+                false,
+                Vec::new(),
+            );
+            // Small sleep to ensure UUID v7 ordering
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let on_disk = clhorde_core::persistence::load_all_prompts(&dir);
+        assert_eq!(on_disk.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

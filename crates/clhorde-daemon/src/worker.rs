@@ -69,7 +69,7 @@ pub fn spawn_worker(
     prompt_text: String,
     cwd: Option<String>,
     mode: PromptMode,
-    tx: mpsc::UnboundedSender<WorkerMessage>,
+    tx: mpsc::Sender<WorkerMessage>,
     pty_size: Option<(u16, u16)>,
     resume_session_id: Option<String>,
     pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
@@ -105,7 +105,7 @@ fn spawn_oneshot(
     prompt_id: usize,
     prompt_text: String,
     cwd: Option<String>,
-    tx: mpsc::UnboundedSender<WorkerMessage>,
+    tx: mpsc::Sender<WorkerMessage>,
     resume_session_id: Option<String>,
 ) {
     std::thread::spawn(move || {
@@ -138,7 +138,7 @@ fn spawn_oneshot(
         {
             Ok(child) => child,
             Err(e) => {
-                let _ = tx.send(WorkerMessage::SpawnError {
+                let _ = tx.blocking_send(WorkerMessage::SpawnError {
                     prompt_id,
                     error: format!("Failed to spawn claude: {e}"),
                 });
@@ -161,7 +161,7 @@ fn spawn_oneshot(
 
         let _ = reader_handle.join();
 
-        let _ = tx.send(WorkerMessage::Finished {
+        let _ = tx.blocking_send(WorkerMessage::Finished {
             prompt_id,
             exit_code,
         });
@@ -172,7 +172,7 @@ fn spawn_oneshot(
 fn read_stream_json(
     prompt_id: usize,
     stdout: std::process::ChildStdout,
-    tx: &mpsc::UnboundedSender<WorkerMessage>,
+    tx: &mpsc::Sender<WorkerMessage>,
 ) {
     let reader = BufReader::new(stdout);
     for line in reader.lines() {
@@ -192,7 +192,7 @@ fn read_stream_json(
         // Capture session_id from init message
         if json["type"] == "system" {
             if let Some(session_id) = json["session_id"].as_str() {
-                let _ = tx.send(WorkerMessage::SessionId {
+                let _ = tx.blocking_send(WorkerMessage::SessionId {
                     prompt_id,
                     session_id: session_id.to_string(),
                 });
@@ -203,7 +203,7 @@ fn read_stream_json(
         if json["type"] == "stream_event" {
             if let Some(text) = json["event"]["delta"]["text"].as_str() {
                 if !text.is_empty() {
-                    let _ = tx.send(WorkerMessage::OutputChunk {
+                    let _ = tx.blocking_send(WorkerMessage::OutputChunk {
                         prompt_id,
                         text: text.to_string(),
                     });

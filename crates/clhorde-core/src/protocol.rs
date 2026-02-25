@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Current protocol version. Increment when making breaking changes to
+/// `ClientRequest`, `DaemonEvent`, or `DaemonState`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientRequest {
@@ -184,10 +188,7 @@ impl PromptInfo {
 
     /// Parse the `mode` string back to a `PromptMode` enum.
     pub fn mode_enum(&self) -> crate::prompt::PromptMode {
-        match self.mode.as_str() {
-            "one-shot" | "one_shot" | "oneshot" => crate::prompt::PromptMode::OneShot,
-            _ => crate::prompt::PromptMode::Interactive,
-        }
+        crate::prompt::PromptMode::from_mode_str(&self.mode)
     }
 
     /// Format `elapsed_secs` as a human-readable duration string.
@@ -214,6 +215,9 @@ pub struct DaemonState {
     pub max_workers: usize,
     pub active_workers: usize,
     pub default_mode: String,
+    /// Protocol version of the daemon. Clients should warn if mismatched.
+    #[serde(default)]
+    pub protocol_version: u32,
 }
 
 #[cfg(test)]
@@ -251,5 +255,34 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let decoded: DaemonEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, DaemonEvent::Unsubscribed));
+    }
+
+    #[test]
+    fn protocol_version_is_1() {
+        assert_eq!(PROTOCOL_VERSION, 1);
+    }
+
+    #[test]
+    fn daemon_state_serde_roundtrip_includes_version() {
+        let state = DaemonState {
+            prompts: vec![],
+            max_workers: 3,
+            active_workers: 0,
+            default_mode: "interactive".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("protocol_version"));
+        let decoded: DaemonState = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn daemon_state_without_version_defaults_to_zero() {
+        // Backward compat: old daemons without protocol_version field
+        let json =
+            r#"{"prompts":[],"max_workers":3,"active_workers":0,"default_mode":"interactive"}"#;
+        let decoded: DaemonState = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.protocol_version, 0);
     }
 }

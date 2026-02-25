@@ -5,7 +5,7 @@
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use clhorde_core::ipc;
+use clhorde_core::ipc::{self, MAX_FRAME_SIZE};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent};
 
 const CONNECT_ERROR: &str = "Failed to connect to daemon. Is it running? Start with: clhorded";
@@ -37,7 +37,7 @@ pub async fn request(req: ClientRequest) -> Result<DaemonEvent, String> {
             .await
             .map_err(|e| format!("Read error: {e}"))?;
         let len = u32::from_be_bytes(len_buf) as usize;
-        if len > 16 * 1024 * 1024 {
+        if len > MAX_FRAME_SIZE {
             return Err("Response frame too large".to_string());
         }
         let mut payload = vec![0u8; len];
@@ -90,7 +90,7 @@ pub async fn stream_events(
             break;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
-        if len > 16 * 1024 * 1024 {
+        if len > MAX_FRAME_SIZE {
             break;
         }
         let mut payload = vec![0u8; len];

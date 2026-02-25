@@ -3,7 +3,7 @@ use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use clhorde_core::ipc;
+use clhorde_core::ipc::{self, MAX_FRAME_SIZE};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent};
 
 /// Message received from the daemon.
@@ -74,7 +74,7 @@ async fn read_loop(
             break;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
-        if len > 16 * 1024 * 1024 {
+        if len > MAX_FRAME_SIZE {
             let _ = msg_tx.send(DaemonMessage::Disconnected);
             break;
         }
@@ -97,7 +97,10 @@ async fn read_loop(
                         break;
                     }
                 }
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!("Warning: failed to decode PTY frame: {e}");
+                    continue;
+                }
             }
         } else {
             match serde_json::from_slice::<DaemonEvent>(&payload) {
@@ -106,7 +109,10 @@ async fn read_loop(
                         break;
                     }
                 }
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!("Warning: failed to deserialize daemon event: {e}");
+                    continue;
+                }
             }
         }
     }

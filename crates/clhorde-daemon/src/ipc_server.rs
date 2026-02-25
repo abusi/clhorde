@@ -4,7 +4,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-use clhorde_core::ipc::{self, PTY_FRAME_MARKER};
+use tracing::{info, warn};
+
+use clhorde_core::ipc::{self, MAX_FRAME_SIZE, PTY_FRAME_MARKER};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent};
 
 /// Command sent from a client handler to the main orchestrator loop.
@@ -20,7 +22,7 @@ async fn read_frame_async(
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 16 * 1024 * 1024 {
+    if len > MAX_FRAME_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("Frame too large: {len}"),
@@ -47,12 +49,12 @@ async fn write_frame_async(
 pub async fn run_server(
     socket_path: PathBuf,
     cmd_tx: mpsc::UnboundedSender<ServerCommand>,
-    session_register_tx: mpsc::UnboundedSender<(usize, mpsc::UnboundedSender<DaemonEvent>)>,
+    session_register_tx: mpsc::UnboundedSender<(usize, mpsc::Sender<DaemonEvent>)>,
     session_unregister_tx: mpsc::UnboundedSender<usize>,
     pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket_path)?;
-    eprintln!("Listening on {}", socket_path.display());
+    info!(socket = %socket_path.display(), "IPC server listening");
 
     let mut next_session_id: usize = 1;
 
@@ -84,14 +86,14 @@ async fn handle_client(
     stream: UnixStream,
     session_id: usize,
     cmd_tx: mpsc::UnboundedSender<ServerCommand>,
-    session_register_tx: mpsc::UnboundedSender<(usize, mpsc::UnboundedSender<DaemonEvent>)>,
+    session_register_tx: mpsc::UnboundedSender<(usize, mpsc::Sender<DaemonEvent>)>,
     session_unregister_tx: mpsc::UnboundedSender<usize>,
     pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Register this client's event channel with the orchestrator
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<DaemonEvent>();
+    let (event_tx, mut event_rx) = mpsc::channel::<DaemonEvent>(1024);
     if session_register_tx.send((session_id, event_tx)).is_err() {
         return;
     }
@@ -122,7 +124,10 @@ async fn handle_client(
 
                     let json = match serde_json::to_vec(&event) {
                         Ok(j) => j,
-                        Err(_) => continue,
+                        Err(e) => {
+                            warn!(session_id, error = %e, "failed to serialize event");
+                            continue;
+                        }
                     };
                     if write_frame_async(&mut writer, &json).await.is_err() {
                         break;
@@ -162,7 +167,7 @@ async fn handle_client(
             let request: ClientRequest = match serde_json::from_slice(&payload) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("Invalid request from session {session_id}: {e}");
+                    warn!(session_id, error = %e, "invalid request from client");
                     continue;
                 }
             };
