@@ -62,10 +62,7 @@ fn store_list() -> i32 {
                 println!("No stored prompts.");
                 return 0;
             }
-            println!(
-                "{:<38} {:<11} {:<13} PROMPT",
-                "UUID", "STATE", "MODE"
-            );
+            println!("{:<38} {:<11} {:<13} PROMPT", "UUID", "STATE", "MODE");
             println!("{}", "-".repeat(78));
             for info in &prompts {
                 let text = if info.text.len() > 40 {

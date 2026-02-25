@@ -9,9 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::editor::TextBuffer;
 use crate::key_encoding;
-use crate::keymap::{
-    FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction,
-};
+use crate::keymap::{FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction};
 use crate::pty_renderer::PtyRenderer;
 use clhorde_core::prompt::{PromptMode, PromptStatus};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent, DaemonState, PromptInfo};
@@ -203,7 +201,13 @@ impl App {
 
     // ── Add prompt ──
 
-    pub fn add_prompt(&mut self, text: String, cwd: Option<String>, worktree: bool, tags: Vec<String>) {
+    pub fn add_prompt(
+        &mut self,
+        text: String,
+        cwd: Option<String>,
+        worktree: bool,
+        tags: Vec<String>,
+    ) {
         self.send(ClientRequest::SubmitPrompt {
             text,
             cwd,
@@ -292,9 +296,7 @@ impl App {
     }
 
     pub fn selected_prompt(&self) -> Option<&PromptInfo> {
-        self.list_state
-            .selected()
-            .and_then(|i| self.prompts.get(i))
+        self.list_state.selected().and_then(|i| self.prompts.get(i))
     }
 
     /// Mark the currently selected prompt as seen if it's finished (local-only).
@@ -412,12 +414,23 @@ impl App {
             DaemonEvent::ActiveWorkersChanged { count } => {
                 self.active_workers = count;
             }
+            DaemonEvent::PtyReplay { prompt_id, data } => {
+                // Auto-create PTY renderer if missing, then replay bytes
+                if !self.pty_renderers.contains_key(&prompt_id) {
+                    let (cols, rows) = self.output_panel_size.unwrap_or((80, 24));
+                    self.pty_renderers
+                        .insert(prompt_id, PtyRenderer::new(cols, rows));
+                }
+                self.apply_pty_bytes(prompt_id, &data);
+            }
             // Events we don't need to handle
             DaemonEvent::PtyUpdate { .. }
             | DaemonEvent::TurnComplete { .. }
             | DaemonEvent::SessionId { .. }
             | DaemonEvent::WorkerStarted { .. }
             | DaemonEvent::Pong
+            | DaemonEvent::Subscribed
+            | DaemonEvent::Unsubscribed
             | DaemonEvent::StoreListResult { .. }
             | DaemonEvent::StoreCountResult { .. }
             | DaemonEvent::StorePathResult { .. }
@@ -570,7 +583,8 @@ impl App {
         }
 
         // g starts the gg sequence
-        if key.code == KeyCode::Char('g') && key.modifiers == KeyModifiers::NONE
+        if key.code == KeyCode::Char('g')
+            && key.modifiers == KeyModifiers::NONE
             && !self.keymap.normal.contains_key(&KeyCode::Char('g'))
         {
             self.pending_g = true;
@@ -1222,7 +1236,11 @@ impl App {
     }
 
     fn half_page_size(&self) -> usize {
-        let h = if self.list_height > 2 { self.list_height - 2 } else { 10 };
+        let h = if self.list_height > 2 {
+            self.list_height - 2
+        } else {
+            10
+        };
         (h as usize / 2).max(1)
     }
 
@@ -1279,8 +1297,7 @@ impl App {
             return;
         }
         if self.filter_text.is_some() && !self.filtered_indices.is_empty() {
-            self.list_state
-                .select(Some(self.filtered_indices[0]));
+            self.list_state.select(Some(self.filtered_indices[0]));
         } else {
             self.list_state.select(Some(0));
         }
@@ -1322,14 +1339,11 @@ impl App {
 
         match fs::write(&filename, &content) {
             Ok(_) => {
-                self.status_message = Some((
-                    format!("Saved to {}", filename.display()),
-                    Instant::now(),
-                ));
+                self.status_message =
+                    Some((format!("Saved to {}", filename.display()), Instant::now()));
             }
             Err(e) => {
-                self.status_message =
-                    Some((format!("Export failed: {e}"), Instant::now()));
+                self.status_message = Some((format!("Export failed: {e}"), Instant::now()));
             }
         }
     }
@@ -1416,11 +1430,11 @@ impl App {
                     .iter()
                     .enumerate()
                     .filter(|(_, p)| {
-                        let tags_match = tag_filters.iter().all(|tf| {
-                            p.tags.iter().any(|t| t.to_lowercase() == *tf)
-                        });
-                        let text_match = text_filter.is_empty()
-                            || p.text.to_lowercase().contains(&text_filter);
+                        let tags_match = tag_filters
+                            .iter()
+                            .all(|tf| p.tags.iter().any(|t| t.to_lowercase() == *tf));
+                        let text_match =
+                            text_filter.is_empty() || p.text.to_lowercase().contains(&text_filter);
                         tags_match && text_match
                     })
                     .map(|(i, _)| i)
@@ -1538,7 +1552,9 @@ impl App {
         let eligible: Vec<(usize, PromptMode)> = self
             .prompts
             .iter()
-            .filter(|p| self.selected_ids.contains(&p.id) && p.status_enum() == PromptStatus::Pending)
+            .filter(|p| {
+                self.selected_ids.contains(&p.id) && p.status_enum() == PromptStatus::Pending
+            })
             .map(|p| (p.id, p.mode_enum().toggle()))
             .collect();
         let count = eligible.len();
@@ -1637,7 +1653,11 @@ impl App {
     }
 
     fn accept_template_suggestion(&mut self) {
-        if let Some(name) = self.template_suggestions.get(self.template_suggestion_index).cloned() {
+        if let Some(name) = self
+            .template_suggestions
+            .get(self.template_suggestion_index)
+            .cloned()
+        {
             if let Some(template_text) = self.templates.get(&name).cloned() {
                 self.input.set(&format!("{template_text} "));
                 self.template_suggestions.clear();
@@ -1879,7 +1899,10 @@ mod tests {
         app.move_selected_down();
         assert_eq!(app.list_state.selected(), Some(1)); // optimistic
         let msg = rx.try_recv().unwrap();
-        assert!(matches!(msg, ClientRequest::MovePromptDown { prompt_id: 1 }));
+        assert!(matches!(
+            msg,
+            ClientRequest::MovePromptDown { prompt_id: 1 }
+        ));
     }
 
     #[test]
@@ -2217,10 +2240,7 @@ mod tests {
     fn apply_state_snapshot_replaces_prompts() {
         let (mut app, _rx) = new_test_app();
         let state = DaemonState {
-            prompts: vec![
-                make_prompt_info(1, "a"),
-                make_prompt_info(2, "b"),
-            ],
+            prompts: vec![make_prompt_info(1, "a"), make_prompt_info(2, "b")],
             max_workers: 5,
             active_workers: 2,
             default_mode: "one-shot".to_string(),
@@ -2372,7 +2392,9 @@ mod tests {
 
     #[test]
     fn half_page_down_with_filter() {
-        let texts: Vec<&str> = (0..30).map(|i| if i % 2 == 0 { "even" } else { "odd" }).collect();
+        let texts: Vec<&str> = (0..30)
+            .map(|i| if i % 2 == 0 { "even" } else { "odd" })
+            .collect();
         let (mut app, _rx) = app_with_prompts(&texts);
         app.filter_text = Some("even".to_string());
         app.rebuild_filter();

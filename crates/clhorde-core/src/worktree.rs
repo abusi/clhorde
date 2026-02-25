@@ -15,7 +15,12 @@ pub fn is_git_repo(path: &Path) -> bool {
 /// Get the repo root directory (git rev-parse --show-toplevel).
 pub fn repo_root(path: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
-        .args(["-C", &path.to_string_lossy(), "rev-parse", "--show-toplevel"])
+        .args([
+            "-C",
+            &path.to_string_lossy(),
+            "rev-parse",
+            "--show-toplevel",
+        ])
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
@@ -180,8 +185,20 @@ mod tests {
             .expect("git init");
         // Configure identity so commits work in CI (no global git config).
         for args in [
-            &["-C", &*repo.to_string_lossy(), "config", "user.email", "test@test"][..],
-            &["-C", &*repo.to_string_lossy(), "config", "user.name", "test"][..],
+            &[
+                "-C",
+                &*repo.to_string_lossy(),
+                "config",
+                "user.email",
+                "test@test",
+            ][..],
+            &[
+                "-C",
+                &*repo.to_string_lossy(),
+                "config",
+                "user.name",
+                "test",
+            ][..],
         ] {
             Command::new("git")
                 .args(args)
@@ -192,7 +209,14 @@ mod tests {
         }
         // Need at least one commit for worktrees to work.
         Command::new("git")
-            .args(["-C", &repo.to_string_lossy(), "commit", "--allow-empty", "-m", "init"])
+            .args([
+                "-C",
+                &repo.to_string_lossy(),
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()

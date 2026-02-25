@@ -30,10 +30,7 @@ pub fn cmd_status(args: &[String]) -> i32 {
                 return 0;
             }
 
-            println!(
-                "{:<4} {:<14} {:<13} PROMPT",
-                "ID", "STATUS", "MODE"
-            );
+            println!("{:<4} {:<14} {:<13} PROMPT", "ID", "STATUS", "MODE");
             println!("{}", "-".repeat(70));
             for info in &state.prompts {
                 let text = if info.text.len() > 40 {
@@ -42,11 +39,8 @@ pub fn cmd_status(args: &[String]) -> i32 {
                     info.text.clone()
                 };
                 let text = text.replace('\n', " ");
-                let status_display = format!(
-                    "{} {}",
-                    info.status_symbol(),
-                    info.status.to_lowercase()
-                );
+                let status_display =
+                    format!("{} {}", info.status_symbol(), info.status.to_lowercase());
                 println!(
                     "{:<4} {:<14} {:<13} {}",
                     info.id, status_display, info.mode, text

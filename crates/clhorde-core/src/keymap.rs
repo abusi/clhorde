@@ -220,8 +220,7 @@ pub fn save_toml_config(config: &TomlConfig) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let content = toml::to_string_pretty(config)
-        .map_err(io::Error::other)?;
+    let content = toml::to_string_pretty(config).map_err(io::Error::other)?;
     fs::write(&path, content)
 }
 
@@ -261,10 +260,7 @@ pub fn keys_for_action<A: PartialEq>(map: &HashMap<KeyCode, A>, action: A) -> Ve
 
 /// Format a list of keycodes as a display string like "j/k" or "Esc/q".
 pub fn format_keys(keys: &[KeyCode]) -> String {
-    keys.iter()
-        .map(key_display)
-        .collect::<Vec<_>>()
-        .join("/")
+    keys.iter().map(key_display).collect::<Vec<_>>().join("/")
 }
 
 // ── Action enums ──
@@ -438,38 +434,110 @@ impl Keymap {
         if let Some(normal) = config.normal {
             apply_bindings(&mut keymap.normal, NormalAction::Quit, normal.quit);
             apply_bindings(&mut keymap.normal, NormalAction::Insert, normal.insert);
-            apply_bindings(&mut keymap.normal, NormalAction::SelectNext, normal.select_next);
-            apply_bindings(&mut keymap.normal, NormalAction::SelectPrev, normal.select_prev);
-            apply_bindings(&mut keymap.normal, NormalAction::ViewOutput, normal.view_output);
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::SelectNext,
+                normal.select_next,
+            );
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::SelectPrev,
+                normal.select_prev,
+            );
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::ViewOutput,
+                normal.view_output,
+            );
             apply_bindings(&mut keymap.normal, NormalAction::Interact, normal.interact);
-            apply_bindings(&mut keymap.normal, NormalAction::IncreaseWorkers, normal.increase_workers);
-            apply_bindings(&mut keymap.normal, NormalAction::DecreaseWorkers, normal.decrease_workers);
-            apply_bindings(&mut keymap.normal, NormalAction::ToggleMode, normal.toggle_mode);
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::IncreaseWorkers,
+                normal.increase_workers,
+            );
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::DecreaseWorkers,
+                normal.decrease_workers,
+            );
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::ToggleMode,
+                normal.toggle_mode,
+            );
             apply_bindings(&mut keymap.normal, NormalAction::Retry, normal.retry);
             apply_bindings(&mut keymap.normal, NormalAction::Resume, normal.resume);
             apply_bindings(&mut keymap.normal, NormalAction::MoveUp, normal.move_up);
             apply_bindings(&mut keymap.normal, NormalAction::MoveDown, normal.move_down);
             apply_bindings(&mut keymap.normal, NormalAction::Search, normal.search);
-            apply_bindings(&mut keymap.normal, NormalAction::HalfPageDown, normal.half_page_down);
-            apply_bindings(&mut keymap.normal, NormalAction::HalfPageUp, normal.half_page_up);
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::HalfPageDown,
+                normal.half_page_down,
+            );
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::HalfPageUp,
+                normal.half_page_up,
+            );
             apply_bindings(&mut keymap.normal, NormalAction::GoToTop, normal.go_to_top);
-            apply_bindings(&mut keymap.normal, NormalAction::GoToBottom, normal.go_to_bottom);
-            apply_bindings(&mut keymap.normal, NormalAction::ShrinkList, normal.shrink_list);
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::GoToBottom,
+                normal.go_to_bottom,
+            );
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::ShrinkList,
+                normal.shrink_list,
+            );
             apply_bindings(&mut keymap.normal, NormalAction::GrowList, normal.grow_list);
             apply_bindings(&mut keymap.normal, NormalAction::ShowHelp, normal.show_help);
-            apply_bindings(&mut keymap.normal, NormalAction::ToggleSelect, normal.toggle_select);
-            apply_bindings(&mut keymap.normal, NormalAction::SelectAllVisible, normal.select_all_visible);
-            apply_bindings(&mut keymap.normal, NormalAction::VisualSelect, normal.visual_select);
-            apply_bindings(&mut keymap.normal, NormalAction::DeleteSelected, normal.delete_selected);
-            apply_bindings(&mut keymap.normal, NormalAction::KillSelected, normal.kill_selected);
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::ToggleSelect,
+                normal.toggle_select,
+            );
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::SelectAllVisible,
+                normal.select_all_visible,
+            );
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::VisualSelect,
+                normal.visual_select,
+            );
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::DeleteSelected,
+                normal.delete_selected,
+            );
+            apply_bindings(
+                &mut keymap.normal,
+                NormalAction::KillSelected,
+                normal.kill_selected,
+            );
         }
 
         if let Some(insert) = config.insert {
             apply_bindings(&mut keymap.insert, InsertAction::Cancel, insert.cancel);
             apply_bindings(&mut keymap.insert, InsertAction::Submit, insert.submit);
-            apply_bindings(&mut keymap.insert, InsertAction::AcceptSuggestion, insert.accept_suggestion);
-            apply_bindings(&mut keymap.insert, InsertAction::NextSuggestion, insert.next_suggestion);
-            apply_bindings(&mut keymap.insert, InsertAction::PrevSuggestion, insert.prev_suggestion);
+            apply_bindings(
+                &mut keymap.insert,
+                InsertAction::AcceptSuggestion,
+                insert.accept_suggestion,
+            );
+            apply_bindings(
+                &mut keymap.insert,
+                InsertAction::NextSuggestion,
+                insert.next_suggestion,
+            );
+            apply_bindings(
+                &mut keymap.insert,
+                InsertAction::PrevSuggestion,
+                insert.prev_suggestion,
+            );
         }
 
         if let Some(view) = config.view {
@@ -477,7 +545,11 @@ impl Keymap {
             apply_bindings(&mut keymap.view, ViewAction::ScrollDown, view.scroll_down);
             apply_bindings(&mut keymap.view, ViewAction::ScrollUp, view.scroll_up);
             apply_bindings(&mut keymap.view, ViewAction::Interact, view.interact);
-            apply_bindings(&mut keymap.view, ViewAction::ToggleAutoscroll, view.toggle_autoscroll);
+            apply_bindings(
+                &mut keymap.view,
+                ViewAction::ToggleAutoscroll,
+                view.toggle_autoscroll,
+            );
             apply_bindings(&mut keymap.view, ViewAction::KillWorker, view.kill_worker);
             apply_bindings(&mut keymap.view, ViewAction::Export, view.export);
             apply_bindings(&mut keymap.view, ViewAction::ToggleSplit, view.toggle_split);
@@ -543,7 +615,10 @@ impl Keymap {
                 grow_list: Some(keys_to_strings(&km.normal, NormalAction::GrowList)),
                 show_help: Some(keys_to_strings(&km.normal, NormalAction::ShowHelp)),
                 toggle_select: Some(keys_to_strings(&km.normal, NormalAction::ToggleSelect)),
-                select_all_visible: Some(keys_to_strings(&km.normal, NormalAction::SelectAllVisible)),
+                select_all_visible: Some(keys_to_strings(
+                    &km.normal,
+                    NormalAction::SelectAllVisible,
+                )),
                 visual_select: Some(keys_to_strings(&km.normal, NormalAction::VisualSelect)),
                 delete_selected: Some(keys_to_strings(&km.normal, NormalAction::DeleteSelected)),
                 kill_selected: Some(keys_to_strings(&km.normal, NormalAction::KillSelected)),
@@ -551,7 +626,10 @@ impl Keymap {
             insert: Some(TomlInsertBindings {
                 cancel: Some(keys_to_strings(&km.insert, InsertAction::Cancel)),
                 submit: Some(keys_to_strings(&km.insert, InsertAction::Submit)),
-                accept_suggestion: Some(keys_to_strings(&km.insert, InsertAction::AcceptSuggestion)),
+                accept_suggestion: Some(keys_to_strings(
+                    &km.insert,
+                    InsertAction::AcceptSuggestion,
+                )),
                 next_suggestion: Some(keys_to_strings(&km.insert, InsertAction::NextSuggestion)),
                 prev_suggestion: Some(keys_to_strings(&km.insert, InsertAction::PrevSuggestion)),
             }),
@@ -740,8 +818,19 @@ mod tests {
     #[test]
     fn key_display_roundtrip() {
         let names = [
-            "Enter", "Esc", "Tab", "Backspace", "Up", "Down", "Left", "Right", "Space",
-            "q", "i", "+", "/",
+            "Enter",
+            "Esc",
+            "Tab",
+            "Backspace",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Space",
+            "q",
+            "i",
+            "+",
+            "/",
         ];
         for name in names {
             let kc = parse_key(name).unwrap();
@@ -752,7 +841,10 @@ mod tests {
     // ── apply_bindings ──
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum TestAction { A, B }
+    enum TestAction {
+        A,
+        B,
+    }
 
     #[test]
     fn apply_bindings_removes_old_keys() {
@@ -782,14 +874,38 @@ mod tests {
     #[test]
     fn default_normal_bindings() {
         let km = Keymap::default();
-        assert_eq!(km.normal.get(&KeyCode::Char('q')), Some(&NormalAction::Quit));
-        assert_eq!(km.normal.get(&KeyCode::Char('i')), Some(&NormalAction::Insert));
-        assert_eq!(km.normal.get(&KeyCode::Char('j')), Some(&NormalAction::SelectNext));
-        assert_eq!(km.normal.get(&KeyCode::Down), Some(&NormalAction::SelectNext));
-        assert_eq!(km.normal.get(&KeyCode::Enter), Some(&NormalAction::ViewOutput));
-        assert_eq!(km.normal.get(&KeyCode::Char('m')), Some(&NormalAction::ToggleMode));
-        assert_eq!(km.normal.get(&KeyCode::Char('r')), Some(&NormalAction::Retry));
-        assert_eq!(km.normal.get(&KeyCode::Char('/')), Some(&NormalAction::Search));
+        assert_eq!(
+            km.normal.get(&KeyCode::Char('q')),
+            Some(&NormalAction::Quit)
+        );
+        assert_eq!(
+            km.normal.get(&KeyCode::Char('i')),
+            Some(&NormalAction::Insert)
+        );
+        assert_eq!(
+            km.normal.get(&KeyCode::Char('j')),
+            Some(&NormalAction::SelectNext)
+        );
+        assert_eq!(
+            km.normal.get(&KeyCode::Down),
+            Some(&NormalAction::SelectNext)
+        );
+        assert_eq!(
+            km.normal.get(&KeyCode::Enter),
+            Some(&NormalAction::ViewOutput)
+        );
+        assert_eq!(
+            km.normal.get(&KeyCode::Char('m')),
+            Some(&NormalAction::ToggleMode)
+        );
+        assert_eq!(
+            km.normal.get(&KeyCode::Char('r')),
+            Some(&NormalAction::Retry)
+        );
+        assert_eq!(
+            km.normal.get(&KeyCode::Char('/')),
+            Some(&NormalAction::Search)
+        );
     }
 
     #[test]
@@ -801,8 +917,14 @@ quit = ["Q"]
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         let km = Keymap::from_toml(config);
         assert_eq!(km.normal.get(&KeyCode::Char('q')), None);
-        assert_eq!(km.normal.get(&KeyCode::Char('Q')), Some(&NormalAction::Quit));
-        assert_eq!(km.normal.get(&KeyCode::Char('i')), Some(&NormalAction::Insert));
+        assert_eq!(
+            km.normal.get(&KeyCode::Char('Q')),
+            Some(&NormalAction::Quit)
+        );
+        assert_eq!(
+            km.normal.get(&KeyCode::Char('i')),
+            Some(&NormalAction::Insert)
+        );
     }
 
     #[test]
@@ -815,7 +937,10 @@ c = "continue"
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         let km = Keymap::from_toml(config);
         assert_eq!(km.quick_prompts.len(), 2);
-        assert_eq!(km.quick_prompts.get(&KeyCode::Char('g')), Some(&"let's go".to_string()));
+        assert_eq!(
+            km.quick_prompts.get(&KeyCode::Char('g')),
+            Some(&"let's go".to_string())
+        );
     }
 
     #[test]

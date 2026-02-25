@@ -36,11 +36,7 @@ impl SessionManager {
     }
 
     /// Register a client with a pre-assigned session ID.
-    pub fn add_session_with_id(
-        &mut self,
-        id: usize,
-        event_tx: mpsc::UnboundedSender<DaemonEvent>,
-    ) {
+    pub fn add_session_with_id(&mut self, id: usize, event_tx: mpsc::UnboundedSender<DaemonEvent>) {
         self.sessions.push(ClientSession {
             id,
             event_tx,

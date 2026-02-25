@@ -2,11 +2,11 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line as ALine};
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::vte::ansi::{Color as AColor, NamedColor};
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::Frame;
 
 use crate::app::{App, AppMode};
 use crate::keymap::{NormalAction, ViewAction};
@@ -22,10 +22,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),  // status bar (1 content + bottom border)
-            Constraint::Min(5),    // main area
+            Constraint::Length(2),                // status bar (1 content + bottom border)
+            Constraint::Min(5),                   // main area
             Constraint::Length(input_bar_height), // input bar
-            Constraint::Length(1), // help bar
+            Constraint::Length(1),                // help bar
         ])
         .split(f.area());
 
@@ -97,11 +97,15 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             sep.clone(),
             Span::styled(
                 format!("#{}", prompt.id),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" {status_char}"),
-                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
             ),
         ];
         if let Some(elapsed) = prompt.elapsed_display() {
@@ -130,13 +134,19 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Span::raw(" "),
         Span::styled(
             format!(" {mode_str} "),
-            Style::default().fg(Color::Black).bg(mode_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .bg(mode_color)
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     if app.visual_select_active {
         spans.push(Span::styled(
             " VISUAL ",
-            Style::default().fg(Color::Black).bg(Color::LightBlue).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -159,17 +169,23 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         sep.clone(),
         Span::styled(
             format!("Q:{pending}"),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(
             format!("D:{done}"),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(
             format!("T:{total}"),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
     ]);
 
@@ -178,7 +194,9 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!("{} sel", app.selection_count()),
-            Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -193,10 +211,12 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     spans.push(sep);
     spans.push(Span::styled(
         format!("[{}]", app.default_mode.label()),
-        Style::default().fg(match app.default_mode {
-            PromptMode::Interactive => Color::Magenta,
-            PromptMode::OneShot => Color::Yellow,
-        }).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(match app.default_mode {
+                PromptMode::Interactive => Color::Magenta,
+                PromptMode::OneShot => Color::Yellow,
+            })
+            .add_modifier(Modifier::BOLD),
     ));
 
     let paragraph = Paragraph::new(Line::from(spans))
@@ -210,12 +230,19 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_main_area(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
-    let list_pct = if app.list_collapsed { 0 } else { app.list_ratio };
+    let list_pct = if app.list_collapsed {
+        0
+    } else {
+        app.list_ratio
+    };
     let output_pct = 100 - list_pct;
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(list_pct), Constraint::Percentage(output_pct)])
+        .constraints([
+            Constraint::Percentage(list_pct),
+            Constraint::Percentage(output_pct),
+        ])
         .split(area);
 
     if !app.list_collapsed {
@@ -248,7 +275,9 @@ fn tag_color(tag: &str) -> Color {
         Color::Cyan,
         Color::Yellow,
     ];
-    let hash: usize = tag.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+    let hash: usize = tag.bytes().fold(0usize, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(b as usize)
+    });
     PALETTE[hash % PALETTE.len()]
 }
 
@@ -271,7 +300,11 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
     let tick = app.tick;
     // Check for recently moved prompt (flash highlight for ~300ms)
     let moved_id = app.recently_moved.and_then(|(id, t)| {
-        if t.elapsed().as_millis() < 300 { Some(id) } else { None }
+        if t.elapsed().as_millis() < 300 {
+            Some(id)
+        } else {
+            None
+        }
     });
     let visible_indices = app.visible_prompt_indices().to_vec();
 
@@ -289,13 +322,16 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                 .unwrap_or_default();
 
             let is_unseen_done = !prompt.seen
-                && (status == PromptStatus::Completed
-                    || status == PromptStatus::Failed);
+                && (status == PromptStatus::Completed || status == PromptStatus::Failed);
 
             let status_style = match status {
                 PromptStatus::Pending => Style::default().fg(Color::Yellow),
-                PromptStatus::Running => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                PromptStatus::Idle => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                PromptStatus::Running => Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                PromptStatus::Idle => Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
                 PromptStatus::Completed => Style::default().fg(Color::Green),
                 PromptStatus::Failed => Style::default().fg(Color::Red),
             };
@@ -327,7 +363,11 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
             if status == PromptStatus::Idle {
                 overhead += 7; // " " + " IDLE "
             } else if is_unseen_done {
-                overhead += if status == PromptStatus::Completed { 8 } else { 9 };
+                overhead += if status == PromptStatus::Completed {
+                    8
+                } else {
+                    9
+                };
             }
 
             let max_text_chars = content_width.saturating_sub(overhead).max(8);
@@ -335,7 +375,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
 
             let cwd_hint = prompt.cwd.as_ref().map(|dir| {
                 let display = if dir.len() > 20 {
-                    format!(" [..{}]", &dir[dir.len()-18..])
+                    format!(" [..{}]", &dir[dir.len() - 18..])
                 } else {
                     format!(" [{dir}]")
                 };
@@ -343,7 +383,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
             });
 
             let status_tag = if status == PromptStatus::Idle {
-                let bright = (tick / 5) % 2 == 0;
+                let bright = (tick / 5).is_multiple_of(2);
                 let style = if bright {
                     Style::default()
                         .fg(Color::Black)
@@ -367,16 +407,14 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                     Color::Red
                 };
                 // Pulse between bright and dim every ~500ms (5 ticks at 100ms)
-                let bright = (tick / 5) % 2 == 0;
+                let bright = (tick / 5).is_multiple_of(2);
                 let style = if bright {
                     Style::default()
                         .fg(Color::Black)
                         .bg(tag_color)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
-                        .fg(tag_color)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().fg(tag_color).add_modifier(Modifier::BOLD)
                 };
                 Some(Span::styled(tag, style))
             } else {
@@ -388,24 +426,25 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                 spans.push(Span::styled("● ", Style::default().fg(Color::LightBlue)));
             }
             spans.extend([
-                Span::styled(
-                    format!("{} ", prompt.status_symbol()),
-                    status_style,
-                ),
-                Span::styled(
-                    id_str,
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!("{} ", prompt.status_symbol()), status_style),
+                Span::styled(id_str, Style::default().fg(Color::DarkGray)),
                 Span::raw(truncated),
                 Span::styled(elapsed, Style::default().fg(Color::DarkGray)),
             ]);
             if prompt.worktree {
-                spans.push(Span::styled(" [WT]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(
+                    " [WT]",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
             }
             for tag in &prompt.tags {
                 spans.push(Span::styled(
                     format!(" [{tag}]"),
-                    Style::default().fg(tag_color(tag)).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(tag_color(tag))
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
             if let Some(cwd_span) = cwd_hint {
@@ -425,16 +464,20 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
             }
             if moved_id == Some(prompt.id) {
                 // Flash highlight for recently reordered prompt
-                item.style(Style::default().bg(Color::Rgb(60, 60, 30)).add_modifier(Modifier::BOLD))
+                item.style(
+                    Style::default()
+                        .bg(Color::Rgb(60, 60, 30))
+                        .add_modifier(Modifier::BOLD),
+                )
             } else if status == PromptStatus::Idle {
-                let bg = if (tick / 5) % 2 == 0 {
+                let bg = if (tick / 5).is_multiple_of(2) {
                     Color::Rgb(45, 30, 50)
                 } else {
                     Color::Rgb(35, 25, 40)
                 };
                 item.style(Style::default().bg(bg))
             } else if is_unseen_done {
-                let bg = if (tick / 5) % 2 == 0 {
+                let bg = if (tick / 5).is_multiple_of(2) {
                     Color::Rgb(40, 50, 30)
                 } else {
                     Color::Rgb(30, 35, 25)
@@ -467,7 +510,9 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
                 .border_style(Style::default().fg(Color::Rgb(80, 80, 100)))
                 .title(Span::styled(
                     title,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 )),
         )
         .highlight_style(if moved_id.is_some() {
@@ -527,14 +572,22 @@ fn render_pty_output_viewer(
     is_pty_interact: bool,
 ) {
     // Show [WT] in PTY title if this prompt has a worktree
-    let wt_tag = if app.selected_prompt().is_some_and(|p| p.worktree_path.is_some()) {
+    let wt_tag = if app
+        .selected_prompt()
+        .is_some_and(|p| p.worktree_path.is_some())
+    {
         " [WT]"
     } else {
         ""
     };
     let title = format!(" PTY: #{id} [{cwd_str}]{wt_tag} ");
     let live_indicator = if is_pty_interact {
-        Span::styled(" [LIVE] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        Span::styled(
+            " [LIVE] ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::raw("")
     };
@@ -543,7 +596,9 @@ fn render_pty_output_viewer(
     let status_indicator = if let Some((ref msg, _)) = app.status_message {
         Span::styled(
             format!(" {msg} "),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )
     } else {
         Span::raw("")
@@ -561,7 +616,9 @@ fn render_pty_output_viewer(
         .title(vec![
             Span::styled(
                 title,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
             live_indicator,
             status_indicator,
@@ -700,7 +757,11 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
             let status = prompt.status_enum();
             let mode = prompt.mode_enum();
             let cwd_str = prompt.cwd.as_deref().unwrap_or(".");
-            let wt_tag = if prompt.worktree_path.is_some() { " [WT]" } else { "" };
+            let wt_tag = if prompt.worktree_path.is_some() {
+                " [WT]"
+            } else {
+                ""
+            };
             let title = format!(" Output: #{} [{}]{wt_tag} ", prompt.id, cwd_str);
             let content = match status {
                 PromptStatus::Pending => "(pending)".to_string(),
@@ -728,9 +789,10 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
                         None => format!("Idle ({elapsed}){hint}"),
                     }
                 }
-                PromptStatus::Completed => {
-                    prompt.output.clone().unwrap_or_else(|| "(no output)".to_string())
-                }
+                PromptStatus::Completed => prompt
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| "(no output)".to_string()),
                 PromptStatus::Failed => {
                     let mut text = String::from("FAILED");
                     if let Some(err) = &prompt.error {
@@ -746,7 +808,10 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
             };
             (title, content)
         }
-        None => (" Output ".to_string(), "Select a prompt to view output".to_string()),
+        None => (
+            " Output ".to_string(),
+            "Select a prompt to view output".to_string(),
+        ),
     };
 
     // Auto-scroll: compute scroll offset to show the bottom of content
@@ -771,7 +836,12 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
 
     // Status message indicator (transient, shown for 3s)
     let status_indicator = if let Some((ref msg, _)) = app.status_message {
-        Span::styled(format!(" {msg} "), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        Span::styled(
+            format!(" {msg} "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::raw("")
     };
@@ -794,7 +864,12 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(output_border_color))
                 .title(vec![
-                    Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        title,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     auto_scroll_indicator,
                     status_indicator,
                 ]),
@@ -818,7 +893,11 @@ fn render_input_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 format!(" Input (Enter to submit, Esc to cancel){wt_tag}{line_tag} "),
                 app.input.to_string(),
                 Style::default().fg(Color::White),
-                if app.worktree_pending { Color::Cyan } else { Color::Green },
+                if app.worktree_pending {
+                    Color::Cyan
+                } else {
+                    Color::Green
+                },
             )
         }
         AppMode::Interact => (
@@ -850,21 +929,19 @@ fn render_input_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         }
     };
 
-    let paragraph = Paragraph::new(content)
-        .style(style)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(Span::styled(title, Style::default().fg(border_color))),
-        );
+    let paragraph = Paragraph::new(content).style(style).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(Span::styled(title, Style::default().fg(border_color))),
+    );
     f.render_widget(paragraph, area);
 
     match app.mode {
         AppMode::Insert => {
             let (row, col) = app.input.cursor();
             let x = area.x + col as u16 + 1; // +1 for border
-            let y = area.y + row as u16 + 1;  // +1 for border
+            let y = area.y + row as u16 + 1; // +1 for border
             f.set_cursor_position((x, y));
         }
         AppMode::Interact => {
@@ -904,7 +981,10 @@ fn render_suggestions(f: &mut Frame, app: &App, input_area: Rect) {
         .take(5)
         .map(|(i, path)| {
             let style = if i == app.suggestion_index {
-                Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Magenta)
             };
@@ -912,16 +992,15 @@ fn render_suggestions(f: &mut Frame, app: &App, input_area: Rect) {
         })
         .collect();
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
-                .title(Span::styled(
-                    " Directories (Tab to select, Up/Down to navigate) ",
-                    Style::default().fg(Color::Magenta),
-                )),
-        );
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta))
+            .title(Span::styled(
+                " Directories (Tab to select, Up/Down to navigate) ",
+                Style::default().fg(Color::Magenta),
+            )),
+    );
 
     f.render_widget(Clear, popup_area);
     f.render_widget(list, popup_area);
@@ -952,16 +1031,23 @@ fn render_template_suggestions(f: &mut Frame, app: &App, input_area: Rect) {
         .enumerate()
         .take(5)
         .map(|(i, name)| {
-            let preview = app.templates.get(name).map(|t| {
-                if t.len() > 40 {
-                    format!("{}...", &t[..37])
-                } else {
-                    t.clone()
-                }
-            }).unwrap_or_default();
+            let preview = app
+                .templates
+                .get(name)
+                .map(|t| {
+                    if t.len() > 40 {
+                        format!("{}...", &t[..37])
+                    } else {
+                        t.clone()
+                    }
+                })
+                .unwrap_or_default();
 
             let style = if i == app.template_suggestion_index {
-                Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Cyan)
             };
@@ -972,16 +1058,15 @@ fn render_template_suggestions(f: &mut Frame, app: &App, input_area: Rect) {
         })
         .collect();
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(Span::styled(
-                    " Templates (Tab to select) ",
-                    Style::default().fg(Color::Cyan),
-                )),
-        );
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Span::styled(
+                " Templates (Tab to select) ",
+                Style::default().fg(Color::Cyan),
+            )),
+    );
 
     f.render_widget(Clear, popup_area);
     f.render_widget(list, popup_area);
@@ -1003,9 +1088,17 @@ fn render_quit_confirmation(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::raw("  Workers still active. Quit? "),
-            Span::styled("y", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "y",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("/"),
-            Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "n",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
         ]),
     ];
 
@@ -1016,7 +1109,9 @@ fn render_quit_confirmation(f: &mut Frame, area: Rect) {
                 .border_style(Style::default().fg(Color::Yellow))
                 .title(Span::styled(
                     " Confirm Quit ",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 )),
         )
         .style(Style::default().bg(Color::Rgb(40, 30, 30)));
@@ -1027,7 +1122,10 @@ fn render_quit_confirmation(f: &mut Frame, area: Rect) {
 
 fn render_batch_delete_confirmation(f: &mut Frame, app: &App, area: Rect) {
     let count = app.selection_count();
-    let msg = format!("  Delete {count} prompt{}? ", if count == 1 { "" } else { "s" });
+    let msg = format!(
+        "  Delete {count} prompt{}? ",
+        if count == 1 { "" } else { "s" }
+    );
     let width = (msg.len() as u16 + 8).max(36);
     let height = 5;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -1043,9 +1141,17 @@ fn render_batch_delete_confirmation(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::raw(msg),
-            Span::styled("y", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "y",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("/"),
-            Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "n",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
         ]),
     ];
 
@@ -1069,11 +1175,18 @@ fn render_quick_prompts_popup(f: &mut Frame, app: &App, main_area: Rect) {
     let qp = app.keymap.quick_prompt_help();
 
     // Compute the output panel area (matches render_main_area split)
-    let list_pct = if app.list_collapsed { 0 } else { app.list_ratio };
+    let list_pct = if app.list_collapsed {
+        0
+    } else {
+        app.list_ratio
+    };
     let output_pct = 100 - list_pct;
     let output_area = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(list_pct), Constraint::Percentage(output_pct)])
+        .constraints([
+            Constraint::Percentage(list_pct),
+            Constraint::Percentage(output_pct),
+        ])
         .split(main_area)[1];
 
     let lines: Vec<Line> = if qp.is_empty() {
@@ -1159,10 +1272,7 @@ fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
     // Helper to add a section
     let mut add_section = |name: &str, bindings: &[(String, &str)], extras: &[(&str, &str)]| {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("  {name}"),
-            section_style,
-        )));
+        lines.push(Line::from(Span::styled(format!("  {name}"), section_style)));
         for (key, desc) in bindings {
             lines.push(Line::from(vec![
                 Span::raw("    "),
@@ -1183,39 +1293,64 @@ fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
 
     // NORMAL
     let normal = app.keymap.normal_help();
-    add_section("NORMAL", &normal, &[
-        ("Ctrl+D", "half page down"),
-        ("Ctrl+U", "half page up"),
-        ("gg", "go to top"),
-    ]);
+    add_section(
+        "NORMAL",
+        &normal,
+        &[
+            ("Ctrl+D", "half page down"),
+            ("Ctrl+U", "half page up"),
+            ("gg", "go to top"),
+        ],
+    );
 
     // SELECTION
-    add_section("SELECTION (normal mode)", &[], &[
-        (&app.keymap.normal_key_hint(NormalAction::ToggleSelect), "toggle select"),
-        (&app.keymap.normal_key_hint(NormalAction::VisualSelect), "visual select"),
-        (&app.keymap.normal_key_hint(NormalAction::SelectAllVisible), "select all visible"),
-        (&app.keymap.normal_key_hint(NormalAction::DeleteSelected), "delete selected"),
-        (&app.keymap.normal_key_hint(NormalAction::KillSelected), "kill selected"),
-        ("Esc", "clear selection"),
-    ]);
+    add_section(
+        "SELECTION (normal mode)",
+        &[],
+        &[
+            (
+                &app.keymap.normal_key_hint(NormalAction::ToggleSelect),
+                "toggle select",
+            ),
+            (
+                &app.keymap.normal_key_hint(NormalAction::VisualSelect),
+                "visual select",
+            ),
+            (
+                &app.keymap.normal_key_hint(NormalAction::SelectAllVisible),
+                "select all visible",
+            ),
+            (
+                &app.keymap.normal_key_hint(NormalAction::DeleteSelected),
+                "delete selected",
+            ),
+            (
+                &app.keymap.normal_key_hint(NormalAction::KillSelected),
+                "kill selected",
+            ),
+            ("Esc", "clear selection"),
+        ],
+    );
 
     // INSERT
     let insert = app.keymap.insert_help();
-    add_section("INSERT", &insert, &[
-        ("Shift+Enter", "insert newline"),
-        ("Ctrl+E", "open $EDITOR"),
-        ("Ctrl+W", "toggle worktree"),
-        ("Left/Right", "move cursor"),
-        ("Home/End", "line start/end"),
-        ("Up/Down", "navigate lines / history"),
-        (":name+Tab", "expand template"),
-    ]);
+    add_section(
+        "INSERT",
+        &insert,
+        &[
+            ("Shift+Enter", "insert newline"),
+            ("Ctrl+E", "open $EDITOR"),
+            ("Ctrl+W", "toggle worktree"),
+            ("Left/Right", "move cursor"),
+            ("Home/End", "line start/end"),
+            ("Up/Down", "navigate lines / history"),
+            (":name+Tab", "expand template"),
+        ],
+    );
 
     // VIEW
     let view = app.keymap.view_help();
-    add_section("VIEW", &view, &[
-        ("Ctrl+P", "quick prompts"),
-    ]);
+    add_section("VIEW", &view, &[("Ctrl+P", "quick prompts")]);
 
     // INTERACT
     let interact = app.keymap.interact_help();
@@ -1226,10 +1361,11 @@ fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
     add_section("FILTER", &filter, &[]);
 
     // PTY INTERACT
-    add_section("PTY INTERACT", &[], &[
-        ("Esc", "exit PTY mode"),
-        ("*", "all keys forwarded to PTY"),
-    ]);
+    add_section(
+        "PTY INTERACT",
+        &[],
+        &[("Esc", "exit PTY mode"), ("*", "all keys forwarded to PTY")],
+    );
 
     // Quick prompts section (if any configured)
     let qp = app.keymap.quick_prompt_help();
@@ -1293,19 +1429,37 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let bindings: Vec<(String, &str)> = match app.mode {
         AppMode::Normal if app.visual_select_active => {
             vec![
-                (app.keymap.normal_key_hint(NormalAction::SelectNext), "extend"),
-                (app.keymap.normal_key_hint(NormalAction::ToggleSelect), "toggle"),
+                (
+                    app.keymap.normal_key_hint(NormalAction::SelectNext),
+                    "extend",
+                ),
+                (
+                    app.keymap.normal_key_hint(NormalAction::ToggleSelect),
+                    "toggle",
+                ),
                 ("Esc".to_string(), "clear sel"),
             ]
         }
         AppMode::Normal if app.selection_count() > 0 => {
             vec![
                 (app.keymap.normal_key_hint(NormalAction::Retry), "retry"),
-                (app.keymap.normal_key_hint(NormalAction::KillSelected), "kill"),
-                (app.keymap.normal_key_hint(NormalAction::DeleteSelected), "delete"),
+                (
+                    app.keymap.normal_key_hint(NormalAction::KillSelected),
+                    "kill",
+                ),
+                (
+                    app.keymap.normal_key_hint(NormalAction::DeleteSelected),
+                    "delete",
+                ),
                 (app.keymap.normal_key_hint(NormalAction::ToggleMode), "mode"),
-                (app.keymap.normal_key_hint(NormalAction::ToggleSelect), "toggle"),
-                (app.keymap.normal_key_hint(NormalAction::SelectAllVisible), "sel all"),
+                (
+                    app.keymap.normal_key_hint(NormalAction::ToggleSelect),
+                    "toggle",
+                ),
+                (
+                    app.keymap.normal_key_hint(NormalAction::SelectAllVisible),
+                    "sel all",
+                ),
                 ("Esc".to_string(), "clear sel"),
             ]
         }
@@ -1343,11 +1497,16 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for (i, (key, desc)) in bindings.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled("  ", Style::default().fg(Color::Rgb(60, 60, 60))));
+            spans.push(Span::styled(
+                "  ",
+                Style::default().fg(Color::Rgb(60, 60, 60)),
+            ));
         }
         spans.push(Span::styled(
             key.as_str(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             format!(":{desc}"),
@@ -1415,7 +1574,9 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ));
         spans.push(Span::styled(
             msg.as_str(),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 

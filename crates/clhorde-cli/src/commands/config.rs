@@ -47,10 +47,7 @@ fn config_edit() -> i32 {
     }
 
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-    match std::process::Command::new(&editor)
-        .arg(&path)
-        .status()
-    {
+    match std::process::Command::new(&editor).arg(&path).status() {
         Ok(status) => {
             if status.success() {
                 0

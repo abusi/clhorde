@@ -47,12 +47,9 @@ async fn write_frame_async(
 pub async fn run_server(
     socket_path: PathBuf,
     cmd_tx: mpsc::UnboundedSender<ServerCommand>,
-    session_register_tx: mpsc::UnboundedSender<(
-        usize,
-        mpsc::UnboundedSender<DaemonEvent>,
-    )>,
+    session_register_tx: mpsc::UnboundedSender<(usize, mpsc::UnboundedSender<DaemonEvent>)>,
     session_unregister_tx: mpsc::UnboundedSender<usize>,
-    pty_byte_rx_factory: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
+    pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket_path)?;
     eprintln!("Listening on {}", socket_path.display());
@@ -67,7 +64,7 @@ pub async fn run_server(
         let cmd_tx = cmd_tx.clone();
         let session_register_tx = session_register_tx.clone();
         let session_unregister_tx = session_unregister_tx.clone();
-        let pty_byte_rx = pty_byte_rx_factory.subscribe();
+        let pty_byte_tx = pty_byte_tx.clone();
 
         tokio::spawn(async move {
             handle_client(
@@ -76,7 +73,7 @@ pub async fn run_server(
                 cmd_tx,
                 session_register_tx,
                 session_unregister_tx,
-                pty_byte_rx,
+                pty_byte_tx,
             )
             .await;
         });
@@ -87,29 +84,42 @@ async fn handle_client(
     stream: UnixStream,
     session_id: usize,
     cmd_tx: mpsc::UnboundedSender<ServerCommand>,
-    session_register_tx: mpsc::UnboundedSender<(
-        usize,
-        mpsc::UnboundedSender<DaemonEvent>,
-    )>,
+    session_register_tx: mpsc::UnboundedSender<(usize, mpsc::UnboundedSender<DaemonEvent>)>,
     session_unregister_tx: mpsc::UnboundedSender<usize>,
-    mut pty_byte_rx: tokio::sync::broadcast::Receiver<(usize, Vec<u8>)>,
+    pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Register this client's event channel with the orchestrator
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<DaemonEvent>();
-    if session_register_tx
-        .send((session_id, event_tx))
-        .is_err()
-    {
+    if session_register_tx.send((session_id, event_tx)).is_err() {
         return;
     }
 
     let write_loop = async {
+        // PTY byte forwarding is gated on subscription.
+        // We start with a receiver but only select! on it when pty_active is true.
+        let mut pty_active = false;
+        let mut pty_byte_rx = pty_byte_tx.subscribe();
+
         loop {
             tokio::select! {
                 event = event_rx.recv() => {
                     let Some(event) = event else { break; };
+
+                    // Toggle PTY forwarding based on Subscribed/Unsubscribed events
+                    match &event {
+                        DaemonEvent::Subscribed => {
+                            pty_active = true;
+                            // Create a fresh receiver to avoid stale buffered bytes
+                            pty_byte_rx = pty_byte_tx.subscribe();
+                        }
+                        DaemonEvent::Unsubscribed => {
+                            pty_active = false;
+                        }
+                        _ => {}
+                    }
+
                     let json = match serde_json::to_vec(&event) {
                         Ok(j) => j,
                         Err(_) => continue,
@@ -118,7 +128,7 @@ async fn handle_client(
                         break;
                     }
                 }
-                pty_result = pty_byte_rx.recv() => {
+                pty_result = pty_byte_rx.recv(), if pty_active => {
                     match pty_result {
                         Ok((prompt_id, bytes)) => {
                             let frame = ipc::encode_pty_frame(prompt_id, &bytes);

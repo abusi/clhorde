@@ -193,7 +193,10 @@ mod tests {
 
     #[test]
     fn toggle_roundtrip() {
-        assert_eq!(PromptMode::Interactive.toggle().toggle(), PromptMode::Interactive);
+        assert_eq!(
+            PromptMode::Interactive.toggle().toggle(),
+            PromptMode::Interactive
+        );
     }
 
     #[test]
@@ -236,7 +239,12 @@ mod tests {
 
     #[test]
     fn new_prompt_with_cwd() {
-        let p = Prompt::new(5, "test".to_string(), Some("/tmp".to_string()), PromptMode::OneShot);
+        let p = Prompt::new(
+            5,
+            "test".to_string(),
+            Some("/tmp".to_string()),
+            PromptMode::OneShot,
+        );
         assert_eq!(p.cwd, Some("/tmp".to_string()));
         assert_eq!(p.mode, PromptMode::OneShot);
     }

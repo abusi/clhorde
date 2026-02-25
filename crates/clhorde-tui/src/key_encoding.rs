@@ -7,7 +7,9 @@ pub fn key_event_to_bytes(key: KeyEvent) -> Vec<u8> {
 
     let mut bytes = match key.code {
         KeyCode::Char(c) if ctrl => {
-            let byte = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
+            let byte = (c.to_ascii_lowercase() as u8)
+                .wrapping_sub(b'a')
+                .wrapping_add(1);
             vec![byte]
         }
         KeyCode::Char(c) => {
@@ -118,19 +120,13 @@ mod tests {
     #[test]
     fn key_ctrl_c() {
         // Ctrl+C = byte 3 (0x03)
-        assert_eq!(
-            key_event_to_bytes(ctrl_key(KeyCode::Char('c'))),
-            vec![0x03]
-        );
+        assert_eq!(key_event_to_bytes(ctrl_key(KeyCode::Char('c'))), vec![0x03]);
     }
 
     #[test]
     fn key_ctrl_a() {
         // Ctrl+A = byte 1
-        assert_eq!(
-            key_event_to_bytes(ctrl_key(KeyCode::Char('a'))),
-            vec![0x01]
-        );
+        assert_eq!(key_event_to_bytes(ctrl_key(KeyCode::Char('a'))), vec![0x01]);
     }
 
     #[test]

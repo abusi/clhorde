@@ -83,24 +83,27 @@ pub fn cmd_submit(args: &[String]) -> i32 {
         let mut exit_code = 1;
         let timeout = tokio::time::Duration::from_secs(5);
 
-        tokio::time::timeout(timeout, daemon_client::stream_events(
-            setup,
-            |event| {
-                match event {
-                    DaemonEvent::PromptAdded(info) => {
-                        println!("Submitted prompt #{}", info.id);
-                        exit_code = 0;
-                        false // stop
+        tokio::time::timeout(
+            timeout,
+            daemon_client::stream_events(
+                setup,
+                |event| {
+                    match event {
+                        DaemonEvent::PromptAdded(info) => {
+                            println!("Submitted prompt #{}", info.id);
+                            exit_code = 0;
+                            false // stop
+                        }
+                        DaemonEvent::Error { message } => {
+                            eprintln!("Error: {message}");
+                            false
+                        }
+                        _ => true, // keep waiting
                     }
-                    DaemonEvent::Error { message } => {
-                        eprintln!("Error: {message}");
-                        false
-                    }
-                    _ => true, // keep waiting
-                }
-            },
-            |_prompt_id, _data| true, // ignore PTY bytes
-        ))
+                },
+                |_prompt_id, _data| true, // ignore PTY bytes
+            ),
+        )
         .await
         .map_err(|_| "Timeout waiting for response".to_string())
         .and_then(|r| r)?;
@@ -129,11 +132,7 @@ mod tests {
     #[test]
     fn submit_invalid_mode_returns_error() {
         assert_eq!(
-            cmd_submit(&[
-                "hello".into(),
-                "--mode".into(),
-                "bogus".into(),
-            ]),
+            cmd_submit(&["hello".into(), "--mode".into(), "bogus".into(),]),
             1
         );
     }

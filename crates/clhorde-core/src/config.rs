@@ -59,11 +59,7 @@ pub fn append_history(text: &str) {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if let Ok(mut file) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
             let escaped = text.replace('\n', "\\n");
             let _ = writeln!(file, "{escaped}");
         }

@@ -11,12 +11,20 @@ pub enum CliAction {
 
 pub fn run(args: &[String]) -> CliAction {
     let Some(cmd) = args.get(1).map(|s| s.as_str()) else {
-        return CliAction::LaunchTui(LaunchOptions { prompts: vec![], worktree: false, run_path: None });
+        return CliAction::LaunchTui(LaunchOptions {
+            prompts: vec![],
+            worktree: false,
+            run_path: None,
+        });
     };
     match cmd {
         "help" | "--help" | "-h" => CliAction::Exit(cmd_help()),
         "prompt-from-files" => cmd_prompt_from_files(&args[2..]),
-        _ => CliAction::LaunchTui(LaunchOptions { prompts: vec![], worktree: false, run_path: None }),
+        _ => CliAction::LaunchTui(LaunchOptions {
+            prompts: vec![],
+            worktree: false,
+            run_path: None,
+        }),
     }
 }
 
@@ -109,7 +117,11 @@ fn cmd_prompt_from_files(args: &[String]) -> CliAction {
         return CliAction::Exit(1);
     }
 
-    CliAction::LaunchTui(LaunchOptions { prompts, worktree: true, run_path })
+    CliAction::LaunchTui(LaunchOptions {
+        prompts,
+        worktree: true,
+        run_path,
+    })
 }
 
 #[cfg(test)]
@@ -119,19 +131,32 @@ mod tests {
 
     #[test]
     fn run_returns_launch_tui_for_no_args() {
-        assert!(matches!(run(&["clhorde".into()]), CliAction::LaunchTui(opts) if opts.prompts.is_empty()));
+        assert!(
+            matches!(run(&["clhorde".into()]), CliAction::LaunchTui(opts) if opts.prompts.is_empty())
+        );
     }
 
     #[test]
     fn run_dispatches_help() {
-        assert!(matches!(run(&["clhorde".into(), "help".into()]), CliAction::Exit(0)));
-        assert!(matches!(run(&["clhorde".into(), "--help".into()]), CliAction::Exit(0)));
-        assert!(matches!(run(&["clhorde".into(), "-h".into()]), CliAction::Exit(0)));
+        assert!(matches!(
+            run(&["clhorde".into(), "help".into()]),
+            CliAction::Exit(0)
+        ));
+        assert!(matches!(
+            run(&["clhorde".into(), "--help".into()]),
+            CliAction::Exit(0)
+        ));
+        assert!(matches!(
+            run(&["clhorde".into(), "-h".into()]),
+            CliAction::Exit(0)
+        ));
     }
 
     #[test]
     fn run_unknown_command_launches_tui() {
-        assert!(matches!(run(&["clhorde".into(), "unknown".into()]), CliAction::LaunchTui(opts) if opts.prompts.is_empty()));
+        assert!(
+            matches!(run(&["clhorde".into(), "unknown".into()]), CliAction::LaunchTui(opts) if opts.prompts.is_empty())
+        );
     }
 
     #[test]
@@ -241,7 +266,10 @@ mod tests {
                 assert_eq!(opts.prompts.len(), 1);
                 assert_eq!(opts.prompts[0], "do something");
                 assert!(opts.worktree);
-                assert_eq!(opts.run_path.as_deref(), Some(dir.to_string_lossy().as_ref()));
+                assert_eq!(
+                    opts.run_path.as_deref(),
+                    Some(dir.to_string_lossy().as_ref())
+                );
             }
             _ => panic!("Expected LaunchTui"),
         }

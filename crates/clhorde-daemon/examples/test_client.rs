@@ -11,7 +11,7 @@ use std::io::Write;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use clhorde_core::ipc::{daemon_socket_path, is_binary_frame, decode_pty_frame};
+use clhorde_core::ipc::{daemon_socket_path, decode_pty_frame, is_binary_frame};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent};
 
 async fn write_frame(
@@ -25,9 +25,7 @@ async fn write_frame(
     Ok(())
 }
 
-async fn read_frame(
-    stream: &mut (impl AsyncReadExt + Unpin),
-) -> Result<Vec<u8>, std::io::Error> {
+async fn read_frame(stream: &mut (impl AsyncReadExt + Unpin)) -> Result<Vec<u8>, std::io::Error> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;

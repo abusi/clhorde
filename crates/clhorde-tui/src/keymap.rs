@@ -8,7 +8,10 @@ mod tests {
     #[test]
     fn re_exported_keymap_loads_defaults() {
         let km = Keymap::default();
-        assert_eq!(km.normal.get(&KeyCode::Char('q')), Some(&NormalAction::Quit));
+        assert_eq!(
+            km.normal.get(&KeyCode::Char('q')),
+            Some(&NormalAction::Quit)
+        );
     }
 
     #[test]

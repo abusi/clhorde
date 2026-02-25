@@ -24,7 +24,10 @@ pub async fn request(req: ClientRequest) -> Result<DaemonEvent, String> {
         .write_all(&frame)
         .await
         .map_err(|e| format!("Write error: {e}"))?;
-    stream.flush().await.map_err(|e| format!("Flush error: {e}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| format!("Flush error: {e}"))?;
 
     // Read one response frame
     loop {
@@ -75,7 +78,10 @@ pub async fn stream_events(
             .await
             .map_err(|e| format!("Write error: {e}"))?;
     }
-    stream.flush().await.map_err(|e| format!("Flush error: {e}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| format!("Flush error: {e}"))?;
 
     // Read event stream
     loop {

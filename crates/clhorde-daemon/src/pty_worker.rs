@@ -47,7 +47,6 @@ impl PtyRingBuffer {
     }
 
     /// Snapshot the current buffer contents in order.
-    #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<u8> {
         if self.full {
             let mut out = Vec::with_capacity(self.capacity);
@@ -70,8 +69,7 @@ pub type SharedPtyState = Arc<Mutex<PtyState>>;
 pub struct PtyHandle {
     pub state: SharedPtyState,
     pub master: Box<dyn portable_pty::MasterPty + Send>,
-    pub child: Box<dyn portable_pty::Child + Send + Sync>,
-    #[allow(dead_code)]
+    pub child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     pub ring_buffer: Arc<Mutex<PtyRingBuffer>>,
 }
 
@@ -193,11 +191,8 @@ pub fn spawn_pty_worker(
                 Err(_) => break,
             }
         }
-        // Child process has exited
-        let _ = tx.send(WorkerMessage::Finished {
-            prompt_id,
-            exit_code: Some(0),
-        });
+        // PTY EOF — child process output is done, but we need to wait() for real exit code
+        let _ = tx.send(WorkerMessage::PtyEof { prompt_id });
     });
 
     // Writer thread: receives WorkerInput, writes bytes to PTY
@@ -232,7 +227,7 @@ pub fn spawn_pty_worker(
         PtyHandle {
             state,
             master: pair.master,
-            child,
+            child: Some(child),
             ring_buffer,
         },
     ))

@@ -3,17 +3,38 @@ use std::process::{Command, Stdio};
 
 use tokio::sync::mpsc;
 
-use clhorde_core::prompt::PromptMode;
 use crate::pty_worker::PtyHandle;
+use clhorde_core::prompt::PromptMode;
 
 #[allow(dead_code)]
 pub enum WorkerMessage {
-    OutputChunk { prompt_id: usize, text: String },
-    TurnComplete { prompt_id: usize },
-    Finished { prompt_id: usize, exit_code: Option<i32> },
-    SpawnError { prompt_id: usize, error: String },
-    PtyUpdate { #[allow(dead_code)] prompt_id: usize },
-    SessionId { prompt_id: usize, session_id: String },
+    OutputChunk {
+        prompt_id: usize,
+        text: String,
+    },
+    TurnComplete {
+        prompt_id: usize,
+    },
+    Finished {
+        prompt_id: usize,
+        exit_code: Option<i32>,
+    },
+    SpawnError {
+        prompt_id: usize,
+        error: String,
+    },
+    PtyUpdate {
+        #[allow(dead_code)]
+        prompt_id: usize,
+    },
+    SessionId {
+        prompt_id: usize,
+        session_id: String,
+    },
+    /// PTY reader hit EOF — child process output is done but we haven't reaped it yet.
+    PtyEof {
+        prompt_id: usize,
+    },
 }
 
 pub enum WorkerInput {
@@ -61,9 +82,10 @@ pub fn spawn_worker(
                 resume_session_id,
                 pty_byte_tx,
             ) {
-                Ok((input_sender, pty_handle)) => {
-                    SpawnResult::Pty { input_sender, pty_handle }
-                }
+                Ok((input_sender, pty_handle)) => SpawnResult::Pty {
+                    input_sender,
+                    pty_handle,
+                },
                 Err(e) => SpawnResult::Error(e),
             }
         }

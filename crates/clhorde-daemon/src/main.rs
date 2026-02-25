@@ -69,8 +69,10 @@ async fn main() {
 
     // 3. Channels for IPC server <-> main loop
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<ipc_server::ServerCommand>();
-    let (session_register_tx, mut session_register_rx) =
-        mpsc::unbounded_channel::<(usize, mpsc::UnboundedSender<clhorde_core::protocol::DaemonEvent>)>();
+    let (session_register_tx, mut session_register_rx) = mpsc::unbounded_channel::<(
+        usize,
+        mpsc::UnboundedSender<clhorde_core::protocol::DaemonEvent>,
+    )>();
     let (session_unregister_tx, mut session_unregister_rx) = mpsc::unbounded_channel::<usize>();
 
     let pty_byte_tx = orch.pty_byte_tx.clone();

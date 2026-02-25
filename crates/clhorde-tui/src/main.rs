@@ -20,8 +20,8 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use app::App;
-use cli::{CliAction, LaunchOptions};
 use clhorde_core::protocol::ClientRequest;
+use cli::{CliAction, LaunchOptions};
 use ipc_client::DaemonMessage;
 
 #[tokio::main]
@@ -165,7 +165,8 @@ async fn run_app(
         if app.open_external_editor {
             app.open_external_editor = false;
             if let Err(e) = open_editor(terminal, &mut app) {
-                app.status_message = Some((format!("Editor error: {e}"), std::time::Instant::now()));
+                app.status_message =
+                    Some((format!("Editor error: {e}"), std::time::Instant::now()));
             }
         }
 
@@ -199,9 +200,7 @@ fn open_editor(
     )?;
 
     // Spawn editor
-    let status = std::process::Command::new(&editor)
-        .arg(&tmp_path)
-        .status();
+    let status = std::process::Command::new(&editor).arg(&tmp_path).status();
 
     // Restore terminal
     execute!(

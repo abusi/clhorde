@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use crossterm::event::KeyCode;
 
 use clhorde_core::keymap::{
-    self, FilterAction, InsertAction, InteractAction, Keymap, NormalAction,
-    TomlConfig, TomlFilterBindings, TomlInsertBindings, TomlInteractBindings,
-    TomlNormalBindings, TomlViewBindings, ViewAction,
+    self, FilterAction, InsertAction, InteractAction, Keymap, NormalAction, TomlConfig,
+    TomlFilterBindings, TomlInsertBindings, TomlInteractBindings, TomlNormalBindings,
+    TomlViewBindings, ViewAction,
 };
 
 pub fn cmd_keys(args: &[String]) -> i32 {
@@ -263,8 +263,9 @@ fn set_toml_action(
     action: &str,
     keys: Vec<String>,
 ) -> Result<(), String> {
-    let valid = action_names_for_mode(mode)
-        .ok_or_else(|| format!("Unknown mode: {mode}\nValid modes: normal, insert, view, interact, filter"))?;
+    let valid = action_names_for_mode(mode).ok_or_else(|| {
+        format!("Unknown mode: {mode}\nValid modes: normal, insert, view, interact, filter")
+    })?;
     if !valid.contains(&action) {
         return Err(format!(
             "Unknown action '{action}' for mode '{mode}'.\nValid actions: {}",
@@ -276,7 +277,9 @@ fn set_toml_action(
 
     match mode {
         "normal" => {
-            let b = config.normal.get_or_insert_with(TomlNormalBindings::default);
+            let b = config
+                .normal
+                .get_or_insert_with(TomlNormalBindings::default);
             match action {
                 "quit" => b.quit = keys,
                 "insert" => b.insert = keys,
@@ -300,7 +303,9 @@ fn set_toml_action(
             }
         }
         "insert" => {
-            let b = config.insert.get_or_insert_with(TomlInsertBindings::default);
+            let b = config
+                .insert
+                .get_or_insert_with(TomlInsertBindings::default);
             match action {
                 "cancel" => b.cancel = keys,
                 "submit" => b.submit = keys,
@@ -324,7 +329,9 @@ fn set_toml_action(
             }
         }
         "interact" => {
-            let b = config.interact.get_or_insert_with(TomlInteractBindings::default);
+            let b = config
+                .interact
+                .get_or_insert_with(TomlInteractBindings::default);
             match action {
                 "back" => b.back = keys,
                 "send" => b.send = keys,
@@ -332,7 +339,9 @@ fn set_toml_action(
             }
         }
         "filter" => {
-            let b = config.filter.get_or_insert_with(TomlFilterBindings::default);
+            let b = config
+                .filter
+                .get_or_insert_with(TomlFilterBindings::default);
             match action {
                 "confirm" => b.confirm = keys,
                 "cancel" => b.cancel = keys,
@@ -350,8 +359,9 @@ fn reset_toml_action(
     action: Option<&str>,
 ) -> Result<(), String> {
     if let Some(action) = action {
-        let valid = action_names_for_mode(mode)
-            .ok_or_else(|| format!("Unknown mode: {mode}\nValid modes: normal, insert, view, interact, filter"))?;
+        let valid = action_names_for_mode(mode).ok_or_else(|| {
+            format!("Unknown mode: {mode}\nValid modes: normal, insert, view, interact, filter")
+        })?;
         if !valid.contains(&action) {
             return Err(format!(
                 "Unknown action '{action}' for mode '{mode}'.\nValid actions: {}",
@@ -465,10 +475,7 @@ mod tests {
     fn set_toml_action_normal() {
         let mut config = TomlConfig::default();
         set_toml_action(&mut config, "normal", "quit", vec!["Q".into()]).unwrap();
-        assert_eq!(
-            config.normal.as_ref().unwrap().quit,
-            Some(vec!["Q".into()])
-        );
+        assert_eq!(config.normal.as_ref().unwrap().quit, Some(vec!["Q".into()]));
     }
 
     #[test]

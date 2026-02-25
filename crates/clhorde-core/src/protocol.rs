@@ -136,6 +136,15 @@ pub enum DaemonEvent {
     Error {
         message: String,
     },
+    /// Replay of PTY ring buffer bytes for late-joining clients.
+    PtyReplay {
+        prompt_id: usize,
+        data: Vec<u8>,
+    },
+    /// Acknowledgement that subscription is active — PTY byte forwarding enabled.
+    Subscribed,
+    /// Acknowledgement that subscription is inactive — PTY byte forwarding disabled.
+    Unsubscribed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,4 +214,42 @@ pub struct DaemonState {
     pub max_workers: usize,
     pub active_workers: usize,
     pub default_mode: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serde_roundtrip_pty_replay() {
+        let event = DaemonEvent::PtyReplay {
+            prompt_id: 42,
+            data: vec![0x1b, 0x5b, 0x48, 0x65, 0x6c, 0x6c, 0x6f],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: DaemonEvent = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonEvent::PtyReplay { prompt_id, data } => {
+                assert_eq!(prompt_id, 42);
+                assert_eq!(data, vec![0x1b, 0x5b, 0x48, 0x65, 0x6c, 0x6c, 0x6f]);
+            }
+            _ => panic!("expected PtyReplay"),
+        }
+    }
+
+    #[test]
+    fn serde_roundtrip_subscribed() {
+        let event = DaemonEvent::Subscribed;
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: DaemonEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, DaemonEvent::Subscribed));
+    }
+
+    #[test]
+    fn serde_roundtrip_unsubscribed() {
+        let event = DaemonEvent::Unsubscribed;
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: DaemonEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, DaemonEvent::Unsubscribed));
+    }
 }

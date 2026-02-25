@@ -66,9 +66,7 @@ pub fn cmd_attach(args: &[String]) -> i32 {
                     let _ = io::stdout().flush();
                     false
                 }
-                DaemonEvent::WorkerFinished { prompt_id, .. } if prompt_id == id => {
-                    false
-                }
+                DaemonEvent::WorkerFinished { prompt_id, .. } if prompt_id == id => false,
                 DaemonEvent::WorkerError {
                     prompt_id, error, ..
                 } if prompt_id == id => {
