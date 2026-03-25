@@ -33,6 +33,27 @@
                     </div>
                 </div>
             </div>
+            <form class="submit-form" id="submit-form">
+                <textarea class="input" id="prompt-input" placeholder="Enter a prompt..." rows="3"></textarea>
+                <div class="submit-options">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="submit-worktree"> <span class="worktree-indicator">[WT]</span>
+                    </label>
+                    <select class="input select-sm" id="submit-mode">
+                        <option value="interactive">interactive</option>
+                        <option value="one-shot">one-shot</option>
+                    </select>
+                    <button type="button" class="btn btn-sm" id="cwd-toggle" title="Set working directory">cwd</button>
+                </div>
+                <div class="cwd-row" id="cwd-row" hidden>
+                    <input type="text" class="input" id="submit-cwd" placeholder="/path/to/project">
+                </div>
+                <div class="submit-actions">
+                    <span class="submit-error" id="submit-error"></span>
+                    <span class="submit-hint">Ctrl+Enter to submit</span>
+                    <button type="submit" class="btn btn-primary" id="submit-btn">Submit</button>
+                </div>
+            </form>
             <div class="prompt-list" id="prompt-list">
                 <div class="empty-state" id="empty-state">No prompts yet</div>
             </div>
