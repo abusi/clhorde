@@ -777,6 +777,10 @@ textarea.input {
     background: var(--bg-primary);
 }
 
+.login-overlay[hidden] {
+    display: none;
+}
+
 .login-card {
     width: 340px;
     padding: var(--space-xl);
