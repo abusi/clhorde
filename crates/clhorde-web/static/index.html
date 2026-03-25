@@ -4,9 +4,70 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>clhorde</title>
+    <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-    <div id="root"></div>
+    <header class="header">
+        <div class="header-left">
+            <h1 class="header-title">clhorde</h1>
+        </div>
+        <div class="header-right">
+            <span class="connection-status" id="connection-status">
+                <span class="status-dot disconnected" id="status-dot"></span>
+                <span id="status-text">disconnected</span>
+            </span>
+        </div>
+    </header>
+
+    <main class="main">
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <div class="search-bar" id="search-bar">
+                    <input type="text" id="search-input" class="input" placeholder="Filter prompts...">
+                    <div class="status-filters" id="status-filters">
+                        <button class="chip active" data-filter="all">All</button>
+                        <button class="chip" data-filter="pending">Pending</button>
+                        <button class="chip" data-filter="running">Running</button>
+                        <button class="chip" data-filter="completed">Completed</button>
+                        <button class="chip" data-filter="failed">Failed</button>
+                    </div>
+                </div>
+            </div>
+            <div class="prompt-list" id="prompt-list">
+                <div class="empty-state" id="empty-state">No prompts yet</div>
+            </div>
+        </aside>
+
+        <section class="content" id="content">
+            <div class="content-placeholder" id="content-placeholder">
+                <p>Select a prompt to view details</p>
+            </div>
+            <div class="prompt-detail" id="prompt-detail" hidden>
+                <div class="detail-header" id="detail-header"></div>
+                <div class="detail-output" id="detail-output"></div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <div class="footer-left">
+            <span class="footer-label">Workers:</span>
+            <button class="btn btn-sm" id="workers-dec" title="Decrease max workers">-</button>
+            <span id="workers-display">
+                <span id="active-workers">0</span>/<span id="max-workers">0</span>
+            </span>
+            <button class="btn btn-sm" id="workers-inc" title="Increase max workers">+</button>
+        </div>
+        <div class="footer-center">
+            <span class="footer-label">Mode:</span>
+            <button class="btn btn-sm" id="mode-toggle" title="Toggle default mode">interactive</button>
+        </div>
+        <div class="footer-right">
+            <span id="prompt-count" class="footer-label">0 prompts</span>
+        </div>
+    </footer>
+
     <noscript>clhorde web interface requires JavaScript.</noscript>
+    <script src="/app.js"></script>
 </body>
 </html>
