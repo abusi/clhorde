@@ -185,6 +185,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, launch_o
                             }
                         }
                     }
+                    Event::Paste(text) if app.mode == app::AppMode::PtyInteract => {
+                        app.paste_to_pty(&text);
+                    }
+                    Event::Paste(text) if app.mode == app::AppMode::Interact => {
+                        app.interact_input.push_str(&text);
+                    }
                     Event::Resize(_, _) => {
                         // Terminal resized — next draw will update output_panel_size
                         // and resize_pty_workers will be called

@@ -1168,6 +1168,19 @@ impl App {
         }
     }
 
+    pub fn paste_to_pty(&mut self, text: &str) {
+        if let Some(prompt) = self.selected_prompt() {
+            if prompt.status != PromptStatus::Running && prompt.status != PromptStatus::Idle {
+                return;
+            }
+            let id = prompt.id;
+            if let Some(sender) = self.worker_inputs.get(&id) {
+                let bytes = text.as_bytes().to_vec();
+                let _ = sender.send(WorkerInput::SendBytes(bytes));
+            }
+        }
+    }
+
     fn try_quick_prompt(&mut self, key: &KeyEvent) {
         let Some(message) = self.keymap.quick_prompts.get(&key.code) else {
             return;
