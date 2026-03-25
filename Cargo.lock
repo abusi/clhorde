@@ -408,6 +408,7 @@ name = "clhorde-web"
 version = "0.3.0"
 dependencies = [
  "axum",
+ "base64",
  "clap",
  "clhorde-core",
  "futures-util",
