@@ -50,6 +50,53 @@ clhorde-cli submit "Review the auth module"  # submit a prompt via CLI
 
 The daemon must be running before the TUI or CLI can connect. Press `i` to start typing a prompt. See the [getting started guide](https://abusi.github.io/clhorde/guide.html) for a walkthrough.
 
+### Running clhorded as a systemd user service
+
+To have `clhorded` start automatically on login, install it as a systemd user service.
+
+Create the service file:
+
+```bash
+mkdir -p ~/.config/systemd/user
+```
+
+Write `~/.config/systemd/user/clhorded.service`:
+
+```ini
+[Unit]
+Description=clhorde daemon - Claude Code orchestrator
+After=default.target
+
+[Service]
+ExecStart=/path/to/clhorded
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+```
+
+Replace `/path/to/clhorded` with the actual binary path (e.g. `~/.cargo/bin/clhorded` or `./target/release/clhorded`).
+
+Then enable and start it:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable clhorded.service
+systemctl --user start clhorded.service
+```
+
+The service will now start automatically each time you log in.
+
+Useful commands:
+
+```bash
+systemctl --user status clhorded   # check status
+systemctl --user stop clhorded     # stop
+systemctl --user restart clhorded  # restart after rebuild
+journalctl --user -u clhorded -f   # follow logs
+```
+
 ## Documentation
 
 Full documentation is available at **[abusi.github.io/clhorde](https://abusi.github.io/clhorde/)**:

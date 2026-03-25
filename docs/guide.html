@@ -61,6 +61,43 @@
       <li><strong>Return:</strong> Press <kbd>Esc</kbd> or <kbd>q</kbd> to go back to the list.</li>
     </ol>
 
+    <h2>Running clhorded as a systemd User Service</h2>
+
+    <p>Instead of running <code>clhorded &amp;</code> manually, you can install it as a systemd user service so it starts automatically on login.</p>
+
+    <p>Create the service file directory and unit file:</p>
+
+    <pre><code><span class="tok-prompt">$ </span><span class="tok-cmd">mkdir</span> <span class="tok-flag">-p</span> ~/.config/systemd/user</code></pre>
+
+    <p>Write <code>~/.config/systemd/user/clhorded.service</code>:</p>
+
+    <pre><code><span class="tok-section">[Unit]</span>
+<span class="tok-key">Description</span>=clhorde daemon - Claude Code orchestrator
+<span class="tok-key">After</span>=default.target
+
+<span class="tok-section">[Service]</span>
+<span class="tok-key">ExecStart</span>=/path/to/clhorded
+<span class="tok-key">Restart</span>=on-failure
+<span class="tok-key">RestartSec</span>=3
+
+<span class="tok-section">[Install]</span>
+<span class="tok-key">WantedBy</span>=default.target</code></pre>
+
+    <p>Replace <code>/path/to/clhorded</code> with the actual binary path (e.g. <code>~/.cargo/bin/clhorded</code> or <code>./target/release/clhorded</code>).</p>
+
+    <p>Then enable and start it:</p>
+
+    <pre><code><span class="tok-prompt">$ </span><span class="tok-cmd">systemctl</span> <span class="tok-flag">--user</span> daemon-reload
+<span class="tok-prompt">$ </span><span class="tok-cmd">systemctl</span> <span class="tok-flag">--user</span> enable clhorded.service
+<span class="tok-prompt">$ </span><span class="tok-cmd">systemctl</span> <span class="tok-flag">--user</span> start clhorded.service</code></pre>
+
+    <p>The service will now start automatically each time you log in. Useful commands:</p>
+
+    <pre><code><span class="tok-prompt">$ </span><span class="tok-cmd">systemctl</span> <span class="tok-flag">--user</span> status clhorded   <span class="tok-cmt"># check status</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">systemctl</span> <span class="tok-flag">--user</span> stop clhorded     <span class="tok-cmt"># stop</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">systemctl</span> <span class="tok-flag">--user</span> restart clhorded  <span class="tok-cmt"># restart after rebuild</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">journalctl</span> <span class="tok-flag">--user</span> -u clhorded -f   <span class="tok-cmt"># follow logs</span></code></pre>
+
     <h2>UI Layout</h2>
 
     <pre><code><span class="tok-section">&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;</span>
