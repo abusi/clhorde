@@ -473,8 +473,13 @@ impl App {
 
     /// Feed raw PTY bytes to the local renderer.
     pub fn apply_pty_bytes(&mut self, prompt_id: usize, data: &[u8]) {
+        let is_selected = self.selected_prompt().is_some_and(|p| p.id == prompt_id);
         if let Some(renderer) = self.pty_renderers.get_mut(&prompt_id) {
             renderer.feed_bytes(data);
+            // Auto-scroll to bottom when new output arrives (if not scrolled up)
+            if is_selected && self.auto_scroll && renderer.display_offset() != 0 {
+                renderer.scroll_to_bottom();
+            }
         }
     }
 
@@ -1004,12 +1009,35 @@ impl App {
                 self.show_quick_prompts_popup = false;
                 self.mode = AppMode::Normal;
                 self.scroll_offset = 0;
+                // Reset PTY scrollback to bottom
+                if let Some(id) = self.selected_prompt().map(|p| p.id) {
+                    if let Some(renderer) = self.pty_renderers.get_mut(&id) {
+                        renderer.scroll_to_bottom();
+                    }
+                }
+                self.auto_scroll = true;
                 self.list_collapsed = false;
             }
             ViewAction::ScrollDown => {
+                if let Some(id) = self.selected_prompt().map(|p| p.id) {
+                    if let Some(renderer) = self.pty_renderers.get_mut(&id) {
+                        renderer.scroll_display(-1);
+                        if renderer.display_offset() == 0 {
+                            self.auto_scroll = true;
+                        }
+                        return;
+                    }
+                }
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
             }
             ViewAction::ScrollUp => {
+                if let Some(id) = self.selected_prompt().map(|p| p.id) {
+                    if let Some(renderer) = self.pty_renderers.get_mut(&id) {
+                        renderer.scroll_display(1);
+                        self.auto_scroll = false;
+                        return;
+                    }
+                }
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
             }
             ViewAction::Interact => {
@@ -1041,6 +1069,14 @@ impl App {
             }
             ViewAction::ToggleAutoscroll => {
                 self.auto_scroll = !self.auto_scroll;
+                // When re-enabling auto-scroll, jump PTY to bottom
+                if self.auto_scroll {
+                    if let Some(id) = self.selected_prompt().map(|p| p.id) {
+                        if let Some(renderer) = self.pty_renderers.get_mut(&id) {
+                            renderer.scroll_to_bottom();
+                        }
+                    }
+                }
             }
             ViewAction::KillWorker => {
                 let kill_id = self.selected_prompt().and_then(|p| {
@@ -1185,22 +1221,54 @@ impl App {
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         match self.mode {
             AppMode::PtyInteract => {
-                self.forward_mouse_to_pty(mouse);
+                // Scroll the local PTY scrollback instead of forwarding to remote
+                // (Claude Code TUI doesn't handle mouse scroll events)
+                match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        self.scroll_pty_or_text(mouse.kind);
+                    }
+                    _ => {
+                        self.forward_mouse_to_pty(mouse);
+                    }
+                }
             }
             AppMode::ViewOutput => {
-                // Scroll text output with mouse wheel
                 match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        self.auto_scroll = false;
-                        self.scroll_offset = self.scroll_offset.saturating_sub(3);
-                    }
-                    MouseEventKind::ScrollDown => {
-                        self.scroll_offset = self.scroll_offset.saturating_add(3);
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        self.scroll_pty_or_text(mouse.kind);
                     }
                     _ => {}
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Scroll the PTY grid scrollback or the text output scroll_offset.
+    fn scroll_pty_or_text(&mut self, kind: MouseEventKind) {
+        let is_up = matches!(kind, MouseEventKind::ScrollUp);
+        let selected_id = self.selected_prompt().map(|p| p.id);
+
+        // Try PTY scrollback first
+        if let Some(id) = selected_id {
+            if let Some(renderer) = self.pty_renderers.get_mut(&id) {
+                let delta = if is_up { 3 } else { -3 };
+                renderer.scroll_display(delta);
+                if is_up {
+                    self.auto_scroll = false;
+                } else if renderer.display_offset() == 0 {
+                    self.auto_scroll = true;
+                }
+                return;
+            }
+        }
+
+        // Fall back to text output scroll
+        if is_up {
+            self.auto_scroll = false;
+            self.scroll_offset = self.scroll_offset.saturating_sub(3);
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_add(3);
         }
     }
 
