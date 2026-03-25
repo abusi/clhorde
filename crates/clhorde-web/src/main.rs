@@ -11,6 +11,7 @@ use clhorde_core::ipc::daemon_socket_path;
 mod bridge;
 mod routes;
 mod state;
+mod static_files;
 mod ws;
 
 /// clhorde-web — HTTP/WebSocket bridge for the clhorde daemon
@@ -88,8 +89,19 @@ async fn main() {
         }
     };
 
+    let static_source = match cli.static_dir {
+        Some(dir) => {
+            info!(path = %dir.display(), "serving static files from filesystem");
+            static_files::StaticSource::Directory(dir)
+        }
+        None => {
+            info!("serving embedded static files");
+            static_files::StaticSource::Embedded
+        }
+    };
+
     let app_state = state::AppState::new(bridge);
-    let app = routes::router(app_state);
+    let app = routes::router(app_state, static_source);
 
     let addr: SocketAddr = match format!("{}:{}", cli.host, cli.port).parse() {
         Ok(a) => a,

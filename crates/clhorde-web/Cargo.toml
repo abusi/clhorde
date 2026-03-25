@@ -19,3 +19,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 futures-util.workspace = true
 base64.workspace = true
+include_dir.workspace = true

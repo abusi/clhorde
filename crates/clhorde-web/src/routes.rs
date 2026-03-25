@@ -11,10 +11,12 @@ use serde_json::json;
 use clhorde_core::protocol::{ClientRequest, DaemonEvent};
 
 use crate::state::AppState;
+use crate::static_files::{self, StaticSource};
 use crate::ws;
 
-/// Build the axum router with all REST API routes.
-pub fn router(state: AppState) -> Router {
+/// Build the axum router with all REST API routes and static file fallback.
+pub fn router(state: AppState, static_source: StaticSource) -> Router {
+    let fallback_source = static_source.clone();
     Router::new()
         .route("/api/health", get(health))
         .route("/api/state", get(get_state))
@@ -44,6 +46,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/store/keep", post(store_keep))
         .route("/api/store/clean-worktrees", post(store_clean_worktrees))
         .with_state(state)
+        .fallback(move |req| static_files::serve_static(fallback_source.clone(), req))
 }
 
 // ---------------------------------------------------------------------------
