@@ -1,5 +1,4 @@
 // clhorde dashboard — vanilla JS SPA
-// M2: WebSocket client & state management
 
 "use strict";
 
@@ -413,12 +412,18 @@ function renderFooter(state) {
     if (modeEl) modeEl.textContent = state.defaultMode;
 }
 
+/** Whether auto-scroll is enabled for the output viewer. */
+let autoScroll = true;
+
 /** Render the detail view for the selected prompt. */
 function renderDetail(state) {
     const placeholder = document.getElementById("content-placeholder");
     const detail = document.getElementById("prompt-detail");
     const headerEl = document.getElementById("detail-header");
+    const actionsEl = document.getElementById("detail-actions");
     const outputEl = document.getElementById("detail-output");
+    const terminalEl = document.getElementById("detail-terminal");
+    const inputEl = document.getElementById("detail-input");
 
     if (selectedPromptId === null) {
         placeholder.hidden = false;
@@ -436,25 +441,225 @@ function renderDetail(state) {
     placeholder.hidden = true;
     detail.hidden = false;
 
+    const isInteractive = prompt.mode === "interactive";
+    const isRunning = prompt.status === "running";
+    const isOneShot = prompt.mode !== "interactive";
+    const isDone = prompt.status === "completed" || prompt.status === "failed";
+    const isPending = prompt.status === "pending";
+
+    // --- Header ---
     const statusClass = "badge badge-" + (prompt.status || "idle");
-    const modeLabel = prompt.mode === "one-shot" ? "one-shot" : "interactive";
+    const modeLabel = isInteractive ? "interactive" : "one-shot";
     const wt = prompt.worktree ? ' <span class="worktree-indicator">[WT]</span>' : "";
+    const elapsed = prompt.elapsed_secs ? ` <span class="mode-indicator">${formatDuration(prompt.elapsed_secs)}</span>` : "";
 
     headerEl.innerHTML = `
         <span class="prompt-id">#${prompt.id}</span>
         <span class="${statusClass}">${prompt.status || "idle"}</span>
         <span class="mode-indicator">${modeLabel}</span>
-        ${wt}
+        ${wt}${elapsed}
         <span style="flex:1"></span>
         <span class="prompt-text" style="white-space:normal;overflow:visible;text-overflow:unset">${escapeHtml(prompt.text || "")}</span>
     `;
 
-    const output = prompt.output || prompt.full_text || "";
-    if (output) {
-        outputEl.textContent = output;
+    // --- Action buttons ---
+    renderActions(actionsEl, prompt, isRunning, isDone, isPending);
+
+    // --- Output / Terminal ---
+    if (isInteractive) {
+        outputEl.hidden = true;
+        terminalEl.hidden = false;
+        attachTerminal(terminalEl, prompt.id);
     } else {
-        outputEl.innerHTML = `<span class="empty-state">No output yet</span>`;
+        // One-shot prompts use ANSI output viewer
+        outputEl.hidden = false;
+        terminalEl.hidden = true;
+        renderOutput(outputEl, prompt);
     }
+
+    // --- Follow-up input ---
+    // Show for running one-shot prompts only
+    const showInput = isRunning && isOneShot;
+    inputEl.hidden = !showInput;
+}
+
+/** Render action buttons based on prompt status. */
+function renderActions(container, prompt, isRunning, isDone, isPending) {
+    const buttons = [];
+
+    if (isRunning) {
+        buttons.push(`<button class="btn btn-sm btn-danger" data-action="kill" data-id="${prompt.id}">Kill</button>`);
+    }
+    if (isDone) {
+        buttons.push(`<button class="btn btn-sm btn-success" data-action="retry" data-id="${prompt.id}">Retry</button>`);
+        buttons.push(`<button class="btn btn-sm" data-action="resume" data-id="${prompt.id}">Resume</button>`);
+    }
+    if (isPending) {
+        buttons.push(`<button class="btn btn-sm" data-action="move-up" data-id="${prompt.id}">Move Up</button>`);
+        buttons.push(`<button class="btn btn-sm" data-action="move-down" data-id="${prompt.id}">Move Down</button>`);
+    }
+    buttons.push(`<button class="btn btn-sm btn-danger" data-action="delete" data-id="${prompt.id}">Delete</button>`);
+
+    container.innerHTML = buttons.join("");
+}
+
+/** Render one-shot output with ANSI color support. */
+function renderOutput(el, prompt) {
+    const output = prompt.output || prompt.full_text || "";
+
+    if (!output) {
+        const msg = prompt.status === "running" ? "Waiting for output..." : "No output";
+        el.innerHTML = `<span class="empty-state">${msg}</span>`;
+        return;
+    }
+
+    el.innerHTML = ansiToHtml(output);
+    el.className = "detail-output ansi-output";
+
+    // Auto-scroll to bottom
+    if (autoScroll) {
+        el.scrollTop = el.scrollHeight;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ANSI escape code parser
+// ---------------------------------------------------------------------------
+
+/** Convert text with ANSI escape codes to styled HTML. */
+function ansiToHtml(text) {
+    const out = [];
+    let i = 0;
+    let currentStyles = [];
+
+    while (i < text.length) {
+        // Check for ESC[...m sequences
+        if (text[i] === "\x1b" && text[i + 1] === "[") {
+            const end = text.indexOf("m", i + 2);
+            if (end !== -1 && end - i < 20) {
+                const codes = text.slice(i + 2, end).split(";").map(Number);
+                currentStyles = applyAnsiCodes(currentStyles, codes);
+                i = end + 1;
+                continue;
+            }
+        }
+
+        // Skip other ESC sequences (e.g., cursor movement)
+        if (text[i] === "\x1b" && text[i + 1] === "[") {
+            const match = text.slice(i).match(/^\x1b\[[0-9;]*[A-Za-z]/);
+            if (match) {
+                i += match[0].length;
+                continue;
+            }
+        }
+
+        // Collect normal text until next ESC or end
+        let textStart = i;
+        while (i < text.length && text[i] !== "\x1b") i++;
+        const chunk = text.slice(textStart, i);
+
+        if (currentStyles.length > 0) {
+            const classes = currentStyles.filter(s => s.startsWith("ansi-")).join(" ");
+            const inlineStyle = currentStyles.filter(s => s.startsWith("color:") || s.startsWith("background")).join(";");
+            const classAttr = classes ? ` class="${classes}"` : "";
+            const styleAttr = inlineStyle ? ` style="${inlineStyle}"` : "";
+            out.push(`<span${classAttr}${styleAttr}>${escapeHtml(chunk)}</span>`);
+        } else {
+            out.push(escapeHtml(chunk));
+        }
+    }
+
+    return out.join("");
+}
+
+/** Map ANSI SGR codes to CSS classes/styles. */
+function applyAnsiCodes(current, codes) {
+    const styles = [];
+
+    for (let j = 0; j < codes.length; j++) {
+        const c = codes[j];
+
+        if (c === 0 || isNaN(c)) {
+            // Reset
+            return [];
+        } else if (c === 1) {
+            styles.push("ansi-bold");
+        } else if (c === 2) {
+            styles.push("ansi-dim");
+        } else if (c === 3) {
+            styles.push("ansi-italic");
+        } else if (c === 4) {
+            styles.push("ansi-underline");
+        } else if (c === 9) {
+            styles.push("ansi-strikethrough");
+        } else if (c >= 30 && c <= 37) {
+            styles.push(`color:${ansi4Color(c - 30)}`);
+        } else if (c === 38 && codes[j + 1] === 5) {
+            // 256-color: ESC[38;5;Nm
+            styles.push(`color:${ansi256Color(codes[j + 2])}`);
+            j += 2;
+        } else if (c === 38 && codes[j + 1] === 2) {
+            // True color: ESC[38;2;R;G;Bm
+            styles.push(`color:rgb(${codes[j+2]},${codes[j+3]},${codes[j+4]})`);
+            j += 4;
+        } else if (c >= 40 && c <= 47) {
+            styles.push(`background-color:${ansi4Color(c - 40)}`);
+        } else if (c === 48 && codes[j + 1] === 5) {
+            styles.push(`background-color:${ansi256Color(codes[j + 2])}`);
+            j += 2;
+        } else if (c === 48 && codes[j + 1] === 2) {
+            styles.push(`background-color:rgb(${codes[j+2]},${codes[j+3]},${codes[j+4]})`);
+            j += 4;
+        } else if (c >= 90 && c <= 97) {
+            styles.push(`color:${ansi4BrightColor(c - 90)}`);
+        } else if (c >= 100 && c <= 107) {
+            styles.push(`background-color:${ansi4BrightColor(c - 100)}`);
+        }
+    }
+
+    // Merge with existing styles (replace colors, accumulate decorations)
+    const merged = [...current];
+    for (const s of styles) {
+        if (s.startsWith("color:")) {
+            const idx = merged.findIndex(m => m.startsWith("color:"));
+            if (idx >= 0) merged[idx] = s; else merged.push(s);
+        } else if (s.startsWith("background")) {
+            const idx = merged.findIndex(m => m.startsWith("background"));
+            if (idx >= 0) merged[idx] = s; else merged.push(s);
+        } else if (!merged.includes(s)) {
+            merged.push(s);
+        }
+    }
+    return merged;
+}
+
+const ANSI_4 = ["#000","#c33","#3c3","#cc3","#33c","#c3c","#3cc","#ccc"];
+const ANSI_4_BRIGHT = ["#555","#f55","#5f5","#ff5","#55f","#f5f","#5ff","#fff"];
+
+function ansi4Color(n) { return ANSI_4[n] || "#ccc"; }
+function ansi4BrightColor(n) { return ANSI_4_BRIGHT[n] || "#fff"; }
+
+function ansi256Color(n) {
+    if (n < 8) return ANSI_4[n];
+    if (n < 16) return ANSI_4_BRIGHT[n - 8];
+    if (n < 232) {
+        // 216-color cube
+        const idx = n - 16;
+        const r = Math.floor(idx / 36) * 51;
+        const g = Math.floor((idx % 36) / 6) * 51;
+        const b = (idx % 6) * 51;
+        return `rgb(${r},${g},${b})`;
+    }
+    // Grayscale
+    const v = (n - 232) * 10 + 8;
+    return `rgb(${v},${v},${v})`;
+}
+
+function formatDuration(secs) {
+    if (secs < 60) return `${Math.round(secs)}s`;
+    const m = Math.floor(secs / 60);
+    const s = Math.round(secs % 60);
+    return `${m}m${s}s`;
 }
 
 /** Full render pass. */
@@ -465,14 +670,146 @@ function render(state) {
 }
 
 // ---------------------------------------------------------------------------
+// xterm.js terminal management
+// ---------------------------------------------------------------------------
+
+/** Currently active terminal instance. */
+let activeTerm = null;
+let activeTermPromptId = null;
+let ptyUnsubscribe = null;
+
+/** Attach or reuse an xterm.js terminal for the given prompt. */
+function attachTerminal(container, promptId) {
+    // Already attached to this prompt
+    if (activeTermPromptId === promptId && activeTerm) return;
+
+    // Clean up previous terminal
+    detachTerminal();
+
+    // Check if xterm.js is loaded
+    if (typeof Terminal === "undefined") {
+        container.innerHTML = `<div class="empty-state">xterm.js not loaded</div>`;
+        return;
+    }
+
+    activeTermPromptId = promptId;
+
+    const term = new Terminal({
+        theme: {
+            background: "#0f1117",
+            foreground: "#e4e4e8",
+            cursor: "#e4e4e8",
+            cursorAccent: "#0f1117",
+            selectionBackground: "#2a2d40",
+            black: "#000000",
+            red: "#c33",
+            green: "#3c3",
+            yellow: "#cc3",
+            blue: "#33c",
+            magenta: "#c3c",
+            cyan: "#3cc",
+            white: "#ccc",
+            brightBlack: "#555",
+            brightRed: "#f55",
+            brightGreen: "#5f5",
+            brightYellow: "#ff5",
+            brightBlue: "#55f",
+            brightMagenta: "#f5f",
+            brightCyan: "#5ff",
+            brightWhite: "#fff",
+        },
+        fontSize: 13,
+        fontFamily: "var(--font-mono)",
+        cursorBlink: true,
+        scrollback: 5000,
+        convertEol: false,
+    });
+
+    // Load addons
+    if (typeof FitAddon !== "undefined") {
+        const fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term._fitAddon = fitAddon;
+    }
+    if (typeof WebLinksAddon !== "undefined") {
+        term.loadAddon(new WebLinksAddon.WebLinksAddon());
+    }
+
+    container.innerHTML = "";
+    term.open(container);
+
+    // Fit to container
+    if (term._fitAddon) {
+        try { term._fitAddon.fit(); } catch (e) {}
+    }
+
+    activeTerm = term;
+
+    // Subscribe to PTY bytes for this prompt
+    client.subscribePty(promptId);
+
+    // Listen for PTY bytes
+    ptyUnsubscribe = client.onEvent((msg) => {
+        if (msg.type === "PtyBytes" && msg.prompt_id === promptId && activeTerm) {
+            try {
+                const bytes = atob(msg.data);
+                activeTerm.write(bytes);
+            } catch (e) {
+                console.warn("[term] failed to decode PTY bytes:", e);
+            }
+        }
+    });
+
+    // Forward keyboard input to daemon
+    term.onData((data) => {
+        // Send raw bytes via WS ClientRequest SendBytes
+        const encoded = btoa(data);
+        client.send({ type: "SendBytes", prompt_id: promptId, data: Array.from(data, c => c.charCodeAt(0)) });
+    });
+
+    // Handle resize
+    const resizeObserver = new ResizeObserver(() => {
+        if (activeTerm && activeTerm._fitAddon) {
+            try { activeTerm._fitAddon.fit(); } catch (e) {}
+        }
+    });
+    resizeObserver.observe(container);
+    term._resizeObserver = resizeObserver;
+}
+
+/** Detach and clean up the current terminal. */
+function detachTerminal() {
+    if (activeTermPromptId !== null) {
+        client.unsubscribePty(activeTermPromptId);
+    }
+    if (ptyUnsubscribe) {
+        ptyUnsubscribe();
+        ptyUnsubscribe = null;
+    }
+    if (activeTerm) {
+        if (activeTerm._resizeObserver) {
+            activeTerm._resizeObserver.disconnect();
+        }
+        activeTerm.dispose();
+        activeTerm = null;
+    }
+    activeTermPromptId = null;
+}
+
+// ---------------------------------------------------------------------------
 // Prompt selection
 // ---------------------------------------------------------------------------
 
 function selectPrompt(id) {
+    // Clean up terminal if switching away from an interactive prompt
+    if (activeTermPromptId !== null && activeTermPromptId !== id) {
+        detachTerminal();
+    }
+
     selectedPromptId = id;
     location.hash = id != null ? `#prompt-${id}` : "";
 
-    // If selecting a running interactive prompt, fetch full output
+    // Fetch full output for the selected prompt
     if (id != null) {
         fetch(`/api/prompts/${id}/output`)
             .then(r => r.ok ? r.json() : null)
@@ -586,6 +923,78 @@ function setupEventHandlers() {
     window.addEventListener("hashchange", () => {
         restoreFromHash();
         render(appState);
+    });
+
+    // Action buttons (event delegation)
+    document.getElementById("detail-actions")?.addEventListener("click", async (e) => {
+        const btn = e.target.closest("[data-action]");
+        if (!btn) return;
+
+        const action = btn.dataset.action;
+        const id = Number(btn.dataset.id);
+
+        // Confirm destructive actions
+        if (action === "kill" && !confirm(`Kill worker for prompt #${id}?`)) return;
+        if (action === "delete" && !confirm(`Delete prompt #${id}?`)) return;
+
+        btn.disabled = true;
+
+        const routes = {
+            "kill":      { method: "POST",   url: `/api/prompts/${id}/kill` },
+            "retry":     { method: "POST",   url: `/api/prompts/${id}/retry` },
+            "resume":    { method: "POST",   url: `/api/prompts/${id}/resume` },
+            "delete":    { method: "DELETE", url: `/api/prompts/${id}` },
+            "move-up":   { method: "POST",   url: `/api/prompts/${id}/move-up` },
+            "move-down": { method: "POST",   url: `/api/prompts/${id}/move-down` },
+        };
+
+        const route = routes[action];
+        if (!route) return;
+
+        try {
+            await fetch(route.url, { method: route.method });
+            // If deleted, deselect
+            if (action === "delete") selectPrompt(null);
+        } catch (err) {
+            console.error(`Action ${action} failed:`, err);
+        } finally {
+            btn.disabled = false;
+        }
+    });
+
+    // Follow-up input
+    const followupInput = document.getElementById("followup-input");
+    const followupSend = document.getElementById("followup-send");
+
+    async function sendFollowup() {
+        const text = followupInput?.value?.trim();
+        if (!text || selectedPromptId === null) return;
+
+        followupSend.disabled = true;
+        try {
+            const res = await fetch(`/api/prompts/${selectedPromptId}/input`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text }),
+            });
+            if (res.ok) {
+                followupInput.value = "";
+                followupInput.classList.add("followup-flash");
+                setTimeout(() => followupInput.classList.remove("followup-flash"), 400);
+            }
+        } catch (err) {
+            console.error("Follow-up send failed:", err);
+        } finally {
+            followupSend.disabled = false;
+        }
+    }
+
+    followupSend?.addEventListener("click", sendFollowup);
+    followupInput?.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            sendFollowup();
+        }
     });
 
     // CWD toggle

@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>clhorde</title>
     <link rel="stylesheet" href="/style.css">
+    <link rel="stylesheet" href="/lib/xterm.css">
 </head>
 <body>
     <header class="header">
@@ -65,7 +66,13 @@
             </div>
             <div class="prompt-detail" id="prompt-detail" hidden>
                 <div class="detail-header" id="detail-header"></div>
+                <div class="detail-actions" id="detail-actions"></div>
                 <div class="detail-output" id="detail-output"></div>
+                <div class="detail-terminal" id="detail-terminal" hidden></div>
+                <div class="detail-input" id="detail-input" hidden>
+                    <input type="text" class="input" id="followup-input" placeholder="Send follow-up...">
+                    <button class="btn btn-sm" id="followup-send">Send</button>
+                </div>
             </div>
         </section>
     </main>
@@ -89,6 +96,9 @@
     </footer>
 
     <noscript>clhorde web interface requires JavaScript.</noscript>
+    <script src="/lib/xterm.min.js"></script>
+    <script src="/lib/addon-fit.min.js"></script>
+    <script src="/lib/addon-web-links.min.js"></script>
     <script src="/app.js"></script>
 </body>
 </html>

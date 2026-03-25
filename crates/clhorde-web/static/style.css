@@ -463,6 +463,103 @@ textarea.input {
     line-height: 1.6;
 }
 
+/* Action buttons */
+.detail-actions {
+    display: flex;
+    gap: var(--space-sm);
+    padding-bottom: var(--space-md);
+    flex-wrap: wrap;
+}
+
+.detail-actions:empty {
+    display: none;
+}
+
+.btn-danger {
+    color: var(--status-failed);
+    border-color: color-mix(in srgb, var(--status-failed) 40%, var(--border));
+}
+
+.btn-danger:hover {
+    background: color-mix(in srgb, var(--status-failed) 15%, var(--bg-tertiary));
+    border-color: var(--status-failed);
+}
+
+.btn-success {
+    color: var(--status-completed);
+    border-color: color-mix(in srgb, var(--status-completed) 40%, var(--border));
+}
+
+.btn-success:hover {
+    background: color-mix(in srgb, var(--status-completed) 15%, var(--bg-tertiary));
+    border-color: var(--status-completed);
+}
+
+/* Follow-up input */
+.detail-input {
+    display: flex;
+    gap: var(--space-sm);
+    padding-top: var(--space-md);
+    border-top: 1px solid var(--border);
+    margin-top: var(--space-md);
+}
+
+.detail-input .input {
+    flex: 1;
+}
+
+.followup-flash {
+    animation: flash-success 0.4s ease-out;
+}
+
+@keyframes flash-success {
+    0% { border-color: var(--status-completed); }
+    100% { border-color: var(--border); }
+}
+
+/* Terminal container (xterm.js) */
+.detail-terminal {
+    flex: 1;
+    overflow: hidden;
+    border-radius: var(--radius-sm);
+    background: #000;
+    min-height: 200px;
+}
+
+/* ANSI output rendering */
+.ansi-output {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.ansi-bold { font-weight: 700; }
+.ansi-dim { opacity: 0.6; }
+.ansi-italic { font-style: italic; }
+.ansi-underline { text-decoration: underline; }
+.ansi-strikethrough { text-decoration: line-through; }
+
+/* Auto-scroll toggle */
+.scroll-toggle {
+    position: absolute;
+    top: var(--space-sm);
+    right: var(--space-sm);
+    font-size: 10px;
+    opacity: 0.6;
+    z-index: 1;
+}
+
+.scroll-toggle:hover {
+    opacity: 1;
+}
+
+.detail-output-wrapper {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
 /* Card */
 .card {
     background: var(--bg-secondary);
