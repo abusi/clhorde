@@ -604,6 +604,20 @@ fn render_pty_output_viewer(
         Span::raw("")
     };
 
+    // PTY scrollback indicator
+    let scroll_indicator = app
+        .pty_renderers
+        .get(&id)
+        .map(|r| r.display_offset())
+        .filter(|&offset| offset > 0)
+        .map(|offset| {
+            Span::styled(
+                format!(" [+{offset} lines] "),
+                Style::default().fg(Color::Yellow),
+            )
+        })
+        .unwrap_or_else(|| Span::raw(""));
+
     let border_color = if is_pty_interact {
         Color::Green
     } else {
@@ -621,6 +635,7 @@ fn render_pty_output_viewer(
                     .add_modifier(Modifier::BOLD),
             ),
             live_indicator,
+            scroll_indicator,
             status_indicator,
         ]);
 

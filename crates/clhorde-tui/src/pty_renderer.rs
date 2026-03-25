@@ -1,4 +1,5 @@
 use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::Config;
 use alacritty_terminal::vte::ansi::Processor;
 use alacritty_terminal::Term;
@@ -42,5 +43,20 @@ impl PtyRenderer {
             lines: rows as usize,
         };
         self.term.resize(dims);
+    }
+
+    /// Scroll the terminal viewport (positive delta = up into history).
+    pub fn scroll_display(&mut self, delta: i32) {
+        self.term.scroll_display(Scroll::Delta(delta));
+    }
+
+    /// Get the current display offset (0 = at bottom / latest output).
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// Scroll the terminal viewport back to the bottom.
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
     }
 }
