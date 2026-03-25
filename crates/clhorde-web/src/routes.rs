@@ -10,14 +10,15 @@ use serde_json::json;
 
 use clhorde_core::protocol::{ClientRequest, DaemonEvent};
 
+use crate::auth::{self, AuthToken};
 use crate::state::AppState;
 use crate::static_files::{self, StaticSource};
 use crate::ws;
 
 /// Build the axum router with all REST API routes and static file fallback.
-pub fn router(state: AppState, static_source: StaticSource) -> Router {
+pub fn router(state: AppState, static_source: StaticSource, auth_token: Option<String>) -> Router {
     let fallback_source = static_source.clone();
-    Router::new()
+    let mut app = Router::new()
         .route("/api/health", get(health))
         .route("/api/state", get(get_state))
         .route("/api/prompts", get(list_prompts).post(submit_prompt))
@@ -46,7 +47,16 @@ pub fn router(state: AppState, static_source: StaticSource) -> Router {
         .route("/api/store/keep", post(store_keep))
         .route("/api/store/clean-worktrees", post(store_clean_worktrees))
         .with_state(state)
-        .fallback(move |req| static_files::serve_static(fallback_source.clone(), req))
+        .fallback(move |req| static_files::serve_static(fallback_source.clone(), req));
+
+    // Apply auth middleware if a token is configured
+    if let Some(token) = auth_token {
+        app = app
+            .layer(axum::Extension(AuthToken(token)))
+            .layer(axum::middleware::from_fn(auth::auth_middleware));
+    }
+
+    app
 }
 
 // ---------------------------------------------------------------------------

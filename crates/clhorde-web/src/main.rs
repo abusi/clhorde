@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 
 use clhorde_core::ipc::daemon_socket_path;
 
+mod auth;
 mod bridge;
 mod routes;
 mod state;
@@ -33,6 +34,10 @@ struct Cli {
     /// Override path to daemon Unix socket
     #[arg(long)]
     daemon_socket: Option<PathBuf>,
+
+    /// Require this token for API access (Bearer auth). Also reads CLHORDE_WEB_AUTH_TOKEN env var.
+    #[arg(long, env = "CLHORDE_WEB_AUTH_TOKEN")]
+    auth_token: Option<String>,
 
     /// Enable verbose logging (-v info, -vv debug)
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -101,7 +106,7 @@ async fn main() {
     };
 
     let app_state = state::AppState::new(bridge);
-    let app = routes::router(app_state, static_source);
+    let app = routes::router(app_state, static_source, cli.auth_token.clone());
 
     let addr: SocketAddr = match format!("{}:{}", cli.host, cli.port).parse() {
         Ok(a) => a,
@@ -110,6 +115,13 @@ async fn main() {
             process::exit(1);
         }
     };
+
+    // Warn if binding to non-localhost without auth
+    let is_localhost = cli.host == "127.0.0.1" || cli.host == "::1" || cli.host == "localhost";
+    if !is_localhost && cli.auth_token.is_none() {
+        eprintln!("Warning: serving without authentication on a network interface");
+        tracing::warn!("serving without authentication on a network interface — consider --auth-token");
+    }
 
     info!(%addr, "listening");
 

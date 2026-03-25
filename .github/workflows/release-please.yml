@@ -48,7 +48,7 @@ jobs:
           TAG="${{ needs.release-please.outputs.tag_name }}"
           ARCHIVE="clhorde-${TAG}-${{ matrix.target }}.tar.gz"
           BIN_DIR="target/${{ matrix.target }}/release"
-          tar -czf "$ARCHIVE" -C "$BIN_DIR" clhorded clhorde clhorde-cli
+          tar -czf "$ARCHIVE" -C "$BIN_DIR" clhorded clhorde clhorde-cli clhorde-web
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Upload release assets

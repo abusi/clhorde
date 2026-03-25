@@ -1083,9 +1083,261 @@ function escapeAttr(str) {
 }
 
 // ---------------------------------------------------------------------------
+// Toast notifications (M2)
+// ---------------------------------------------------------------------------
+
+/** Show a toast notification. Returns the toast element. */
+function showToast(message, type = "error", options = {}) {
+    const container = document.getElementById("toast-container");
+    if (!container) return null;
+
+    const toast = document.createElement("div");
+    toast.className = `toast toast-${type}`;
+
+    let html = `<span class="toast-msg">${escapeHtml(message)}</span>`;
+    if (options.retry) {
+        html += `<button class="toast-retry">Retry</button>`;
+    }
+    html += `<button class="toast-dismiss">\u00d7</button>`;
+    toast.innerHTML = html;
+
+    toast.querySelector(".toast-dismiss")?.addEventListener("click", () => toast.remove());
+    if (options.retry) {
+        toast.querySelector(".toast-retry")?.addEventListener("click", () => {
+            toast.remove();
+            options.retry();
+        });
+    }
+
+    container.appendChild(toast);
+
+    // Auto-dismiss after 5s unless persistent
+    if (!options.persistent) {
+        setTimeout(() => toast.remove(), 5000);
+    }
+
+    return toast;
+}
+
+// ---------------------------------------------------------------------------
+// API fetch wrapper with timeout and error toasts (M2)
+// ---------------------------------------------------------------------------
+
+/** Fetch with 10s timeout and error toast on failure. */
+async function apiFetch(url, options = {}) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    try {
+        const res = await fetch(url, { ...options, signal: controller.signal });
+        clearTimeout(timeout);
+
+        if (!res.ok) {
+            const data = await res.json().catch(() => null);
+            const msg = data?.error || `HTTP ${res.status}`;
+            showToast(msg, "error", {
+                retry: () => apiFetch(url, options),
+            });
+        }
+        return res;
+    } catch (e) {
+        clearTimeout(timeout);
+        const msg = e.name === "AbortError" ? "Request timed out" : "Network error";
+        showToast(msg, "error", {
+            retry: () => apiFetch(url, options),
+        });
+        return null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reconnection banner (M2)
+// ---------------------------------------------------------------------------
+
+let bannerVisible = false;
+let pollInterval = null;
+
+client.onEvent(msg => {
+    if (msg.type !== "ConnectionStatus") return;
+    const banner = document.getElementById("reconnect-banner");
+    const bannerText = document.getElementById("banner-text");
+
+    if (msg.status === "connecting" || msg.status === "disconnected") {
+        if (banner) banner.hidden = false;
+        if (bannerText) {
+            bannerText.textContent = msg.status === "connecting"
+                ? "Reconnecting to daemon..."
+                : "Disconnected from daemon";
+        }
+        bannerVisible = true;
+
+        // Start fallback polling if WS is down
+        if (!pollInterval) {
+            pollInterval = setInterval(async () => {
+                try {
+                    const res = await fetch("/api/state");
+                    if (res.ok) {
+                        const data = await res.json();
+                        appState.hydrate(data);
+                    }
+                } catch (e) { /* ignore */ }
+            }, 5000);
+        }
+    } else if (msg.status === "connected") {
+        if (banner) banner.hidden = true;
+        bannerVisible = false;
+
+        // Stop fallback polling
+        if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+        }
+    }
+});
+
+// ---------------------------------------------------------------------------
+// View navigation (M1)
+// ---------------------------------------------------------------------------
+
+let currentView = "dashboard";
+
+function switchView(view) {
+    currentView = view;
+
+    // Toggle nav tabs
+    document.querySelectorAll(".nav-tab").forEach(tab => {
+        tab.classList.toggle("active", tab.dataset.view === view);
+    });
+
+    // Toggle views
+    const sidebar = document.getElementById("sidebar");
+    const content = document.getElementById("content");
+    const storeView = document.getElementById("store-view");
+
+    if (view === "dashboard") {
+        if (sidebar) sidebar.hidden = false;
+        if (content) content.hidden = false;
+        if (storeView) storeView.hidden = true;
+    } else if (view === "store") {
+        if (sidebar) sidebar.hidden = true;
+        if (content) content.hidden = true;
+        if (storeView) storeView.hidden = false;
+        loadStoreData();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Store management (M1)
+// ---------------------------------------------------------------------------
+
+async function loadStoreData() {
+    const [listRes, countRes, pathRes] = await Promise.all([
+        fetch("/api/store").catch(() => null),
+        fetch("/api/store/count").catch(() => null),
+        fetch("/api/store/path").catch(() => null),
+    ]);
+
+    // Counts
+    const countsEl = document.getElementById("store-counts");
+    if (countRes?.ok && countsEl) {
+        const counts = await countRes.json();
+        countsEl.innerHTML = [
+            { label: "Pending", count: counts.pending, color: "pending" },
+            { label: "Running", count: counts.running, color: "running" },
+            { label: "Completed", count: counts.completed, color: "completed" },
+            { label: "Failed", count: counts.failed, color: "failed" },
+        ].map(c => `
+            <div class="store-count-card">
+                <div class="count" style="color:var(--status-${c.color})">${c.count}</div>
+                <div class="label">${c.label}</div>
+            </div>
+        `).join("");
+    }
+
+    // Path
+    const pathEl = document.getElementById("store-path");
+    if (pathRes?.ok && pathEl) {
+        const data = await pathRes.json();
+        pathEl.textContent = data.path || "";
+    }
+
+    // List
+    const listEl = document.getElementById("store-list");
+    if (listRes?.ok && listEl) {
+        const prompts = await listRes.json();
+        if (prompts.length === 0) {
+            listEl.innerHTML = `<div class="empty-state">No stored prompts</div>`;
+        } else {
+            listEl.innerHTML = prompts.map(p => {
+                const statusClass = "badge badge-" + (p.status || "idle");
+                const modeLabel = p.mode === "one-shot" ? "1S" : "IA";
+                return `
+                    <div class="store-row">
+                        <span class="prompt-id">#${p.id}</span>
+                        <span class="${statusClass}">${p.status || "idle"}</span>
+                        <span class="mode-indicator">${modeLabel}</span>
+                        <span class="prompt-text">${escapeHtml(truncate(p.text || "", 80))}</span>
+                    </div>
+                `;
+            }).join("");
+        }
+    }
+}
+
+async function storeAction(action) {
+    const routes = {
+        "drop-all":        { url: "/api/store/drop", body: { filter: "all" } },
+        "drop-completed":  { url: "/api/store/drop", body: { filter: "completed" } },
+        "drop-failed":     { url: "/api/store/drop", body: { filter: "failed" } },
+        "keep-completed":  { url: "/api/store/keep", body: { filter: "completed" } },
+        "clean-worktrees": { url: "/api/store/clean-worktrees", body: null },
+        "refresh":         { url: null },
+    };
+
+    const route = routes[action];
+    if (!route) return;
+
+    if (action.startsWith("drop") && !confirm(`${action.replace("-", " ")}?`)) return;
+
+    if (route.url) {
+        try {
+            const res = await fetch(route.url, {
+                method: "POST",
+                headers: route.body ? { "Content-Type": "application/json" } : {},
+                body: route.body ? JSON.stringify(route.body) : undefined,
+            });
+            if (res.ok) {
+                const data = await res.json();
+                if (data.message) showToast(data.message, "success");
+            } else {
+                const data = await res.json().catch(() => null);
+                showToast(data?.error || "Store action failed", "error");
+            }
+        } catch (e) {
+            showToast("Failed to connect", "error");
+        }
+    }
+
+    // Refresh store data after any action
+    loadStoreData();
+}
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
 restoreFromHash();
 setupEventHandlers();
+
+// Nav tabs
+document.querySelectorAll(".nav-tab").forEach(tab => {
+    tab.addEventListener("click", () => switchView(tab.dataset.view));
+});
+
+// Store action buttons
+document.querySelector(".store-actions")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-store]");
+    if (btn) storeAction(btn.dataset.store);
+});
+
 client.connect();

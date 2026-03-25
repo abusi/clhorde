@@ -43,6 +43,16 @@ crates/
 │       ├── pty_renderer.rs # Local alacritty_terminal Term for PTY byte rendering
 │       ├── key_encoding.rs # Crossterm key → PTY byte encoding
 │       └── cli.rs          # TUI-specific CLI args (prompt-from-files, --run-path)
+├── clhorde-web/           # HTTP/WebSocket bridge → `clhorde-web` binary
+│   └── src/
+│       ├── main.rs         # CLI args, tracing, server startup
+│       ├── routes.rs       # REST API route handlers (prompts, config, store)
+│       ├── ws.rs           # WebSocket handler, event fan-out, PTY streaming
+│       ├── bridge.rs       # Async IPC client to daemon (connect, reconnect, broadcast)
+│       ├── state.rs        # Shared AppState (bridge + WS connection count)
+│       ├── static_files.rs # Embedded/filesystem static file serving with SPA fallback
+│       └── auth.rs         # Optional token-based auth middleware
+│   └── static/             # Frontend assets (vanilla JS SPA, vendored xterm.js)
 └── clhorde-cli/           # Command-line tool → `clhorde-cli` binary
     └── src/
         ├── main.rs         # Arg parsing, subcommand dispatch
@@ -66,6 +76,7 @@ crates/
 | `clhorde-daemon` | `clhorded` | Background orchestrator, manages workers |
 | `clhorde-tui` | `clhorde` | Terminal UI, connects to daemon |
 | `clhorde-cli` | `clhorde-cli` | CLI tool for store mgmt + daemon interaction |
+| `clhorde-web` | `clhorde-web` | HTTP/WebSocket bridge + web dashboard |
 
 ### Key design decisions
 
@@ -77,6 +88,7 @@ crates/
 - **Communication**: Workers send `WorkerMessage` variants back to the orchestrator. Clients send `ClientRequest` messages. The daemon broadcasts `DaemonEvent` to all subscribed clients.
 - **Persistence**: Each prompt is persisted as a UUID v7-named JSON file in `~/.local/share/clhorde/prompts/`. Managed by the daemon. The `[settings]` section in `keymap.toml` controls `max_saved_prompts` (default: 100) for automatic pruning.
 - **Git worktree isolation**: Per-prompt opt-in via `Ctrl+W` in Insert mode. The daemon creates a detached git worktree before spawning the worker. Cleanup controlled by `worktree_cleanup` setting.
+- **Web bridge**: `clhorde-web` is another thin client that bridges HTTP/WebSocket to the daemon IPC. REST API for CRUD operations, WebSocket for real-time event streaming and PTY bytes. Vanilla JS SPA with no build step, xterm.js for terminal emulation. Optional token-based auth for non-localhost use.
 - **Dual architecture (PTY + stream-json)**: Interactive workers run in a real PTY via `portable-pty`, with the full Claude Code TUI rendered through `alacritty_terminal`. One-shot workers use the lighter `stream-json` protocol for text-only output.
 - **Claude CLI integration**: Two spawn strategies based on prompt mode:
   - **Interactive (PTY)**: `claude "prompt" --dangerously-skip-permissions` — runs in a real PTY, full TUI embedded in the right panel. Keystrokes forwarded in PtyInteract mode.
@@ -104,6 +116,16 @@ crates/
 - `crossterm` 0.28 — terminal backend
 - `alacritty_terminal` 0.25 — local PTY rendering
 - `chrono` 0.4, `dirs` 6
+
+### clhorde-web
+- `clhorde-core`, `tokio` 1, `serde_json` 1
+- `axum` 0.8 (ws) — HTTP/WebSocket server
+- `tower-http` 0.6 (fs, cors) — static file serving, CORS
+- `futures-util` 0.3 — stream split for WebSocket
+- `base64` 0.22 — PTY byte encoding
+- `include_dir` 0.7 — compile-time static asset embedding
+- `tracing` 0.1, `tracing-subscriber` 0.3 — logging
+- `clap` 4 (derive, env) — CLI args
 
 ### clhorde-cli
 - `clhorde-core`, `tokio` 1, `serde_json` 1

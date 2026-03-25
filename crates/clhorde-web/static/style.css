@@ -586,6 +586,186 @@ textarea.input {
     background: var(--border-focus);
 }
 
+/* Navigation tabs */
+.header-nav {
+    display: flex;
+    gap: var(--space-xs);
+}
+
+.nav-tab {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
+    padding: var(--space-xs) var(--space-md);
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.nav-tab:hover {
+    color: var(--text-primary);
+}
+
+.nav-tab.active {
+    color: var(--text-primary);
+    border-color: var(--border);
+    background: var(--bg-tertiary);
+}
+
+/* Reconnection banner */
+.banner {
+    background: color-mix(in srgb, var(--status-pending) 15%, var(--bg-secondary));
+    border-bottom: 1px solid var(--status-pending);
+    color: var(--status-pending);
+    font-size: var(--font-size-sm);
+    padding: var(--space-sm) var(--space-lg);
+    text-align: center;
+    flex-shrink: 0;
+}
+
+/* Toast notifications */
+.toast-container {
+    position: fixed;
+    top: calc(var(--header-height) + var(--space-sm));
+    right: var(--space-lg);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    z-index: 100;
+    pointer-events: none;
+}
+
+.toast {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: var(--space-sm) var(--space-md);
+    font-size: var(--font-size-sm);
+    max-width: 360px;
+    pointer-events: auto;
+    animation: toast-in 0.2s ease-out;
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.toast-error {
+    border-color: color-mix(in srgb, var(--status-failed) 40%, var(--border));
+    color: var(--status-failed);
+}
+
+.toast-success {
+    border-color: color-mix(in srgb, var(--status-completed) 40%, var(--border));
+    color: var(--status-completed);
+}
+
+.toast-msg { flex: 1; }
+
+.toast-dismiss {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0;
+    line-height: 1;
+}
+
+.toast-retry {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 1px var(--space-sm);
+}
+
+@keyframes toast-in {
+    from { opacity: 0; transform: translateX(20px); }
+    to { opacity: 1; transform: translateX(0); }
+}
+
+/* Store view */
+.store-view {
+    flex: 1;
+    overflow-y: auto;
+    padding: var(--space-lg);
+}
+
+.store-header {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-lg);
+    margin-bottom: var(--space-lg);
+}
+
+.store-header h2 {
+    font-size: var(--font-size-lg);
+    font-weight: 600;
+}
+
+.store-counts {
+    display: flex;
+    gap: var(--space-md);
+    margin-bottom: var(--space-lg);
+    flex-wrap: wrap;
+}
+
+.store-count-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: var(--space-md) var(--space-lg);
+    text-align: center;
+    min-width: 100px;
+}
+
+.store-count-card .count {
+    font-size: 20px;
+    font-weight: 600;
+}
+
+.store-count-card .label {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+.store-actions {
+    display: flex;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-lg);
+    flex-wrap: wrap;
+}
+
+.store-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+.store-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: var(--space-sm) var(--space-md);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: var(--font-size-sm);
+}
+
+.store-row .prompt-text {
+    flex: 1;
+}
+
+.store-row .mode-indicator {
+    flex-shrink: 0;
+}
+
 /* Responsive: collapse sidebar on narrow screens */
 @media (max-width: 700px) {
     .sidebar {
