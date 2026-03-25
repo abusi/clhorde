@@ -4,10 +4,13 @@ use std::process;
 
 use axum::{routing::get, Router};
 use clap::Parser;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use clhorde_core::ipc::daemon_socket_path;
+
+mod bridge;
+mod state;
 
 /// clhorde-web — HTTP/WebSocket bridge for the clhorde daemon
 #[derive(Parser)]
@@ -77,7 +80,22 @@ async fn main() {
         "starting clhorde-web"
     );
 
-    let app = Router::new().route("/api/health", get(health));
+    let bridge = match bridge::DaemonBridge::connect(socket_path).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!(%e, "failed to connect to daemon");
+            eprintln!(
+                "Failed to connect to daemon. Is it running? Start with: clhorded"
+            );
+            process::exit(1);
+        }
+    };
+
+    let app_state = state::AppState::new(bridge);
+
+    let app = Router::new()
+        .route("/api/health", get(health))
+        .with_state(app_state);
 
     let addr: SocketAddr = match format!("{}:{}", cli.host, cli.port).parse() {
         Ok(a) => a,
