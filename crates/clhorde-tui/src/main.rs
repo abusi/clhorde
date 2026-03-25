@@ -127,6 +127,12 @@ async fn run_app(
                             }
                         }
                     }
+                    Event::Paste(text) if app.mode == app::AppMode::PtyInteract => {
+                        app.paste_to_pty(&text);
+                    }
+                    Event::Paste(text) if app.mode == app::AppMode::Interact => {
+                        app.interact_input.push_str(&text);
+                    }
                     Event::Resize(_, _) => {
                         // Terminal resized — next draw will update output_panel_size
                     }
