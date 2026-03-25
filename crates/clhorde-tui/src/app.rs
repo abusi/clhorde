@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 
@@ -81,6 +81,8 @@ pub struct App {
     pub show_quick_prompts_popup: bool,
     /// Size of the output panel (cols, rows) from last render.
     pub output_panel_size: Option<(u16, u16)>,
+    /// Absolute rect of the PTY inner area (for mouse coordinate mapping).
+    pub output_panel_rect: Option<(u16, u16, u16, u16)>,
     /// Last PTY size sent to workers (for change detection).
     pub last_pty_size: Option<(u16, u16)>,
     /// Whether the next submitted prompt should use a git worktree.
@@ -150,6 +152,7 @@ impl App {
             template_suggestion_index: 0,
             show_quick_prompts_popup: false,
             output_panel_size: None,
+            output_panel_rect: None,
             last_pty_size: None,
             worktree_pending: false,
             list_height: 0,
@@ -1178,6 +1181,95 @@ impl App {
         }
     }
 
+    /// Handle mouse events — forward to PTY in PtyInteract mode, scroll in ViewOutput.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match self.mode {
+            AppMode::PtyInteract => {
+                self.forward_mouse_to_pty(mouse);
+            }
+            AppMode::ViewOutput => {
+                // Scroll text output with mouse wheel
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.auto_scroll = false;
+                        self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.scroll_offset = self.scroll_offset.saturating_add(3);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Forward a mouse event to the PTY as SGR escape sequences.
+    fn forward_mouse_to_pty(&mut self, mouse: MouseEvent) {
+        let Some((px, py, pw, ph)) = self.output_panel_rect else {
+            return;
+        };
+
+        // Translate to PTY-relative coordinates (1-based for SGR encoding)
+        let col = mouse.column;
+        let row = mouse.row;
+        if col < px || col >= px + pw || row < py || row >= py + ph {
+            return; // Outside the PTY panel
+        }
+        let pty_col = col - px + 1;
+        let pty_row = row - py + 1;
+
+        // Encode as SGR mouse escape: \x1b[<button;col;rowM (press) or m (release)
+        let seq = match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                format!("\x1b[<64;{pty_col};{pty_row}M")
+            }
+            MouseEventKind::ScrollDown => {
+                format!("\x1b[<65;{pty_col};{pty_row}M")
+            }
+            MouseEventKind::Down(btn) => {
+                let button = match btn {
+                    crossterm::event::MouseButton::Left => 0,
+                    crossterm::event::MouseButton::Middle => 1,
+                    crossterm::event::MouseButton::Right => 2,
+                };
+                format!("\x1b[<{button};{pty_col};{pty_row}M")
+            }
+            MouseEventKind::Up(btn) => {
+                let button = match btn {
+                    crossterm::event::MouseButton::Left => 0,
+                    crossterm::event::MouseButton::Middle => 1,
+                    crossterm::event::MouseButton::Right => 2,
+                };
+                format!("\x1b[<{button};{pty_col};{pty_row}m")
+            }
+            MouseEventKind::Drag(btn) => {
+                let button = match btn {
+                    crossterm::event::MouseButton::Left => 32,
+                    crossterm::event::MouseButton::Middle => 33,
+                    crossterm::event::MouseButton::Right => 34,
+                };
+                format!("\x1b[<{button};{pty_col};{pty_row}M")
+            }
+            MouseEventKind::Moved => {
+                format!("\x1b[<35;{pty_col};{pty_row}M")
+            }
+            _ => return,
+        };
+
+        if let Some(prompt) = self.selected_prompt() {
+            let s = prompt.status_enum();
+            if s != PromptStatus::Running && s != PromptStatus::Idle {
+                return;
+            }
+            let id = prompt.id;
+            self.send(ClientRequest::SendBytes {
+                prompt_id: id,
+                data: seq.into_bytes(),
+            });
+        }
+    }
+
     fn try_quick_prompt(&mut self, key: &KeyEvent) {
         let Some(message) = self.keymap.quick_prompts.get(&key.code) else {
             return;
@@ -1752,6 +1844,7 @@ mod tests {
             template_suggestion_index: 0,
             show_quick_prompts_popup: false,
             output_panel_size: None,
+            output_panel_rect: None,
             last_pty_size: None,
             worktree_pending: false,
             list_height: 0,
