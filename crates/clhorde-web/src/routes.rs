@@ -3,7 +3,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -29,6 +29,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/prompts/{id}/resume", post(resume_prompt))
         .route("/api/prompts/{id}/move-up", post(move_prompt_up))
         .route("/api/prompts/{id}/move-down", post(move_prompt_down))
+        // Configuration
+        .route("/api/config/max-workers", put(set_max_workers))
+        .route("/api/config/default-mode", put(set_default_mode))
+        .route("/api/prompts/{id}/mode", put(set_prompt_mode))
+        // Store
+        .route("/api/store", get(store_list))
+        .route("/api/store/count", get(store_count))
+        .route("/api/store/path", get(store_path))
+        .route("/api/store/drop", post(store_drop))
+        .route("/api/store/keep", post(store_keep))
+        .route("/api/store/clean-worktrees", post(store_clean_worktrees))
         .with_state(state)
 }
 
@@ -58,6 +69,24 @@ fn default_mode() -> String {
 #[derive(Debug, Deserialize)]
 struct SendInputBody {
     text: String,
+}
+
+/// Request body for `PUT /api/config/max-workers`.
+#[derive(Debug, Deserialize)]
+struct SetMaxWorkersBody {
+    count: usize,
+}
+
+/// Request body for `PUT /api/config/default-mode` and `PUT /api/prompts/:id/mode`.
+#[derive(Debug, Deserialize)]
+struct SetModeBody {
+    mode: String,
+}
+
+/// Request body for `POST /api/store/drop` and `POST /api/store/keep`.
+#[derive(Debug, Deserialize)]
+struct StoreFilterBody {
+    filter: String,
 }
 
 /// `GET /api/health` — ping the daemon, return `{ "status": "ok" }`.
@@ -368,6 +397,275 @@ async fn move_prompt_down(
         "move_prompt_down",
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Configuration endpoints
+// ---------------------------------------------------------------------------
+
+/// `PUT /api/config/max-workers` — set the maximum worker count (1–20).
+async fn set_max_workers(
+    State(state): State<AppState>,
+    Json(body): Json<SetMaxWorkersBody>,
+) -> impl IntoResponse {
+    if body.count < 1 || body.count > 20 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "count must be between 1 and 20" })),
+        )
+            .into_response();
+    }
+
+    dispatch_action(
+        &state,
+        ClientRequest::SetMaxWorkers(body.count),
+        "set_max_workers",
+    )
+    .await
+}
+
+/// `PUT /api/config/default-mode` — set the default prompt mode.
+async fn set_default_mode(
+    State(state): State<AppState>,
+    Json(body): Json<SetModeBody>,
+) -> impl IntoResponse {
+    if !is_valid_mode(&body.mode) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "invalid mode \"{}\": expected \"interactive\" or \"one-shot\"",
+                    body.mode
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    dispatch_action(
+        &state,
+        ClientRequest::SetDefaultMode { mode: body.mode },
+        "set_default_mode",
+    )
+    .await
+}
+
+/// `PUT /api/prompts/:id/mode` — set the mode for a specific prompt.
+async fn set_prompt_mode(
+    State(state): State<AppState>,
+    Path(id): Path<usize>,
+    Json(body): Json<SetModeBody>,
+) -> impl IntoResponse {
+    if !is_valid_mode(&body.mode) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "invalid mode \"{}\": expected \"interactive\" or \"one-shot\"",
+                    body.mode
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    dispatch_prompt_action(
+        &state,
+        ClientRequest::SetPromptMode {
+            prompt_id: id,
+            mode: body.mode,
+        },
+        "set_prompt_mode",
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Store endpoints
+// ---------------------------------------------------------------------------
+
+/// `GET /api/store` — list persisted prompts.
+async fn store_list(State(state): State<AppState>) -> impl IntoResponse {
+    match state.bridge.send_request(ClientRequest::StoreList).await {
+        Ok(DaemonEvent::StoreListResult { prompts }) => {
+            (StatusCode::OK, Json(json!(prompts))).into_response()
+        }
+        Ok(DaemonEvent::Error { message }) => daemon_error_to_response(&message),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "unexpected response from daemon" })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("store_list failed: {e}");
+            daemon_unavailable()
+        }
+    }
+}
+
+/// `GET /api/store/count` — counts by state.
+async fn store_count(State(state): State<AppState>) -> impl IntoResponse {
+    match state.bridge.send_request(ClientRequest::StoreCount).await {
+        Ok(DaemonEvent::StoreCountResult {
+            pending,
+            running,
+            completed,
+            failed,
+        }) => (
+            StatusCode::OK,
+            Json(json!({
+                "pending": pending,
+                "running": running,
+                "completed": completed,
+                "failed": failed,
+            })),
+        )
+            .into_response(),
+        Ok(DaemonEvent::Error { message }) => daemon_error_to_response(&message),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "unexpected response from daemon" })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("store_count failed: {e}");
+            daemon_unavailable()
+        }
+    }
+}
+
+/// `GET /api/store/path` — storage directory path.
+async fn store_path(State(state): State<AppState>) -> impl IntoResponse {
+    match state.bridge.send_request(ClientRequest::StorePath).await {
+        Ok(DaemonEvent::StorePathResult { path }) => {
+            (StatusCode::OK, Json(json!({ "path": path }))).into_response()
+        }
+        Ok(DaemonEvent::Error { message }) => daemon_error_to_response(&message),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "unexpected response from daemon" })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("store_path failed: {e}");
+            daemon_unavailable()
+        }
+    }
+}
+
+/// Valid store filter values.
+fn is_valid_store_filter(filter: &str) -> bool {
+    matches!(filter, "all" | "completed" | "failed" | "pending")
+}
+
+/// Valid store keep filter values (no "all" — keeping everything is a no-op).
+fn is_valid_keep_filter(filter: &str) -> bool {
+    matches!(filter, "completed" | "failed" | "pending")
+}
+
+/// `POST /api/store/drop` — drop prompts by filter.
+async fn store_drop(
+    State(state): State<AppState>,
+    Json(body): Json<StoreFilterBody>,
+) -> impl IntoResponse {
+    if !is_valid_store_filter(&body.filter) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "invalid filter \"{}\": expected \"all\", \"completed\", \"failed\", or \"pending\"",
+                    body.filter
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    match state
+        .bridge
+        .send_request(ClientRequest::StoreDrop {
+            filter: body.filter,
+        })
+        .await
+    {
+        Ok(DaemonEvent::StoreOpComplete { message }) => {
+            (StatusCode::OK, Json(json!({ "ok": true, "message": message }))).into_response()
+        }
+        Ok(DaemonEvent::Error { message }) => daemon_error_to_response(&message),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "unexpected response from daemon" })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("store_drop failed: {e}");
+            daemon_unavailable()
+        }
+    }
+}
+
+/// `POST /api/store/keep` — keep prompts by filter, drop the rest.
+async fn store_keep(
+    State(state): State<AppState>,
+    Json(body): Json<StoreFilterBody>,
+) -> impl IntoResponse {
+    if !is_valid_keep_filter(&body.filter) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "invalid filter \"{}\": expected \"completed\", \"failed\", or \"pending\"",
+                    body.filter
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    match state
+        .bridge
+        .send_request(ClientRequest::StoreKeep {
+            filter: body.filter,
+        })
+        .await
+    {
+        Ok(DaemonEvent::StoreOpComplete { message }) => {
+            (StatusCode::OK, Json(json!({ "ok": true, "message": message }))).into_response()
+        }
+        Ok(DaemonEvent::Error { message }) => daemon_error_to_response(&message),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "unexpected response from daemon" })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("store_keep failed: {e}");
+            daemon_unavailable()
+        }
+    }
+}
+
+/// `POST /api/store/clean-worktrees` — remove lingering git worktrees.
+async fn store_clean_worktrees(State(state): State<AppState>) -> impl IntoResponse {
+    match state
+        .bridge
+        .send_request(ClientRequest::CleanWorktrees)
+        .await
+    {
+        Ok(DaemonEvent::StoreOpComplete { message }) => {
+            (StatusCode::OK, Json(json!({ "ok": true, "message": message }))).into_response()
+        }
+        Ok(DaemonEvent::Error { message }) => daemon_error_to_response(&message),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "unexpected response from daemon" })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("store_clean_worktrees failed: {e}");
+            daemon_unavailable()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
