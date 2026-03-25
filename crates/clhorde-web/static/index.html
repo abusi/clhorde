@@ -12,6 +12,11 @@
         <div class="header-left">
             <h1 class="header-title">clhorde</h1>
         </div>
+
+        <nav class="header-nav">
+            <button class="nav-tab active" data-view="dashboard" id="nav-dashboard">Dashboard</button>
+            <button class="nav-tab" data-view="store" id="nav-store">Store</button>
+        </nav>
         <div class="header-right">
             <span class="connection-status" id="connection-status">
                 <span class="status-dot disconnected" id="status-dot"></span>
@@ -19,6 +24,11 @@
             </span>
         </div>
     </header>
+
+    <div class="banner" id="reconnect-banner" hidden>
+        <span id="banner-text">Reconnecting to daemon...</span>
+    </div>
+    <div class="toast-container" id="toast-container"></div>
 
     <main class="main">
         <aside class="sidebar" id="sidebar">
@@ -73,6 +83,25 @@
                     <input type="text" class="input" id="followup-input" placeholder="Send follow-up...">
                     <button class="btn btn-sm" id="followup-send">Send</button>
                 </div>
+            </div>
+        </section>
+
+        <section class="store-view" id="store-view" hidden>
+            <div class="store-header">
+                <h2>Prompt Store</h2>
+                <span class="footer-label" id="store-path"></span>
+            </div>
+            <div class="store-counts" id="store-counts"></div>
+            <div class="store-actions">
+                <button class="btn btn-sm btn-danger" data-store="drop-all">Drop All</button>
+                <button class="btn btn-sm btn-danger" data-store="drop-completed">Drop Completed</button>
+                <button class="btn btn-sm btn-danger" data-store="drop-failed">Drop Failed</button>
+                <button class="btn btn-sm" data-store="keep-completed">Keep Completed</button>
+                <button class="btn btn-sm" data-store="clean-worktrees">Clean Worktrees</button>
+                <button class="btn btn-sm" data-store="refresh">Refresh</button>
+            </div>
+            <div class="store-list" id="store-list">
+                <div class="empty-state">Loading...</div>
             </div>
         </section>
     </main>
