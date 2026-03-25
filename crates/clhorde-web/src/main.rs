@@ -11,6 +11,7 @@ use clhorde_core::ipc::daemon_socket_path;
 mod bridge;
 mod routes;
 mod state;
+mod ws;
 
 /// clhorde-web — HTTP/WebSocket bridge for the clhorde daemon
 #[derive(Parser)]

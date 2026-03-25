@@ -11,6 +11,7 @@ use serde_json::json;
 use clhorde_core::protocol::{ClientRequest, DaemonEvent};
 
 use crate::state::AppState;
+use crate::ws;
 
 /// Build the axum router with all REST API routes.
 pub fn router(state: AppState) -> Router {
@@ -29,6 +30,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/prompts/{id}/resume", post(resume_prompt))
         .route("/api/prompts/{id}/move-up", post(move_prompt_up))
         .route("/api/prompts/{id}/move-down", post(move_prompt_down))
+        // WebSocket
+        .route("/api/ws", get(ws::ws_upgrade))
         // Configuration
         .route("/api/config/max-workers", put(set_max_workers))
         .route("/api/config/default-mode", put(set_default_mode))
@@ -92,7 +95,10 @@ struct StoreFilterBody {
 /// `GET /api/health` — ping the daemon, return `{ "status": "ok" }`.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     match state.bridge.send_request(ClientRequest::Ping).await {
-        Ok(DaemonEvent::Pong) => (StatusCode::OK, Json(json!({ "status": "ok" }))),
+        Ok(DaemonEvent::Pong) => (
+            StatusCode::OK,
+            Json(json!({ "status": "ok", "ws_connections": state.ws_count() })),
+        ),
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "unexpected response from daemon" })),
