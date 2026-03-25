@@ -38,12 +38,14 @@ struct PendingRequest {
 
 /// PTY bytes received from the daemon.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PtyFrame {
     pub prompt_id: usize,
     pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum BridgeError {
     /// Not currently connected to the daemon.
     NotConnected,
@@ -127,6 +129,7 @@ impl DaemonBridge {
     }
 
     /// Whether the bridge is currently connected to the daemon.
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
@@ -147,11 +150,13 @@ impl DaemonBridge {
     }
 
     /// Subscribe to the daemon event broadcast stream.
+    #[allow(dead_code)]
     pub fn subscribe_events(&self) -> broadcast::Receiver<DaemonEvent> {
         self.event_tx.subscribe()
     }
 
     /// Subscribe to the PTY bytes broadcast stream.
+    #[allow(dead_code)]
     pub fn subscribe_pty(&self) -> broadcast::Receiver<PtyFrame> {
         self.pty_tx.subscribe()
     }
