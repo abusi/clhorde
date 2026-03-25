@@ -39,6 +39,10 @@ struct Cli {
     #[arg(long, env = "CLHORDE_WEB_AUTH_TOKEN")]
     auth_token: Option<String>,
 
+    /// Allow CORS requests from this origin (e.g. http://localhost:5173 for development)
+    #[arg(long, env = "CLHORDE_WEB_CORS_ORIGIN")]
+    cors_origin: Option<String>,
+
     /// Enable verbose logging (-v info, -vv debug)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -106,7 +110,12 @@ async fn main() {
     };
 
     let app_state = state::AppState::new(bridge);
-    let app = routes::router(app_state, static_source, cli.auth_token.clone());
+    let app = routes::router(
+        app_state,
+        static_source,
+        cli.auth_token.clone(),
+        cli.cors_origin.clone(),
+    );
 
     let addr: SocketAddr = match format!("{}:{}", cli.host, cli.port).parse() {
         Ok(a) => a,

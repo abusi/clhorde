@@ -22,6 +22,7 @@
                 <span class="status-dot disconnected" id="status-dot"></span>
                 <span id="status-text">disconnected</span>
             </span>
+            <button class="btn btn-sm" id="logout-btn" hidden title="Clear auth token">Logout</button>
         </div>
     </header>
 
@@ -123,6 +124,18 @@
             <span id="prompt-count" class="footer-label">0 prompts</span>
         </div>
     </footer>
+
+    <div class="login-overlay" id="login-overlay" hidden>
+        <div class="login-card">
+            <h2>clhorde</h2>
+            <p class="login-hint">This instance requires an auth token.</p>
+            <form id="login-form">
+                <input type="password" class="input" id="login-token" placeholder="Enter auth token" autocomplete="off">
+                <span class="login-error" id="login-error"></span>
+                <button type="submit" class="btn btn-primary">Sign in</button>
+            </form>
+        </div>
+    </div>
 
     <noscript>clhorde web interface requires JavaScript.</noscript>
     <script src="/lib/xterm.min.js"></script>
