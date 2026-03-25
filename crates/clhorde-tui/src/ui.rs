@@ -627,8 +627,9 @@ fn render_pty_output_viewer(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Update output panel size for PTY resize tracking
+    // Update output panel size and position for PTY resize tracking + mouse mapping
     app.output_panel_size = Some((inner.width, inner.height));
+    app.output_panel_rect = Some((inner.x, inner.y, inner.width, inner.height));
 
     // Render PTY grid content
     if let Some(renderer) = app.pty_renderers.get(&id) {

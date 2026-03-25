@@ -10,7 +10,10 @@ mod ui;
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -44,7 +47,12 @@ async fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -54,6 +62,7 @@ async fn main() -> io::Result<()> {
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -133,6 +142,9 @@ async fn run_app(
                     Event::Paste(text) if app.mode == app::AppMode::Interact => {
                         app.interact_input.push_str(&text);
                     }
+                    Event::Mouse(mouse) => {
+                        app.handle_mouse(mouse);
+                    }
                     Event::Resize(_, _) => {
                         // Terminal resized — next draw will update output_panel_size
                     }
@@ -202,6 +214,7 @@ fn open_editor(
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
 
@@ -212,7 +225,8 @@ fn open_editor(
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        EnableMouseCapture
     )?;
     enable_raw_mode()?;
     terminal.clear()?;
