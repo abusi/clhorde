@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process;
 
-use axum::{routing::get, Router};
 use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -10,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 use clhorde_core::ipc::daemon_socket_path;
 
 mod bridge;
+mod routes;
 mod state;
 
 /// clhorde-web — HTTP/WebSocket bridge for the clhorde daemon
@@ -64,10 +64,6 @@ fn init_tracing(level: tracing::Level) {
         .init();
 }
 
-async fn health() -> &'static str {
-    "OK"
-}
-
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -92,10 +88,7 @@ async fn main() {
     };
 
     let app_state = state::AppState::new(bridge);
-
-    let app = Router::new()
-        .route("/api/health", get(health))
-        .with_state(app_state);
+    let app = routes::router(app_state);
 
     let addr: SocketAddr = match format!("{}:{}", cli.host, cli.port).parse() {
         Ok(a) => a,
