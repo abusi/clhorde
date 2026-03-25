@@ -31,22 +31,29 @@
     <ul>
       <li><strong>Rust 1.88+</strong> &mdash; install via <a href="https://rustup.rs">rustup.rs</a></li>
       <li><strong><code>claude</code> CLI</strong> &mdash; must be installed and available in your PATH</li>
+      <li><strong>Linux/macOS</strong> &mdash; Unix domain sockets required for daemon IPC</li>
     </ul>
 
     <h2>Installation</h2>
 
     <pre><code><span class="tok-prompt">$ </span><span class="tok-cmd">git clone</span> https://github.com/abusi/clhorde.git
 <span class="tok-prompt">$ </span><span class="tok-cmd">cd</span> clhorde
-<span class="tok-prompt">$ </span><span class="tok-cmd">cargo build</span> <span class="tok-flag">--release</span>
-<span class="tok-prompt">$ </span><span class="tok-cmd">./target/release/clhorde</span></code></pre>
+<span class="tok-prompt">$ </span><span class="tok-cmd">cargo build</span> <span class="tok-flag">--release</span></code></pre>
 
-    <p>The binary is at <code>target/release/clhorde</code>. Copy it somewhere in your PATH for easy access.</p>
+    <p>This builds three binaries in <code>target/release/</code>:</p>
+    <ul>
+      <li><code>clhorded</code> &mdash; the background daemon (manages workers and state)</li>
+      <li><code>clhorde</code> &mdash; the TUI (connects to daemon)</li>
+      <li><code>clhorde-cli</code> &mdash; the CLI tool (submit prompts, check status, manage store)</li>
+    </ul>
+    <p>Copy them somewhere in your PATH for easy access.</p>
 
     <h2>Your First Prompt</h2>
 
     <ol>
-      <li><strong>Launch:</strong> Run <code>clhorde</code> in your terminal. You'll see the TUI with an empty prompt list.</li>
-      <li><strong>Enter insert mode:</strong> Press <kbd>i</kbd>. The input bar at the bottom activates.</li>
+      <li><strong>Start the daemon:</strong> Run <code>clhorded &amp;</code> (or <code>clhorded</code> in a separate terminal). The daemon manages all workers in the background.</li>
+      <li><strong>Launch the TUI:</strong> Run <code>clhorde</code> in your terminal. It connects to the daemon and shows the TUI with an empty prompt list.</li>
+      <li><strong>Enter insert mode:</strong> Press <kbd>i</kbd> in the TUI. The input bar at the bottom activates.</li>
       <li><strong>Type a prompt:</strong> For example, <code>Explain what a git worktree is</code></li>
       <li><strong>Submit:</strong> Press <kbd>Enter</kbd>. The prompt appears in the queue as pending.</li>
       <li><strong>Watch it run:</strong> A worker picks it up and output streams in the right panel.</li>

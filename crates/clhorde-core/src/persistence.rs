@@ -3,8 +3,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::prompt::PromptMode;
-
 #[derive(Serialize, Deserialize)]
 pub struct PromptFile {
     pub prompt: String,
@@ -107,10 +105,7 @@ pub fn delete_prompt_file(dir: &Path, uuid: &str) {
 
 impl PromptFile {
     pub fn from_prompt(prompt: &crate::prompt::Prompt) -> Self {
-        let mode = match prompt.mode {
-            PromptMode::Interactive => "interactive",
-            PromptMode::OneShot => "one_shot",
-        };
+        let mode = prompt.mode.label();
         let state = match prompt.status {
             crate::prompt::PromptStatus::Pending => "pending",
             crate::prompt::PromptStatus::Running => "running",
@@ -137,6 +132,7 @@ impl PromptFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt::PromptMode;
     use std::env;
 
     fn temp_prompts_dir() -> PathBuf {
@@ -245,7 +241,7 @@ mod tests {
     fn prompt_file_oneshot_mode() {
         let prompt = crate::prompt::Prompt::new(1, "test".to_string(), None, PromptMode::OneShot);
         let file = PromptFile::from_prompt(&prompt);
-        assert_eq!(file.options.mode, "one_shot");
+        assert_eq!(file.options.mode, "one-shot");
         assert!(file.options.context.is_none());
     }
 
@@ -311,6 +307,52 @@ mod tests {
         assert_eq!(load_all_prompts(&dir).len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_backward_compat_one_underscore_shot() {
+        // Old files stored "one_shot" — verify they still load as OneShot
+        let dir = temp_prompts_dir();
+        let uuid = uuid::Uuid::now_v7().to_string();
+        let data = PromptFile {
+            prompt: "old format".to_string(),
+            options: PromptOptions {
+                mode: "one_shot".to_string(), // legacy format
+                context: None,
+                worktree: None,
+            },
+            state: "completed".to_string(),
+            queue_rank: 1.0,
+            session_id: None,
+            worktree_path: None,
+            tags: Vec::new(),
+        };
+        save_prompt(&dir, &uuid, &data);
+        let loaded = load_all_prompts(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            PromptMode::from_mode_str(&loaded[0].1.options.mode),
+            PromptMode::OneShot
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_roundtrip_oneshot() {
+        // New files store "one-shot" via label() — roundtrip still works
+        let dir = temp_prompts_dir();
+        let prompt =
+            crate::prompt::Prompt::new(1, "test prompt".to_string(), None, PromptMode::OneShot);
+        let file = PromptFile::from_prompt(&prompt);
+        assert_eq!(file.options.mode, "one-shot");
+        save_prompt(&dir, &prompt.uuid, &file);
+        let loaded = load_all_prompts(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            PromptMode::from_mode_str(&loaded[0].1.options.mode),
+            PromptMode::OneShot
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

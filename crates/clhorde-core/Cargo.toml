@@ -1,0 +1,17 @@
+[package]
+name = "clhorde-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+dirs.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+crossterm = { workspace = true, default-features = false, features = ["events"] }
+alacritty_terminal.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
