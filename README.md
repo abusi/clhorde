@@ -1,6 +1,6 @@
 # clhorde
 
-A lightweight, single-binary TUI for orchestrating multiple Claude Code CLI instances in parallel. Built with Rust, ratatui, and crossterm.
+A daemon+TUI+CLI system for orchestrating multiple Claude Code CLI instances in parallel. Built with Rust, ratatui, and crossterm.
 
 ![Rust](https://img.shields.io/badge/rust-2021-orange)
 
@@ -8,6 +8,7 @@ A lightweight, single-binary TUI for orchestrating multiple Claude Code CLI inst
 
 ## Features
 
+- **Daemon architecture** — background daemon (`clhorded`) manages workers; TUI and CLI are thin clients via Unix sockets. Workers survive TUI restarts, multiple clients connect simultaneously
 - **Prompt queue + worker pool** — queue unlimited prompts, 1–20 concurrent workers pull automatically
 - **Dual architecture** — embedded PTY for interactive, stream-json for one-shot
 - **Vim-style modal interface** — Normal, Insert, View, Interact, PtyInteract, Filter modes
@@ -20,8 +21,7 @@ A lightweight, single-binary TUI for orchestrating multiple Claude Code CLI inst
 - **Batch load from files** — `clhorde prompt-from-files tasks/*.md` to queue prompts from files
 - **Session persistence** — prompts saved to disk, resume with `R`
 - **Custom keybindings** — fully remappable via TOML config
-- **CLI management** — `store`, `keys`, `qp`, `config`, `prompt-from-files` subcommands
-- **Zero dependencies** — single binary, just needs `claude` in PATH
+- **CLI tools** — `submit`, `status`, `attach`, `store`, `keys`, `qp`, `config` subcommands (via `clhorde-cli`), plus `prompt-from-files` (via `clhorde` TUI)
 
 ## Install
 
@@ -29,7 +29,10 @@ A lightweight, single-binary TUI for orchestrating multiple Claude Code CLI inst
 git clone https://github.com/abusi/clhorde.git
 cd clhorde
 cargo build --release
-# binary is at target/release/clhorde
+# binaries at target/release/:
+#   clhorded     — background daemon (orchestrator)
+#   clhorde      — TUI client
+#   clhorde-cli  — CLI tool
 ```
 
 Requires:
@@ -39,11 +42,13 @@ Requires:
 ## Usage
 
 ```bash
-clhorde              # launch TUI
-clhorde --help       # show help
+clhorded &                              # start daemon (background)
+clhorde                                 # launch TUI
+clhorde-cli status                      # check daemon status
+clhorde-cli submit "Review the auth module"  # submit a prompt via CLI
 ```
 
-Press `i` to start typing a prompt. See the [getting started guide](https://abusi.github.io/clhorde/guide.html) for a walkthrough.
+The daemon must be running before the TUI or CLI can connect. Press `i` to start typing a prompt. See the [getting started guide](https://abusi.github.io/clhorde/guide.html) for a walkthrough.
 
 ## Documentation
 
