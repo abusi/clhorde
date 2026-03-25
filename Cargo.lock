@@ -407,6 +407,7 @@ dependencies = [
  "axum",
  "clap",
  "clhorde-core",
+ "serde",
  "serde_json",
  "tokio",
  "tower-http",
