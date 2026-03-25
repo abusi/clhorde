@@ -231,6 +231,7 @@ impl Orchestrator {
             self.persist_prompt(prompt);
             let info = self.to_prompt_info(prompt);
             let id = prompt.id;
+            debug!(prompt_id = id, has_pty = info.has_pty, "mark_running: broadcasting initial PromptUpdated");
             self.sessions
                 .broadcast(&DaemonEvent::WorkerStarted { prompt_id: id });
             self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
@@ -317,9 +318,16 @@ impl Orchestrator {
                 } => {
                     self.worker_inputs.insert(prompt_id, input_sender);
                     self.pty_handles.insert(prompt_id, pty_handle);
+                    debug!(prompt_id, "PTY handle stored, has_pty=true");
+                    // Re-broadcast PromptUpdated now that has_pty will be true
+                    // (mark_running broadcast happened before the handle was stored)
+                    if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
+                        let info = self.to_prompt_info(prompt);
+                        self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+                    }
                 }
                 SpawnResult::OneShot => {
-                    // No input channel for one-shot
+                    debug!(prompt_id, "one-shot worker spawned (no PTY)");
                 }
                 SpawnResult::Error(e) => {
                     self.active_workers = self.active_workers.saturating_sub(1);
