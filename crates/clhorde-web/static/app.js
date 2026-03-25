@@ -587,6 +587,74 @@ function setupEventHandlers() {
         restoreFromHash();
         render(appState);
     });
+
+    // CWD toggle
+    document.getElementById("cwd-toggle")?.addEventListener("click", () => {
+        const row = document.getElementById("cwd-row");
+        if (row) {
+            row.hidden = !row.hidden;
+            if (!row.hidden) document.getElementById("submit-cwd")?.focus();
+        }
+    });
+
+    // Prompt submission form
+    const submitForm = document.getElementById("submit-form");
+    const promptInput = document.getElementById("prompt-input");
+    const submitBtn = document.getElementById("submit-btn");
+    const submitError = document.getElementById("submit-error");
+
+    if (submitForm) {
+        submitForm.addEventListener("submit", (e) => {
+            e.preventDefault();
+            submitPrompt();
+        });
+    }
+
+    // Ctrl+Enter to submit from textarea
+    if (promptInput) {
+        promptInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault();
+                submitPrompt();
+            }
+        });
+    }
+
+    async function submitPrompt() {
+        const text = promptInput?.value?.trim();
+        if (!text) return;
+
+        const mode = document.getElementById("submit-mode")?.value || "interactive";
+        const worktree = document.getElementById("submit-worktree")?.checked || false;
+        const cwdInput = document.getElementById("submit-cwd")?.value?.trim();
+        const cwd = cwdInput || null;
+
+        // Disable button during submission
+        if (submitBtn) submitBtn.disabled = true;
+        if (submitError) submitError.textContent = "";
+
+        try {
+            const res = await fetch("/api/prompts", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text, mode, worktree, cwd }),
+            });
+
+            if (res.ok) {
+                // Clear form on success
+                if (promptInput) promptInput.value = "";
+                if (submitError) submitError.textContent = "";
+            } else {
+                const data = await res.json().catch(() => null);
+                const msg = data?.error || `Error ${res.status}`;
+                if (submitError) submitError.textContent = msg;
+            }
+        } catch (e) {
+            if (submitError) submitError.textContent = "Failed to connect";
+        } finally {
+            if (submitBtn) submitBtn.disabled = false;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
