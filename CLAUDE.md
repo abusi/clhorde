@@ -279,3 +279,33 @@ clhorde prompt-from-files a.txt,b.txt c.txt                   # Comma-separated 
 - UI rendering is stateless (pure function of `App` state) in `ui.rs`
 - IPC communication uses typed enums (`ClientRequest`, `DaemonEvent`, `PromptInfo`), not raw strings
 - Worker communication uses typed enums (`WorkerMessage`, `WorkerInput`)
+
+## Commit and PR conventions
+
+Follow the [Conventional Commits](https://www.conventionalcommits.org/) specification for all commit messages and PR titles.
+
+**Format:** `<type>(<optional scope>): <description>`
+
+**Types:**
+- `feat` — new feature
+- `fix` — bug fix
+- `docs` — documentation changes
+- `style` — formatting, no logic change
+- `refactor` — code restructuring, no feature/fix
+- `perf` — performance improvement
+- `test` — adding or fixing tests
+- `build` — build system or dependency changes
+- `ci` — CI configuration changes
+- `chore` — other maintenance tasks
+
+**Breaking changes:** append `!` after type/scope (e.g. `feat!: remove deprecated API`) or add `BREAKING CHANGE:` footer.
+
+**Scope** is optional, describes the affected area (e.g. `fix(daemon): handle socket timeout`).
+
+**Examples:**
+```
+feat(tui): add prompt history search
+fix(daemon): prevent worker leak on disconnect
+refactor(core): simplify IPC framing logic
+docs: update keybinding reference
+```
