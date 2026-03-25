@@ -3,6 +3,52 @@
 "use strict";
 
 // ---------------------------------------------------------------------------
+// Auth token management
+// ---------------------------------------------------------------------------
+
+const AUTH_TOKEN_KEY = "clhorde_auth_token";
+
+function getAuthToken() {
+    return localStorage.getItem(AUTH_TOKEN_KEY);
+}
+
+function setAuthToken(token) {
+    localStorage.setItem(AUTH_TOKEN_KEY, token);
+}
+
+function clearAuthToken() {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+}
+
+/** Build headers object with auth token if present. */
+function authHeaders(extra = {}) {
+    const headers = { ...extra };
+    const token = getAuthToken();
+    if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+    }
+    return headers;
+}
+
+/** Show the login overlay, hide on successful auth. */
+function showLogin(errorMsg) {
+    const overlay = document.getElementById("login-overlay");
+    const errorEl = document.getElementById("login-error");
+    if (overlay) overlay.hidden = false;
+    if (errorEl) errorEl.textContent = errorMsg || "";
+}
+
+function hideLogin() {
+    const overlay = document.getElementById("login-overlay");
+    if (overlay) overlay.hidden = true;
+}
+
+function updateLogoutButton() {
+    const btn = document.getElementById("logout-btn");
+    if (btn) btn.hidden = !getAuthToken();
+}
+
+// ---------------------------------------------------------------------------
 // DaemonClient — WebSocket connection with auto-reconnect
 // ---------------------------------------------------------------------------
 
@@ -31,7 +77,11 @@ class DaemonClient {
         this._setStatus("connecting");
 
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
-        const url = `${proto}//${location.host}/api/ws`;
+        let url = `${proto}//${location.host}/api/ws`;
+        const token = getAuthToken();
+        if (token) {
+            url += `?token=${encodeURIComponent(token)}`;
+        }
 
         try {
             this._ws = new WebSocket(url);
@@ -767,10 +817,19 @@ function attachTerminal(container, promptId) {
         client.send({ type: "SendBytes", prompt_id: promptId, data: Array.from(data, c => c.charCodeAt(0)) });
     });
 
-    // Handle resize
+    // Handle resize — fit terminal and notify daemon of new dimensions
     const resizeObserver = new ResizeObserver(() => {
         if (activeTerm && activeTerm._fitAddon) {
-            try { activeTerm._fitAddon.fit(); } catch (e) {}
+            try {
+                activeTerm._fitAddon.fit();
+                // Send new dimensions to the daemon so the PTY resizes to match
+                client.send({
+                    type: "ResizePty",
+                    prompt_id: promptId,
+                    cols: activeTerm.cols,
+                    rows: activeTerm.rows,
+                });
+            } catch (e) {}
         }
     });
     resizeObserver.observe(container);
@@ -1123,14 +1182,22 @@ function showToast(message, type = "error", options = {}) {
 // API fetch wrapper with timeout and error toasts (M2)
 // ---------------------------------------------------------------------------
 
-/** Fetch with 10s timeout and error toast on failure. */
+/** Fetch with 10s timeout, auth headers, and error toast on failure. */
 async function apiFetch(url, options = {}) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
 
+    // Merge auth headers
+    options.headers = authHeaders(options.headers || {});
+
     try {
         const res = await fetch(url, { ...options, signal: controller.signal });
         clearTimeout(timeout);
+
+        if (res.status === 401) {
+            showLogin("Invalid or expired token");
+            return res;
+        }
 
         if (!res.ok) {
             const data = await res.json().catch(() => null);
@@ -1175,7 +1242,7 @@ client.onEvent(msg => {
         if (!pollInterval) {
             pollInterval = setInterval(async () => {
                 try {
-                    const res = await fetch("/api/state");
+                    const res = await fetch("/api/state", { headers: authHeaders() });
                     if (res.ok) {
                         const data = await res.json();
                         appState.hydrate(data);
@@ -1231,10 +1298,11 @@ function switchView(view) {
 // ---------------------------------------------------------------------------
 
 async function loadStoreData() {
+    const hdrs = { headers: authHeaders() };
     const [listRes, countRes, pathRes] = await Promise.all([
-        fetch("/api/store").catch(() => null),
-        fetch("/api/store/count").catch(() => null),
-        fetch("/api/store/path").catch(() => null),
+        fetch("/api/store", hdrs).catch(() => null),
+        fetch("/api/store/count", hdrs).catch(() => null),
+        fetch("/api/store/path", hdrs).catch(() => null),
     ]);
 
     // Counts
@@ -1303,7 +1371,7 @@ async function storeAction(action) {
         try {
             const res = await fetch(route.url, {
                 method: "POST",
-                headers: route.body ? { "Content-Type": "application/json" } : {},
+                headers: authHeaders(route.body ? { "Content-Type": "application/json" } : {}),
                 body: route.body ? JSON.stringify(route.body) : undefined,
             });
             if (res.ok) {
@@ -1339,5 +1407,59 @@ document.querySelector(".store-actions")?.addEventListener("click", (e) => {
     const btn = e.target.closest("[data-store]");
     if (btn) storeAction(btn.dataset.store);
 });
+
+// Login form handler
+document.getElementById("login-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const tokenInput = document.getElementById("login-token");
+    const errorEl = document.getElementById("login-error");
+    const token = tokenInput?.value.trim();
+    if (!token) {
+        if (errorEl) errorEl.textContent = "Token is required";
+        return;
+    }
+    // Test the token against the health endpoint
+    try {
+        const res = await fetch("/api/health", {
+            headers: { "Authorization": `Bearer ${token}` },
+        });
+        if (res.status === 401) {
+            if (errorEl) errorEl.textContent = "Invalid token";
+            return;
+        }
+        // Token is valid — save and reconnect
+        setAuthToken(token);
+        hideLogin();
+        updateLogoutButton();
+        // Reconnect WS with new token
+        client.disconnect();
+        client.connect();
+    } catch (err) {
+        if (errorEl) errorEl.textContent = "Cannot reach server";
+    }
+});
+
+// Logout button
+document.getElementById("logout-btn")?.addEventListener("click", () => {
+    clearAuthToken();
+    updateLogoutButton();
+    client.disconnect();
+    client.connect();
+});
+
+// On initial load, check if auth is required by probing the health endpoint
+(async function checkAuth() {
+    try {
+        const res = await fetch("/api/health", { headers: authHeaders() });
+        if (res.status === 401) {
+            showLogin();
+            return;
+        }
+    } catch (e) {
+        // Server unreachable — proceed anyway, WS will handle reconnect
+    }
+    hideLogin();
+    updateLogoutButton();
+})();
 
 client.connect();

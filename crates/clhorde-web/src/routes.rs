@@ -1,12 +1,13 @@
 //! REST API route handlers.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
+use tower_http::cors::CorsLayer;
 
 use clhorde_core::protocol::{ClientRequest, DaemonEvent};
 
@@ -16,7 +17,12 @@ use crate::static_files::{self, StaticSource};
 use crate::ws;
 
 /// Build the axum router with all REST API routes and static file fallback.
-pub fn router(state: AppState, static_source: StaticSource, auth_token: Option<String>) -> Router {
+pub fn router(
+    state: AppState,
+    static_source: StaticSource,
+    auth_token: Option<String>,
+    cors_origin: Option<String>,
+) -> Router {
     let fallback_source = static_source.clone();
     let mut app = Router::new()
         .route("/api/health", get(health))
@@ -54,6 +60,31 @@ pub fn router(state: AppState, static_source: StaticSource, auth_token: Option<S
         app = app
             .layer(axum::Extension(AuthToken(token)))
             .layer(axum::middleware::from_fn(auth::auth_middleware));
+    }
+
+    // Apply CORS middleware if an origin is configured
+    if let Some(origin) = cors_origin {
+        if let Ok(origin_value) = origin.parse::<HeaderValue>() {
+            let cors = CorsLayer::new()
+                .allow_origin(origin_value)
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers([
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::AUTHORIZATION,
+                ]);
+            app = app.layer(cors);
+        } else {
+            tracing::warn!(
+                origin = %origin,
+                "invalid CORS origin — skipping CORS middleware"
+            );
+        }
     }
 
     app
