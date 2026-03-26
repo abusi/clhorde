@@ -354,7 +354,8 @@ function renderPromptList(state) {
     const emptyState = document.getElementById("empty-state");
 
     const filtered = state.prompts.filter(p => {
-        if (filterStatus !== "all" && p.status !== filterStatus) return false;
+        const st = (p.status || "").toLowerCase();
+        if (filterStatus !== "all" && st !== filterStatus) return false;
         if (filterText && !p.text.toLowerCase().includes(filterText.toLowerCase())) return false;
         return true;
     });
@@ -435,14 +436,15 @@ function updatePromptRow(row, prompt) {
     const isSelected = prompt.id === selectedPromptId;
     row.className = "prompt-row" + (isSelected ? " selected" : "");
 
-    const statusClass = "badge badge-" + (prompt.status || "idle");
+    const st = (prompt.status || "idle").toLowerCase();
+    const statusClass = "badge badge-" + st;
     const modeLabel = prompt.mode === "one-shot" ? "1S" : "IA";
     const wt = prompt.worktree ? '<span class="worktree-indicator">[WT]</span>' : "";
     const truncText = truncate(prompt.text || "(empty)", 50);
 
     row.innerHTML = `
         <span class="prompt-id">#${prompt.id}</span>
-        <span class="${statusClass}">${prompt.status || "idle"}</span>
+        <span class="${statusClass}">${st}</span>
         <span class="prompt-text" title="${escapeAttr(prompt.text || "")}">${escapeHtml(truncText)}</span>
         <span class="prompt-meta">
             <span class="mode-indicator">${modeLabel}</span>
@@ -492,20 +494,21 @@ function renderDetail(state) {
     detail.hidden = false;
 
     const isInteractive = prompt.mode === "interactive";
-    const isRunning = prompt.status === "running";
+    const st = (prompt.status || "").toLowerCase();
+    const isRunning = st === "running" || st === "idle";
     const isOneShot = prompt.mode !== "interactive";
-    const isDone = prompt.status === "completed" || prompt.status === "failed";
-    const isPending = prompt.status === "pending";
+    const isDone = st === "completed" || st === "failed";
+    const isPending = st === "pending";
 
     // --- Header ---
-    const statusClass = "badge badge-" + (prompt.status || "idle");
+    const statusClass = "badge badge-" + st;
     const modeLabel = isInteractive ? "interactive" : "one-shot";
     const wt = prompt.worktree ? ' <span class="worktree-indicator">[WT]</span>' : "";
     const elapsed = prompt.elapsed_secs ? ` <span class="mode-indicator">${formatDuration(prompt.elapsed_secs)}</span>` : "";
 
     headerEl.innerHTML = `
         <span class="prompt-id">#${prompt.id}</span>
-        <span class="${statusClass}">${prompt.status || "idle"}</span>
+        <span class="${statusClass}">${st}</span>
         <span class="mode-indicator">${modeLabel}</span>
         ${wt}${elapsed}
         <span style="flex:1"></span>
@@ -558,7 +561,7 @@ function renderOutput(el, prompt) {
     const output = prompt.output || prompt.full_text || "";
 
     if (!output) {
-        const msg = prompt.status === "running" ? "Waiting for output..." : "No output";
+        const msg = (prompt.status || "").toLowerCase() === "running" ? "Waiting for output..." : "No output";
         el.innerHTML = `<span class="empty-state">${msg}</span>`;
         return;
     }
