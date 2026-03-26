@@ -370,6 +370,10 @@ impl App {
                         let s = p.status_enum();
                         if s != PromptStatus::Running && s != PromptStatus::Idle {
                             self.mode = AppMode::ViewOutput;
+                            self.status_message = Some((
+                                "Session ended — press Esc then R to resume".to_string(),
+                                Instant::now(),
+                            ));
                         }
                     }
                 }
@@ -1142,15 +1146,6 @@ impl App {
         if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
             self.mode = AppMode::ViewOutput;
             return;
-        }
-
-        // If prompt is no longer running, exit back to view
-        if let Some(prompt) = self.selected_prompt() {
-            let s = prompt.status_enum();
-            if s != PromptStatus::Running && s != PromptStatus::Idle {
-                self.mode = AppMode::ViewOutput;
-                return;
-            }
         }
 
         // Forward all other keys to PTY as raw bytes
@@ -2544,6 +2539,10 @@ mod tests {
         app.apply_event(DaemonEvent::PromptUpdated(updated));
 
         assert_eq!(app.mode, AppMode::ViewOutput);
+        assert!(
+            app.status_message.is_some(),
+            "should show a status message when PtyInteract exits due to session end"
+        );
     }
 
     #[test]

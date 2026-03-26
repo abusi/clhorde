@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
@@ -14,6 +14,46 @@ use tokio::sync::mpsc;
 use clhorde_core::pty::PtyDimensions;
 
 use crate::worker::{WorkerInput, WorkerMessage};
+
+/// EventListener that forwards terminal query responses (PtyWrite, TextAreaSizeRequest)
+/// back to the PTY via the worker input channel.
+///
+/// This is needed because interactive applications like Claude Code may send terminal
+/// queries (e.g. ESC[6n cursor position, ESC[c device attributes) and block waiting
+/// for the terminal emulator's response. Without this, those queries are silently
+/// discarded by VoidListener, causing the application to freeze.
+pub struct PtyEventListener {
+    input_tx: mpsc::UnboundedSender<WorkerInput>,
+    cols: u16,
+    rows: u16,
+}
+
+impl PtyEventListener {
+    pub fn new(input_tx: mpsc::UnboundedSender<WorkerInput>, cols: u16, rows: u16) -> Self {
+        Self { input_tx, cols, rows }
+    }
+}
+
+impl EventListener for PtyEventListener {
+    fn send_event(&self, event: Event) {
+        match event {
+            Event::PtyWrite(text) => {
+                let _ = self.input_tx.send(WorkerInput::SendBytes(text.into_bytes()));
+            }
+            Event::TextAreaSizeRequest(formatter) => {
+                let ws = WindowSize {
+                    num_lines: self.rows,
+                    num_cols: self.cols,
+                    cell_width: 1,
+                    cell_height: 1,
+                };
+                let response = formatter(ws);
+                let _ = self.input_tx.send(WorkerInput::SendBytes(response.into_bytes()));
+            }
+            _ => {}
+        }
+    }
+}
 
 /// Fixed-size circular buffer for PTY output bytes (for late-join replay).
 pub struct PtyRingBuffer {
@@ -62,7 +102,7 @@ impl PtyRingBuffer {
 }
 
 pub struct PtyState {
-    pub term: Term<VoidListener>,
+    pub term: Term<PtyEventListener>,
     pub processor: Processor,
 }
 
@@ -126,8 +166,16 @@ pub fn spawn_pty_worker(
         cols: cols as usize,
         lines: rows as usize,
     };
+
+    // Create the input channel first so we can give a sender clone to the
+    // EventListener. Terminal query responses (PtyWrite, TextAreaSizeRequest)
+    // are sent back through this same channel, keeping the writer thread as
+    // the single path for all PTY writes.
+    let (input_tx, input_rx) = mpsc::unbounded_channel::<WorkerInput>();
+
+    let listener = PtyEventListener::new(input_tx.clone(), cols, rows);
     let config = Config::default();
-    let term = Term::new(config, &dims, VoidListener);
+    let term = Term::new(config, &dims, listener);
     let processor = Processor::new();
 
     let state = Arc::new(Mutex::new(PtyState { term, processor }));
@@ -144,6 +192,9 @@ pub fn spawn_pty_worker(
 
     // Reader thread: reads from PTY, feeds bytes to alacritty_terminal processor,
     // appends to ring buffer, and broadcasts to subscribers.
+    // When alacritty_terminal generates a terminal query response (e.g. cursor
+    // position ESC[6n → ESC[row;colR), the PtyEventListener sends it via input_tx
+    // so the writer thread writes it back to the PTY immediately.
     let reader_state = state.clone();
     let reader_ring = ring_buffer.clone();
     std::thread::spawn(move || {
@@ -154,7 +205,8 @@ pub fn spawn_pty_worker(
                 Ok(n) => {
                     let bytes = &buf[..n];
 
-                    // Feed to alacritty terminal emulator
+                    // Feed to alacritty terminal emulator; any terminal query
+                    // responses are dispatched to input_tx via PtyEventListener.
                     if let Ok(mut pty) = reader_state.lock() {
                         let PtyState {
                             ref mut term,
@@ -180,8 +232,8 @@ pub fn spawn_pty_worker(
         let _ = tx.blocking_send(WorkerMessage::PtyEof { prompt_id });
     });
 
-    // Writer thread: receives WorkerInput, writes bytes to PTY
-    let (input_tx, input_rx) = mpsc::unbounded_channel::<WorkerInput>();
+    // Writer thread: receives WorkerInput (user keystrokes and terminal query
+    // responses from PtyEventListener) and writes them to the PTY.
     std::thread::spawn(move || {
         let mut writer = writer;
         let mut input_rx = input_rx;

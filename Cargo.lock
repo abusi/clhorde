@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "clhorde-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clhorde-core",
  "crossterm 0.28.1",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "clhorde-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
  "chrono",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "clhorde-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
  "clhorde-core",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "clhorde-tui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
  "chrono",
