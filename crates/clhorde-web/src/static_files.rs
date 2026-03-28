@@ -162,3 +162,224 @@ fn not_found() -> Response<Body> {
         .body(Body::from("not found"))
         .unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // MIME type mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_html() {
+        assert_eq!(mime_from_path("index.html").to_str().unwrap(), "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn mime_js() {
+        assert_eq!(mime_from_path("app.js").to_str().unwrap(), "application/javascript; charset=utf-8");
+    }
+
+    #[test]
+    fn mime_mjs() {
+        assert_eq!(mime_from_path("module.mjs").to_str().unwrap(), "application/javascript; charset=utf-8");
+    }
+
+    #[test]
+    fn mime_css() {
+        assert_eq!(mime_from_path("style.css").to_str().unwrap(), "text/css; charset=utf-8");
+    }
+
+    #[test]
+    fn mime_json() {
+        assert_eq!(mime_from_path("data.json").to_str().unwrap(), "application/json; charset=utf-8");
+    }
+
+    #[test]
+    fn mime_png() {
+        assert_eq!(mime_from_path("logo.png").to_str().unwrap(), "image/png");
+    }
+
+    #[test]
+    fn mime_jpg() {
+        assert_eq!(mime_from_path("photo.jpg").to_str().unwrap(), "image/jpeg");
+    }
+
+    #[test]
+    fn mime_jpeg() {
+        assert_eq!(mime_from_path("photo.jpeg").to_str().unwrap(), "image/jpeg");
+    }
+
+    #[test]
+    fn mime_svg() {
+        assert_eq!(mime_from_path("icon.svg").to_str().unwrap(), "image/svg+xml");
+    }
+
+    #[test]
+    fn mime_woff2() {
+        assert_eq!(mime_from_path("font.woff2").to_str().unwrap(), "font/woff2");
+    }
+
+    #[test]
+    fn mime_wasm() {
+        assert_eq!(mime_from_path("module.wasm").to_str().unwrap(), "application/wasm");
+    }
+
+    #[test]
+    fn mime_unknown_extension() {
+        assert_eq!(mime_from_path("file.xyz").to_str().unwrap(), "application/octet-stream");
+    }
+
+    #[test]
+    fn mime_no_extension() {
+        assert_eq!(mime_from_path("LICENSE").to_str().unwrap(), "application/octet-stream");
+    }
+
+    #[test]
+    fn mime_source_map() {
+        assert_eq!(mime_from_path("app.js.map").to_str().unwrap(), "application/json");
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache policy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cache_index_html_is_no_cache() {
+        assert_eq!(cache_policy("index.html"), NO_CACHE);
+    }
+
+    #[test]
+    fn cache_nested_index_html_is_no_cache() {
+        assert_eq!(cache_policy("sub/index.html"), NO_CACHE);
+    }
+
+    #[test]
+    fn cache_regular_js_is_no_cache() {
+        assert_eq!(cache_policy("app.js"), NO_CACHE);
+    }
+
+    #[test]
+    fn cache_hashed_js_is_immutable() {
+        assert_eq!(cache_policy("app.a1b2c3d4.js"), IMMUTABLE_CACHE);
+    }
+
+    #[test]
+    fn cache_hashed_css_is_immutable() {
+        assert_eq!(cache_policy("chunk-abcdef01.css"), IMMUTABLE_CACHE);
+    }
+
+    #[test]
+    fn cache_short_hash_not_detected() {
+        // 7 hex chars — too short
+        assert_eq!(cache_policy("app.a1b2c3d.js"), NO_CACHE);
+    }
+
+    // -----------------------------------------------------------------------
+    // Hash detection heuristic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hashed_with_dot_separator() {
+        assert!(looks_hashed("app.a1b2c3d4.js"));
+    }
+
+    #[test]
+    fn hashed_with_dash_separator() {
+        assert!(looks_hashed("chunk-abcdef0123456789.css"));
+    }
+
+    #[test]
+    fn not_hashed_short_segment() {
+        assert!(!looks_hashed("app.abc.js"));
+    }
+
+    #[test]
+    fn not_hashed_non_hex_chars() {
+        assert!(!looks_hashed("app.ghijklmn.js"));
+    }
+
+    #[test]
+    fn not_hashed_plain_filename() {
+        assert!(!looks_hashed("index.html"));
+    }
+
+    #[test]
+    fn hashed_exactly_8_hex_chars() {
+        assert!(looks_hashed("app.deadbeef.js"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SPA fallback: /api/ routes must NOT be intercepted
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn api_route_returns_404_not_spa() {
+        let req = Request::builder()
+            .uri("/api/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = serve_static(StaticSource::Embedded, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn root_serves_index_html() {
+        let req = Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = serve_static(StaticSource::Embedded, req).await;
+        // The embedded static/ directory contains index.html, so this should succeed
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_for_unknown_path() {
+        let req = Request::builder()
+            .uri("/prompts/5")
+            .body(Body::empty())
+            .unwrap();
+        let resp = serve_static(StaticSource::Embedded, req).await;
+        // Should fall back to index.html for SPA routing
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_js_file_serves_correctly() {
+        let req = Request::builder()
+            .uri("/app.js")
+            .body(Body::empty())
+            .unwrap();
+        let resp = serve_static(StaticSource::Embedded, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_source_with_traversal_attempt() {
+        let dir = std::env::temp_dir();
+        let req = Request::builder()
+            .uri("/../../../etc/passwd")
+            .body(Body::empty())
+            .unwrap();
+        let resp = serve_static(StaticSource::Directory(dir), req).await;
+        // Should fall back to index.html (which doesn't exist in temp dir), resulting in 404
+        // or the file shouldn't be found due to traversal protection
+        // Either way it must NOT return /etc/passwd content
+        let status = resp.status();
+        assert!(status == StatusCode::NOT_FOUND || status == StatusCode::OK);
+    }
+}

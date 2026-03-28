@@ -286,3 +286,246 @@ async fn handle_client_message(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clhorde_core::protocol::{DaemonEvent, DaemonState};
+
+    // -----------------------------------------------------------------------
+    // server_message — DaemonEvent → JSON envelope
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn server_message_wraps_pong() {
+        let msg = server_message(&DaemonEvent::Pong).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["type"], "DaemonEvent");
+        assert_eq!(json["event"]["type"], "Pong");
+    }
+
+    #[test]
+    fn server_message_wraps_worker_started() {
+        let msg = server_message(&DaemonEvent::WorkerStarted { prompt_id: 42 }).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["type"], "DaemonEvent");
+        assert_eq!(json["event"]["type"], "WorkerStarted");
+        assert_eq!(json["event"]["prompt_id"], 42);
+    }
+
+    #[test]
+    fn server_message_wraps_worker_finished() {
+        let msg = server_message(&DaemonEvent::WorkerFinished {
+            prompt_id: 7,
+            exit_code: Some(0),
+        })
+        .unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["event"]["type"], "WorkerFinished");
+        assert_eq!(json["event"]["prompt_id"], 7);
+        assert_eq!(json["event"]["exit_code"], 0);
+    }
+
+    #[test]
+    fn server_message_wraps_worker_error() {
+        let msg = server_message(&DaemonEvent::WorkerError {
+            prompt_id: 3,
+            error: "timeout".to_string(),
+        })
+        .unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["event"]["type"], "WorkerError");
+        assert_eq!(json["event"]["error"], "timeout");
+    }
+
+    #[test]
+    fn server_message_wraps_output_chunk() {
+        let msg = server_message(&DaemonEvent::OutputChunk {
+            prompt_id: 1,
+            text: "hello world".to_string(),
+        })
+        .unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["event"]["type"], "OutputChunk");
+        assert_eq!(json["event"]["prompt_id"], 1);
+        assert_eq!(json["event"]["text"], "hello world");
+    }
+
+    #[test]
+    fn server_message_wraps_prompt_removed() {
+        let msg = server_message(&DaemonEvent::PromptRemoved { prompt_id: 5 }).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["event"]["type"], "PromptRemoved");
+        assert_eq!(json["event"]["prompt_id"], 5);
+    }
+
+    #[test]
+    fn server_message_wraps_max_workers_changed() {
+        let msg = server_message(&DaemonEvent::MaxWorkersChanged { count: 10 }).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["event"]["type"], "MaxWorkersChanged");
+        assert_eq!(json["event"]["count"], 10);
+    }
+
+    #[test]
+    fn server_message_wraps_error() {
+        let msg = server_message(&DaemonEvent::Error {
+            message: "something went wrong".to_string(),
+        })
+        .unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["event"]["type"], "Error");
+        assert_eq!(json["event"]["message"], "something went wrong");
+    }
+
+    #[test]
+    fn server_message_wraps_state_snapshot() {
+        let state = DaemonState {
+            prompts: vec![],
+            max_workers: 4,
+            active_workers: 1,
+            default_mode: "interactive".to_string(),
+            protocol_version: 1,
+        };
+        let msg = server_message(&DaemonEvent::StateSnapshot(state)).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["type"], "DaemonEvent");
+        assert_eq!(json["event"]["type"], "StateSnapshot");
+        assert_eq!(json["event"]["max_workers"], 4);
+        assert_eq!(json["event"]["active_workers"], 1);
+    }
+
+    #[test]
+    fn server_message_wraps_store_count_result() {
+        let msg = server_message(&DaemonEvent::StoreCountResult {
+            pending: 2,
+            running: 1,
+            completed: 5,
+            failed: 0,
+        })
+        .unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["event"]["type"], "StoreCountResult");
+        assert_eq!(json["event"]["pending"], 2);
+        assert_eq!(json["event"]["completed"], 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // pty_message — PTY frame → base64 JSON envelope
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pty_message_base64_encodes_data() {
+        let frame = PtyFrame {
+            prompt_id: 3,
+            data: vec![0x1b, 0x5b, 0x33, 0x31, 0x6d], // ESC[31m
+        };
+        let msg = pty_message(&frame).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["type"], "PtyBytes");
+        assert_eq!(json["prompt_id"], 3);
+
+        // Verify base64 round-trip
+        let encoded = json["data"].as_str().unwrap();
+        let decoded = BASE64_STANDARD.decode(encoded).unwrap();
+        assert_eq!(decoded, vec![0x1b, 0x5b, 0x33, 0x31, 0x6d]);
+    }
+
+    #[test]
+    fn pty_message_empty_data() {
+        let frame = PtyFrame {
+            prompt_id: 0,
+            data: vec![],
+        };
+        let msg = pty_message(&frame).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["type"], "PtyBytes");
+        let encoded = json["data"].as_str().unwrap();
+        let decoded = BASE64_STANDARD.decode(encoded).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn pty_message_large_frame() {
+        let data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+        let frame = PtyFrame {
+            prompt_id: 99,
+            data: data.clone(),
+        };
+        let msg = pty_message(&frame).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let encoded = json["data"].as_str().unwrap();
+        let decoded = BASE64_STANDARD.decode(encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    // -----------------------------------------------------------------------
+    // ClientEnvelope deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn client_envelope_parse_request() {
+        let raw = r#"{"type":"ClientRequest","request":{"type":"Ping"}}"#;
+        let env: ClientEnvelope = serde_json::from_str(raw).unwrap();
+        assert_eq!(env.msg_type, "ClientRequest");
+        assert_eq!(env.request["type"], "Ping");
+    }
+
+    #[test]
+    fn client_envelope_parse_subscribe() {
+        let raw = r#"{"type":"SubscribePty","prompt_id":5}"#;
+        let env: ClientEnvelope = serde_json::from_str(raw).unwrap();
+        assert_eq!(env.msg_type, "SubscribePty");
+        assert_eq!(env.prompt_id, Some(5));
+    }
+
+    #[test]
+    fn client_envelope_parse_unsubscribe() {
+        let raw = r#"{"type":"UnsubscribePty","prompt_id":10}"#;
+        let env: ClientEnvelope = serde_json::from_str(raw).unwrap();
+        assert_eq!(env.msg_type, "UnsubscribePty");
+        assert_eq!(env.prompt_id, Some(10));
+    }
+
+    #[test]
+    fn client_envelope_unknown_type() {
+        let raw = r#"{"type":"FooBar"}"#;
+        let env: ClientEnvelope = serde_json::from_str(raw).unwrap();
+        assert_eq!(env.msg_type, "FooBar");
+        assert_eq!(env.prompt_id, None);
+    }
+
+    #[test]
+    fn client_envelope_defaults_missing_fields() {
+        let raw = r#"{"type":"SubscribePty"}"#;
+        let env: ClientEnvelope = serde_json::from_str(raw).unwrap();
+        assert_eq!(env.prompt_id, None);
+        assert!(env.request.is_null());
+    }
+}
