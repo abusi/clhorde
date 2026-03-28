@@ -1,5 +1,7 @@
 # Phase 6: Add Structured Logging to clhorded Daemon
 
+**Status: Done** (PR #54)
+
 ## Context
 
 The `clhorded` daemon currently uses `eprintln!` for a handful of lifecycle messages (startup, shutdown, signals, IPC errors). There is no way to increase verbosity for debugging. This phase adds a `-v`/`--verbose` flag so operators can see what the daemon is doing (prompt lifecycle, worker spawns, client connections, IPC traffic, etc.).
