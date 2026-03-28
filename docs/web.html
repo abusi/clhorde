@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Web Interface — clhorde</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a href="index.html" class="nav-brand"><span>&gt;_ </span>clhorde</a>
+      <button class="hamburger" aria-label="Menu">&#9776;</button>
+      <div class="nav-links">
+        <a href="guide.html">Guide</a>
+        <a href="features.html">Features</a>
+        <a href="keybindings.html">Keys</a>
+        <a href="configuration.html">Config</a>
+        <a href="cli.html">CLI</a>
+        <a href="web.html">Web</a>
+        <a href="cheatsheet.html">Cheatsheet</a>
+        <a href="https://github.com/abusi/clhorde" class="github-link">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <h1>Web Interface</h1>
+    <p class="lead">Browser-based dashboard for clhorde &mdash; submit prompts, monitor workers, and interact with Claude sessions from any device.</p>
+
+    <ul>
+      <li><a href="#quickstart">Quick Start</a></li>
+      <li><a href="#dashboard">Dashboard</a></li>
+      <li><a href="#prompt-detail">Prompt Detail &amp; Terminal</a></li>
+      <li><a href="#rest-api">REST API Reference</a></li>
+      <li><a href="#websocket">WebSocket API</a></li>
+      <li><a href="#store">Store Management</a></li>
+      <li><a href="#auth">Authentication</a></li>
+      <li><a href="#cli-options">CLI Options</a></li>
+      <li><a href="#systemd">Systemd Service</a></li>
+    </ul>
+
+    <hr>
+
+    <section id="quickstart" class="feature-section">
+      <h2>Quick Start</h2>
+
+      <p>The web interface is provided by <code>clhorde-web</code>, a thin HTTP/WebSocket bridge that connects to the running daemon. It serves a vanilla JS single-page application with no build step required.</p>
+
+      <pre><code><span class="tok-cmt"># 1. Start the daemon (if not already running)</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">clhorded</span> &amp;
+
+<span class="tok-cmt"># 2. Start the web server</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">clhorde-web</span>
+
+<span class="tok-cmt"># 3. Open in your browser</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">open</span> http://localhost:3120</code></pre>
+
+      <p>The web dashboard connects via WebSocket and reflects the same state as the TUI and CLI clients. All three can run simultaneously.</p>
+
+      <div class="callout info">
+        <strong>Single binary.</strong> All static assets (HTML, CSS, JS, xterm.js) are embedded in the <code>clhorde-web</code> binary at compile time via <code>include_dir!</code>. No external files needed.
+      </div>
+    </section>
+
+    <section id="dashboard" class="feature-section">
+      <h2>Dashboard</h2>
+
+      <p>The main view shows a split layout: prompt list on the left, detail view on the right.</p>
+
+      <h3>Prompt List</h3>
+      <ul>
+        <li>Color-coded status badges: <span class="mode-badge" style="background:var(--accent-amber)">pending</span> <span class="mode-badge" style="background:var(--accent-cyan)">running</span> <span class="mode-badge" style="background:var(--accent-green)">completed</span> <span class="mode-badge" style="background:var(--accent-red)">failed</span></li>
+        <li>Mode indicator: <strong>IA</strong> (interactive) or <strong>1S</strong> (one-shot)</li>
+        <li>Worktree indicator: <code>[WT]</code> when worktree isolation is enabled</li>
+        <li>Sorted: running first, then pending, then completed/failed (newest first)</li>
+        <li>Click a prompt to view its detail in the right panel</li>
+      </ul>
+
+      <h3>Submit a Prompt</h3>
+      <p>The submission form at the top of the sidebar provides:</p>
+      <ul>
+        <li><strong>Text area</strong> &mdash; multi-line prompt input</li>
+        <li><strong>Mode selector</strong> &mdash; interactive or one-shot</li>
+        <li><strong>Worktree toggle</strong> &mdash; enable per-prompt git worktree isolation</li>
+        <li><strong>CWD field</strong> &mdash; optional working directory override (collapsed by default)</li>
+        <li><strong>Submit</strong> &mdash; click the button or press <kbd>Ctrl+Enter</kbd></li>
+      </ul>
+
+      <h3>Filter &amp; Search</h3>
+      <p>Use the search input and status filter chips above the prompt list to narrow down prompts. Text search is case-insensitive substring matching. Status chips and text search combine (both must match). Press <kbd>Esc</kbd> to clear.</p>
+
+      <h3>Worker Controls</h3>
+      <p>The footer shows active and max worker counts, plus the default mode. Click <strong>+</strong>/<strong>-</strong> to adjust max workers (1&ndash;20) or click the mode label to toggle between interactive and one-shot.</p>
+    </section>
+
+    <section id="prompt-detail" class="feature-section">
+      <h2>Prompt Detail &amp; Terminal</h2>
+
+      <h3>One-shot Prompts</h3>
+      <p>Selecting a one-shot prompt shows an ANSI output viewer with full color support. Live output streams in real time via WebSocket <code>OutputChunk</code> events. Auto-scroll follows new output.</p>
+      <p>Running one-shot prompts show a follow-up input bar at the bottom &mdash; type a message and press <kbd>Enter</kbd> to send.</p>
+
+      <h3>Interactive Prompts (xterm.js)</h3>
+      <p>Selecting an interactive prompt opens a full terminal emulator powered by <a href="https://xtermjs.org/">xterm.js</a> with WebGL rendering. The complete Claude Code TUI renders in the browser &mdash; colors, cursor, scrollback, and all.</p>
+      <ul>
+        <li>PTY bytes are base64-encoded and streamed over WebSocket</li>
+        <li>Keyboard input is forwarded back to the daemon PTY</li>
+        <li>Terminal resizes automatically with the browser window</li>
+        <li>Per-prompt PTY subscription avoids flooding all clients with all PTY data</li>
+      </ul>
+
+      <h3>Action Buttons</h3>
+      <p>The detail header shows context-sensitive action buttons:</p>
+      <table>
+        <thead><tr><th>Status</th><th>Available Actions</th></tr></thead>
+        <tbody>
+          <tr><td><span class="mode-badge" style="background:var(--accent-cyan)">running</span></td><td>Kill, Delete</td></tr>
+          <tr><td><span class="mode-badge" style="background:var(--accent-green)">completed</span> / <span class="mode-badge" style="background:var(--accent-red)">failed</span></td><td>Retry, Resume, Delete</td></tr>
+          <tr><td><span class="mode-badge" style="background:var(--accent-amber)">pending</span></td><td>Move Up, Move Down, Delete</td></tr>
+        </tbody>
+      </table>
+      <p>Destructive actions (Kill, Delete) require a confirmation dialog.</p>
+    </section>
+
+    <section id="rest-api" class="feature-section">
+      <h2>REST API Reference</h2>
+
+      <p>All endpoints are prefixed with <code>/api/</code> and return JSON responses with <code>Content-Type: application/json</code>.</p>
+
+      <h3>Health &amp; State</h3>
+      <table>
+        <thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET</code></td><td><code>/api/health</code></td><td>Health check &mdash; returns <code>{ "status": "ok" }</code></td></tr>
+          <tr><td><code>GET</code></td><td><code>/api/state</code></td><td>Full daemon state snapshot (prompts, workers, config)</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Prompts</h3>
+      <table>
+        <thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET</code></td><td><code>/api/prompts</code></td><td>List all prompts</td></tr>
+          <tr><td><code>GET</code></td><td><code>/api/prompts/:id</code></td><td>Get single prompt (404 if not found)</td></tr>
+          <tr><td><code>GET</code></td><td><code>/api/prompts/:id/output</code></td><td>Full output text for a prompt</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/prompts</code></td><td>Submit a new prompt</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/prompts/:id/input</code></td><td>Send follow-up input to running worker</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/prompts/:id/kill</code></td><td>Kill running worker</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/prompts/:id/retry</code></td><td>Retry completed/failed prompt</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/prompts/:id/resume</code></td><td>Resume with <code>--resume</code></td></tr>
+          <tr><td><code>DELETE</code></td><td><code>/api/prompts/:id</code></td><td>Delete a prompt (returns 204)</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/prompts/:id/move-up</code></td><td>Move pending prompt up in queue</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/prompts/:id/move-down</code></td><td>Move pending prompt down in queue</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Submit Prompt Body</h4>
+      <pre><code>{
+  <span class="tok-key">"text"</span>: <span class="tok-str">"Review the auth module"</span>,      <span class="tok-cmt">// required</span>
+  <span class="tok-key">"mode"</span>: <span class="tok-str">"interactive"</span>,                <span class="tok-cmt">// default: "interactive"</span>
+  <span class="tok-key">"worktree"</span>: <span class="tok-val">false</span>,                    <span class="tok-cmt">// default: false</span>
+  <span class="tok-key">"cwd"</span>: <span class="tok-str">"/path/to/project"</span>,             <span class="tok-cmt">// optional</span>
+  <span class="tok-key">"tags"</span>: [<span class="tok-str">"review"</span>, <span class="tok-str">"auth"</span>]            <span class="tok-cmt">// optional</span>
+}</code></pre>
+
+      <p>Valid modes: <code>"interactive"</code>, <code>"one-shot"</code>, <code>"one_shot"</code>, <code>"oneshot"</code></p>
+
+      <h4>Send Input Body</h4>
+      <pre><code>{
+  <span class="tok-key">"text"</span>: <span class="tok-str">"Continue with the refactor"</span>    <span class="tok-cmt">// required, non-empty</span>
+}</code></pre>
+
+      <h3>Configuration</h3>
+      <table>
+        <thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>PUT</code></td><td><code>/api/config/max-workers</code></td><td>Set max worker count (1&ndash;20)</td></tr>
+          <tr><td><code>PUT</code></td><td><code>/api/config/default-mode</code></td><td>Set default prompt mode</td></tr>
+          <tr><td><code>PUT</code></td><td><code>/api/prompts/:id/mode</code></td><td>Set mode for a specific prompt</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Set Max Workers Body</h4>
+      <pre><code>{ <span class="tok-key">"count"</span>: <span class="tok-val">5</span> }     <span class="tok-cmt">// range: 1&ndash;20</span></code></pre>
+
+      <h4>Set Mode Body</h4>
+      <pre><code>{ <span class="tok-key">"mode"</span>: <span class="tok-str">"one-shot"</span> }</code></pre>
+
+      <h3>Store</h3>
+      <table>
+        <thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET</code></td><td><code>/api/store</code></td><td>List persisted prompts</td></tr>
+          <tr><td><code>GET</code></td><td><code>/api/store/count</code></td><td>Counts by status</td></tr>
+          <tr><td><code>GET</code></td><td><code>/api/store/path</code></td><td>Storage directory path</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/store/drop</code></td><td>Drop prompts by filter</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/store/keep</code></td><td>Keep prompts by filter, drop the rest</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/store/clean-worktrees</code></td><td>Remove lingering git worktrees</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Store Filter Body</h4>
+      <pre><code><span class="tok-cmt">// For /api/store/drop:</span>
+{ <span class="tok-key">"filter"</span>: <span class="tok-str">"all"</span> }          <span class="tok-cmt">// "all", "completed", "failed", "pending"</span>
+
+<span class="tok-cmt">// For /api/store/keep:</span>
+{ <span class="tok-key">"filter"</span>: <span class="tok-str">"completed"</span> }    <span class="tok-cmt">// "completed", "failed", "pending" (no "all")</span></code></pre>
+
+      <h3>Error Responses</h3>
+      <p>Errors return JSON with an <code>error</code> field:</p>
+      <table>
+        <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>400</code></td><td>Invalid request body (validation error)</td></tr>
+          <tr><td><code>401</code></td><td>Authentication required (when token is configured)</td></tr>
+          <tr><td><code>404</code></td><td>Prompt not found</td></tr>
+          <tr><td><code>502</code></td><td>Daemon unavailable</td></tr>
+        </tbody>
+      </table>
+      <pre><code>{ <span class="tok-key">"error"</span>: <span class="tok-str">"prompt 99 not found"</span> }</code></pre>
+    </section>
+
+    <section id="websocket" class="feature-section">
+      <h2>WebSocket API</h2>
+
+      <p>Connect to <code>ws://localhost:3120/api/ws</code> for real-time event streaming. On connection, the server sends a <code>StateSnapshot</code> event to bootstrap the client.</p>
+
+      <h3>Server &rarr; Client</h3>
+
+      <h4>Daemon Events</h4>
+      <pre><code>{
+  <span class="tok-key">"type"</span>: <span class="tok-str">"DaemonEvent"</span>,
+  <span class="tok-key">"event"</span>: {
+    <span class="tok-key">"type"</span>: <span class="tok-str">"WorkerStarted"</span>,
+    <span class="tok-key">"prompt_id"</span>: <span class="tok-val">1</span>
+  }
+}</code></pre>
+
+      <p>Event types: <code>StateSnapshot</code>, <code>PromptAdded</code>, <code>PromptUpdated</code>, <code>PromptRemoved</code>, <code>WorkerStarted</code>, <code>WorkerFinished</code>, <code>WorkerError</code>, <code>OutputChunk</code>, <code>MaxWorkersChanged</code>, and more.</p>
+
+      <h4>PTY Bytes</h4>
+      <pre><code>{
+  <span class="tok-key">"type"</span>: <span class="tok-str">"PtyBytes"</span>,
+  <span class="tok-key">"prompt_id"</span>: <span class="tok-val">1</span>,
+  <span class="tok-key">"data"</span>: <span class="tok-str">"G1szMW0="</span>            <span class="tok-cmt">// base64-encoded raw PTY bytes</span>
+}</code></pre>
+
+      <h3>Client &rarr; Server</h3>
+
+      <h4>Client Requests</h4>
+      <pre><code>{
+  <span class="tok-key">"type"</span>: <span class="tok-str">"ClientRequest"</span>,
+  <span class="tok-key">"request"</span>: {
+    <span class="tok-key">"type"</span>: <span class="tok-str">"Ping"</span>
+  }
+}</code></pre>
+
+      <h4>PTY Subscription</h4>
+      <pre><code><span class="tok-cmt">// Subscribe to PTY bytes for a specific prompt</span>
+{ <span class="tok-key">"type"</span>: <span class="tok-str">"SubscribePty"</span>, <span class="tok-key">"prompt_id"</span>: <span class="tok-val">1</span> }
+
+<span class="tok-cmt">// Unsubscribe</span>
+{ <span class="tok-key">"type"</span>: <span class="tok-str">"UnsubscribePty"</span>, <span class="tok-key">"prompt_id"</span>: <span class="tok-val">1</span> }</code></pre>
+    </section>
+
+    <section id="store" class="feature-section">
+      <h2>Store Management</h2>
+
+      <p>Click the <strong>Store</strong> tab in the navigation to access the store management view. This mirrors the <code>clhorde-cli store</code> functionality:</p>
+
+      <ul>
+        <li><strong>Status counts</strong> &mdash; summary cards showing pending, running, completed, and failed counts</li>
+        <li><strong>Prompt list</strong> &mdash; all persisted prompts with ID, status, mode, and text</li>
+        <li><strong>Drop actions</strong> &mdash; drop all, completed, or failed prompts (with confirmation)</li>
+        <li><strong>Keep actions</strong> &mdash; keep only completed, failed, or pending prompts</li>
+        <li><strong>Clean worktrees</strong> &mdash; remove lingering git worktrees from completed prompts</li>
+        <li><strong>Storage path</strong> &mdash; shows the directory where prompt files are stored</li>
+      </ul>
+    </section>
+
+    <section id="auth" class="feature-section">
+      <h2>Authentication</h2>
+
+      <p>By default, <code>clhorde-web</code> binds to <code>127.0.0.1</code> (localhost only) and requires no authentication. When exposing on a network interface, you should configure a token:</p>
+
+      <pre><code><span class="tok-cmt"># Via CLI flag</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">clhorde-web</span> <span class="tok-flag">--host</span> 0.0.0.0 <span class="tok-flag">--auth-token</span> my-secret-token
+
+<span class="tok-cmt"># Or via environment variable</span>
+<span class="tok-prompt">$ </span><span class="tok-key">CLHORDE_WEB_AUTH_TOKEN</span>=my-secret-token <span class="tok-cmd">clhorde-web</span> <span class="tok-flag">--host</span> 0.0.0.0</code></pre>
+
+      <p>When a token is configured:</p>
+      <ul>
+        <li>All <code>/api/*</code> requests require <code>Authorization: Bearer &lt;token&gt;</code></li>
+        <li>WebSocket upgrades accept the token as <code>?token=&lt;token&gt;</code> query parameter</li>
+        <li>Static files (the web UI itself) are served without authentication</li>
+        <li>The frontend shows a login overlay that stores the token in <code>localStorage</code></li>
+        <li>Unauthenticated requests return <code>401</code> with <code>{ "error": "Authentication required" }</code></li>
+      </ul>
+
+      <div class="callout info">
+        <strong>Warning on startup.</strong> If you bind to a non-localhost address without setting a token, <code>clhorde-web</code> prints a warning: <em>"Warning: serving without authentication on a network interface"</em>.
+      </div>
+    </section>
+
+    <section id="cli-options" class="feature-section">
+      <h2>CLI Options</h2>
+
+      <pre><code><span class="tok-prompt">$ </span><span class="tok-cmd">clhorde-web</span> <span class="tok-flag">--help</span></code></pre>
+
+      <table>
+        <thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>--port</code></td><td><code>3120</code></td><td>Port to listen on</td></tr>
+          <tr><td><code>--host</code></td><td><code>127.0.0.1</code></td><td>Host address to bind to</td></tr>
+          <tr><td><code>--static-dir</code></td><td>(embedded)</td><td>Override static file directory (for development)</td></tr>
+          <tr><td><code>--daemon-socket</code></td><td>(auto)</td><td>Override path to daemon Unix socket</td></tr>
+          <tr><td><code>--auth-token</code></td><td>(none)</td><td>Require this token for API access</td></tr>
+          <tr><td><code>--cors-origin</code></td><td>(disabled)</td><td>Allow CORS requests from this origin</td></tr>
+          <tr><td><code>-v</code> / <code>-vv</code></td><td>warn</td><td>Verbosity: <code>-v</code> = info, <code>-vv</code> = debug</td></tr>
+        </tbody>
+      </table>
+
+      <p>Environment variables: <code>CLHORDE_WEB_AUTH_TOKEN</code>, <code>CLHORDE_WEB_CORS_ORIGIN</code></p>
+    </section>
+
+    <section id="systemd" class="feature-section">
+      <h2>Systemd Service</h2>
+
+      <p>Run <code>clhorde-web</code> as a systemd user service alongside the daemon:</p>
+
+      <pre><code><span class="tok-section">[Unit]</span>
+<span class="tok-key">Description</span>=clhorde web interface
+<span class="tok-key">After</span>=clhorded.service
+<span class="tok-key">Requires</span>=clhorded.service
+
+<span class="tok-section">[Service]</span>
+<span class="tok-key">ExecStart</span>=/path/to/clhorde-web
+<span class="tok-key">Restart</span>=on-failure
+<span class="tok-key">RestartSec</span>=3
+
+<span class="tok-section">[Install]</span>
+<span class="tok-key">WantedBy</span>=default.target</code></pre>
+
+      <pre><code><span class="tok-prompt">$ </span><span class="tok-cmd">systemctl</span> <span class="tok-flag">--user</span> enable clhorde-web.service
+<span class="tok-prompt">$ </span><span class="tok-cmd">systemctl</span> <span class="tok-flag">--user</span> start clhorde-web.service</code></pre>
+
+      <p>To expose on the network with authentication, override the command:</p>
+
+      <pre><code><span class="tok-section">[Service]</span>
+<span class="tok-key">ExecStart</span>=/path/to/clhorde-web --host 0.0.0.0 --auth-token %H/.config/clhorde/web-token
+<span class="tok-key">Environment</span>=CLHORDE_WEB_AUTH_TOKEN=your-token-here</code></pre>
+    </section>
+
+  </main>
+
+  <footer>
+    <span>MIT License</span>
+    <a href="https://github.com/abusi/clhorde">Source</a>
+    <a href="https://github.com/abusi/clhorde/issues">Issues</a>
+  </footer>
+
+  <script src="js/main.js"></script>
+</body>
+</html>

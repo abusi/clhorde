@@ -17,6 +17,7 @@
         <a href="keybindings.html">Keys</a>
         <a href="configuration.html">Config</a>
         <a href="cli.html">CLI</a>
+        <a href="web.html">Web</a>
         <a href="cheatsheet.html">Cheatsheet</a>
         <a href="https://github.com/abusi/clhorde" class="github-link">GitHub</a>
       </div>
@@ -40,11 +41,12 @@
 <span class="tok-prompt">$ </span><span class="tok-cmd">cd</span> clhorde
 <span class="tok-prompt">$ </span><span class="tok-cmd">cargo build</span> <span class="tok-flag">--release</span></code></pre>
 
-    <p>This builds three binaries in <code>target/release/</code>:</p>
+    <p>This builds four binaries in <code>target/release/</code>:</p>
     <ul>
       <li><code>clhorded</code> &mdash; the background daemon (manages workers and state)</li>
       <li><code>clhorde</code> &mdash; the TUI (connects to daemon)</li>
       <li><code>clhorde-cli</code> &mdash; the CLI tool (submit prompts, check status, manage store)</li>
+      <li><code>clhorde-web</code> &mdash; the web interface (HTTP/WebSocket bridge + browser dashboard)</li>
     </ul>
     <p>Copy them somewhere in your PATH for easy access.</p>
 
@@ -177,6 +179,7 @@
       <li><a href="features.html">Feature deep-dives</a> &mdash; learn about worktrees, batch operations, quick prompts, and more</li>
       <li><a href="keybindings.html">Keybinding reference</a> &mdash; complete key reference for all modes</li>
       <li><a href="configuration.html">Configuration</a> &mdash; customize keybindings, templates, and settings</li>
+      <li><a href="web.html">Web interface</a> &mdash; browser dashboard, REST API, and WebSocket reference</li>
       <li><a href="cheatsheet.html">Cheatsheet</a> &mdash; printable quick reference card</li>
     </ul>
 
