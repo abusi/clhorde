@@ -791,6 +791,20 @@ function attachTerminal(container, promptId) {
     container.innerHTML = "";
     term.open(container);
 
+    // Load WebGL renderer for GPU-accelerated rendering (falls back to DOM on failure)
+    if (typeof WebglAddon !== "undefined") {
+        try {
+            const webgl = new WebglAddon.WebglAddon();
+            webgl.onContextLoss(() => {
+                console.warn("[term] WebGL context lost, falling back to DOM renderer");
+                webgl.dispose();
+            });
+            term.loadAddon(webgl);
+        } catch (e) {
+            console.warn("[term] WebGL addon failed to load, using DOM renderer:", e);
+        }
+    }
+
     // Fit to container
     if (term._fitAddon) {
         try { term._fitAddon.fit(); } catch (e) {}
