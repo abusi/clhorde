@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use crate::pty_worker::PtyHandle;
 use clhorde_core::prompt::PromptMode;
 
+#[derive(Debug)]
 #[allow(dead_code)]
 pub enum WorkerMessage {
     OutputChunk {
@@ -169,9 +170,9 @@ fn spawn_oneshot(
 }
 
 /// Parses stream-json lines from stdout, sends OutputChunk messages.
-fn read_stream_json(
+fn read_stream_json<R: std::io::Read>(
     prompt_id: usize,
-    stdout: std::process::ChildStdout,
+    stdout: R,
     tx: &mpsc::Sender<WorkerMessage>,
 ) {
     let reader = BufReader::new(stdout);
@@ -209,6 +210,141 @@ fn read_stream_json(
                     });
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Helper: run read_stream_json on input lines and collect all WorkerMessages.
+    fn parse_lines(input: &str) -> Vec<WorkerMessage> {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cursor = Cursor::new(input.to_string().into_bytes());
+        read_stream_json(0, cursor, &tx);
+        drop(tx);
+        let mut msgs = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            msgs.push(msg);
+        }
+        msgs
+    }
+
+    #[test]
+    fn extracts_session_id_from_system_message() {
+        let input = r#"{"type":"system","session_id":"sess-abc-123"}"#;
+        let msgs = parse_lines(&format!("{input}\n"));
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            WorkerMessage::SessionId {
+                prompt_id,
+                session_id,
+            } => {
+                assert_eq!(*prompt_id, 0);
+                assert_eq!(session_id, "sess-abc-123");
+            }
+            other => panic!("expected SessionId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extracts_text_delta_from_stream_event() {
+        let input = r#"{"type":"stream_event","event":{"delta":{"text":"hello world"}}}"#;
+        let msgs = parse_lines(&format!("{input}\n"));
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            WorkerMessage::OutputChunk { prompt_id, text } => {
+                assert_eq!(*prompt_id, 0);
+                assert_eq!(text, "hello world");
+            }
+            other => panic!("expected OutputChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skips_empty_lines() {
+        let input = "\n\n\n";
+        let msgs = parse_lines(input);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn skips_malformed_json() {
+        let input = "not json at all\n{broken\n";
+        let msgs = parse_lines(input);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn skips_empty_text_delta() {
+        let input = r#"{"type":"stream_event","event":{"delta":{"text":""}}}"#;
+        let msgs = parse_lines(&format!("{input}\n"));
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn ignores_unknown_event_types() {
+        let input = r#"{"type":"unknown","data":"whatever"}"#;
+        let msgs = parse_lines(&format!("{input}\n"));
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn system_message_without_session_id_is_ignored() {
+        let input = r#"{"type":"system","version":"1.0"}"#;
+        let msgs = parse_lines(&format!("{input}\n"));
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn stream_event_without_delta_is_ignored() {
+        let input = r#"{"type":"stream_event","event":{"kind":"start"}}"#;
+        let msgs = parse_lines(&format!("{input}\n"));
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn multiple_messages_in_sequence() {
+        let lines = [
+            r#"{"type":"system","session_id":"s1"}"#,
+            r#"{"type":"stream_event","event":{"delta":{"text":"one"}}}"#,
+            r#"{"type":"stream_event","event":{"delta":{"text":"two"}}}"#,
+        ];
+        let input = lines.join("\n") + "\n";
+        let msgs = parse_lines(&input);
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(&msgs[0], WorkerMessage::SessionId { session_id, .. } if session_id == "s1"));
+        assert!(matches!(&msgs[1], WorkerMessage::OutputChunk { text, .. } if text == "one"));
+        assert!(matches!(&msgs[2], WorkerMessage::OutputChunk { text, .. } if text == "two"));
+    }
+
+    #[test]
+    fn mixed_valid_and_invalid_lines() {
+        let lines = [
+            "garbage",
+            r#"{"type":"stream_event","event":{"delta":{"text":"ok"}}}"#,
+            "{bad json",
+            r#"{"type":"system","session_id":"s2"}"#,
+        ];
+        let input = lines.join("\n") + "\n";
+        let msgs = parse_lines(&input);
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], WorkerMessage::OutputChunk { text, .. } if text == "ok"));
+        assert!(matches!(&msgs[1], WorkerMessage::SessionId { session_id, .. } if session_id == "s2"));
+    }
+
+    #[test]
+    fn uses_correct_prompt_id() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let input = r#"{"type":"stream_event","event":{"delta":{"text":"hi"}}}"#;
+        let cursor = Cursor::new(format!("{input}\n").into_bytes());
+        read_stream_json(42, cursor, &tx);
+        drop(tx);
+        match rx.try_recv().unwrap() {
+            WorkerMessage::OutputChunk { prompt_id, .. } => assert_eq!(prompt_id, 42),
+            other => panic!("expected OutputChunk, got {other:?}"),
         }
     }
 }
