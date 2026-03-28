@@ -789,3 +789,186 @@ async fn dispatch_action(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Mode validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_mode_interactive() {
+        assert!(is_valid_mode("interactive"));
+    }
+
+    #[test]
+    fn valid_mode_one_shot_hyphen() {
+        assert!(is_valid_mode("one-shot"));
+    }
+
+    #[test]
+    fn valid_mode_one_shot_underscore() {
+        assert!(is_valid_mode("one_shot"));
+    }
+
+    #[test]
+    fn valid_mode_oneshot() {
+        assert!(is_valid_mode("oneshot"));
+    }
+
+    #[test]
+    fn invalid_mode_empty() {
+        assert!(!is_valid_mode(""));
+    }
+
+    #[test]
+    fn invalid_mode_unknown() {
+        assert!(!is_valid_mode("batch"));
+    }
+
+    #[test]
+    fn invalid_mode_case_sensitive() {
+        assert!(!is_valid_mode("Interactive"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Store filter validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_store_filter_all() {
+        assert!(is_valid_store_filter("all"));
+    }
+
+    #[test]
+    fn valid_store_filter_completed() {
+        assert!(is_valid_store_filter("completed"));
+    }
+
+    #[test]
+    fn valid_store_filter_failed() {
+        assert!(is_valid_store_filter("failed"));
+    }
+
+    #[test]
+    fn valid_store_filter_pending() {
+        assert!(is_valid_store_filter("pending"));
+    }
+
+    #[test]
+    fn invalid_store_filter_unknown() {
+        assert!(!is_valid_store_filter("running"));
+    }
+
+    #[test]
+    fn invalid_store_filter_empty() {
+        assert!(!is_valid_store_filter(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Keep filter validation (no "all")
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_keep_filter_completed() {
+        assert!(is_valid_keep_filter("completed"));
+    }
+
+    #[test]
+    fn valid_keep_filter_failed() {
+        assert!(is_valid_keep_filter("failed"));
+    }
+
+    #[test]
+    fn valid_keep_filter_pending() {
+        assert!(is_valid_keep_filter("pending"));
+    }
+
+    #[test]
+    fn keep_filter_rejects_all() {
+        assert!(!is_valid_keep_filter("all"));
+    }
+
+    #[test]
+    fn keep_filter_rejects_unknown() {
+        assert!(!is_valid_keep_filter("running"));
+    }
+
+    // -----------------------------------------------------------------------
+    // daemon_error_to_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_not_found_maps_to_404() {
+        let resp = daemon_error_to_response("prompt 5 not found");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn error_no_prompt_maps_to_404() {
+        let resp = daemon_error_to_response("No prompt with id 99");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn error_other_maps_to_500() {
+        let resp = daemon_error_to_response("internal failure");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // -----------------------------------------------------------------------
+    // Request body deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn submit_body_defaults() {
+        let json = r#"{"text":"hello"}"#;
+        let body: SubmitPromptBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.text, "hello");
+        assert_eq!(body.mode, "interactive"); // default
+        assert!(!body.worktree); // default false
+        assert!(body.cwd.is_none());
+        assert!(body.tags.is_empty());
+    }
+
+    #[test]
+    fn submit_body_full() {
+        let json = r#"{"text":"review","mode":"one-shot","worktree":true,"cwd":"/tmp","tags":["fast"]}"#;
+        let body: SubmitPromptBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.text, "review");
+        assert_eq!(body.mode, "one-shot");
+        assert!(body.worktree);
+        assert_eq!(body.cwd.unwrap(), "/tmp");
+        assert_eq!(body.tags, vec!["fast"]);
+    }
+
+    #[test]
+    fn set_max_workers_body() {
+        let json = r#"{"count":5}"#;
+        let body: SetMaxWorkersBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.count, 5);
+    }
+
+    #[test]
+    fn set_mode_body() {
+        let json = r#"{"mode":"one-shot"}"#;
+        let body: SetModeBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.mode, "one-shot");
+    }
+
+    #[test]
+    fn store_filter_body() {
+        let json = r#"{"filter":"completed"}"#;
+        let body: StoreFilterBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.filter, "completed");
+    }
+
+    #[test]
+    fn send_input_body() {
+        let json = r#"{"text":"continue"}"#;
+        let body: SendInputBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.text, "continue");
+    }
+}

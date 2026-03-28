@@ -62,3 +62,172 @@ pub async fn auth_middleware(
 /// Extension type that carries the auth token into the middleware.
 #[derive(Clone)]
 pub struct AuthToken(pub String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::middleware;
+    use axum::routing::get;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    /// Build a minimal app with auth middleware for testing.
+    ///
+    /// Layer order matters: middleware must run after Extension has been inserted.
+    /// `.layer()` applies outer-first, so we add middleware first (outer), then
+    /// Extension (inner). This means Extension runs first, inserting the token,
+    /// then middleware sees it.
+    fn app_with_token(token: &str) -> Router {
+        Router::new()
+            .route("/api/health", get(|| async { "ok" }))
+            .route("/index.html", get(|| async { "page" }))
+            .layer(middleware::from_fn(auth_middleware))
+            .layer(axum::Extension(AuthToken(token.to_string())))
+    }
+
+    /// Build an app without auth (no token configured).
+    fn app_without_token() -> Router {
+        Router::new()
+            .route("/api/health", get(|| async { "ok" }))
+            .route("/index.html", get(|| async { "page" }))
+            .layer(middleware::from_fn(auth_middleware))
+    }
+
+    #[tokio::test]
+    async fn no_token_configured_allows_all() {
+        let resp = app_without_token()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn missing_token_returns_401() {
+        let resp = app_with_token("secret123")
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "Authentication required");
+    }
+
+    #[tokio::test]
+    async fn valid_bearer_token_passes() {
+        let resp = app_with_token("secret123")
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::AUTHORIZATION, "Bearer secret123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn invalid_bearer_token_returns_401() {
+        let resp = app_with_token("secret123")
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::AUTHORIZATION, "Bearer wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn query_param_token_passes() {
+        let resp = app_with_token("secret123")
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health?token=secret123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn query_param_wrong_token_returns_401() {
+        let resp = app_with_token("secret123")
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health?token=wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn static_files_bypass_auth() {
+        let resp = app_with_token("secret123")
+            .oneshot(
+                Request::builder()
+                    .uri("/index.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Non-/api/ routes should pass through without auth
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_prefix_required() {
+        // Authorization header without "Bearer " prefix should fail
+        let resp = app_with_token("secret123")
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::AUTHORIZATION, "secret123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_among_multiple_query_params() {
+        let resp = app_with_token("secret123")
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health?foo=bar&token=secret123&baz=qux")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
