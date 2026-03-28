@@ -1,0 +1,56 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits"
+  ],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["serde", "serde_json", "tokio"],
+      "groupName": "core infra (serde, tokio)",
+      "automerge": true
+    },
+    {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["ratatui", "crossterm"],
+      "groupName": "TUI stack (ratatui, crossterm)"
+    },
+    {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["alacritty_terminal", "portable-pty"],
+      "groupName": "terminal emulation",
+      "automerge": false,
+      "prPriority": 10
+    },
+    {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["axum", "tower-http", "tower"],
+      "groupName": "web stack (axum, tower)"
+    },
+    {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": [
+        "dirs", "chrono", "uuid", "toml", "clap",
+        "base64", "include_dir", "futures-util", "libc",
+        "tempfile", "http-body-util"
+      ],
+      "groupName": "utility crates",
+      "automerge": true
+    },
+    {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["tracing", "tracing-subscriber"],
+      "groupName": "tracing stack",
+      "automerge": true
+    },
+    {
+      "matchManagers": ["cargo"],
+      "automerge": false
+    }
+  ],
+  "prConcurrentLimit": 5,
+  "schedule": ["before 9am on monday"],
+  "commitMessagePrefix": "build(deps):"
+}
