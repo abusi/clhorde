@@ -1,5 +1,7 @@
 # Monorepo Split: TUI + Daemon + CLI
 
+**Status: Done**
+
 **Goal:** Split clhorde from a single binary into 3 processes (TUI, daemon, CLI) and a shared library within a Cargo workspace. This enables persistent worker management (workers survive TUI restarts), headless CLI interaction, and cleaner separation of concerns.
 
 ---

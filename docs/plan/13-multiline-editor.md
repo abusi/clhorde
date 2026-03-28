@@ -1,5 +1,7 @@
 # Multi-line prompt editor
 
+**Status: Done**
+
 **Problem:** The input bar is a single line. Complex prompts (multi-line instructions, code snippets, detailed requirements) are painful to compose in a 1-line text field.
 
 **Proposal:** Improve the prompt editing experience with two options (not mutually exclusive):

@@ -1,5 +1,7 @@
 # HTTP Server / Web Interface Plan
 
+**Status: Done**
+
 Breakdown of [web-interface-plan.md](../../web-interface-plan.md) into epics and tickets.
 
 ## Epics
