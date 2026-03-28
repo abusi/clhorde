@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: node --test crates/clhorde-web/static/tests/app.test.js
+      - run: node --test crates/clhorde-web/tests/js/app.test.js
 
   rust-tests:
     name: Rust unit tests

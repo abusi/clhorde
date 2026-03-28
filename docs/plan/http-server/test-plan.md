@@ -217,14 +217,13 @@ This plan covers the most probable user flows through the clhorde web dashboard,
 ## Test File Location
 
 ```
-crates/clhorde-web/static/tests/
-├── app.test.js          # Unit tests for app.js pure functions & state logic
-└── README.md            # How to run tests
+crates/clhorde-web/tests/js/
+└── app.test.js          # Unit tests for app.js pure functions & state logic
 ```
 
 ## Running Tests
 
 ```bash
-cd crates/clhorde-web/static
-npx vitest run           # or: node --test tests/app.test.js (Node 22+ built-in runner)
+cd crates/clhorde-web
+node --test tests/js/app.test.js
 ```

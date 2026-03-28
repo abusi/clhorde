@@ -11,7 +11,7 @@ run: build
 
 test:
 	cargo test
-	node --test crates/clhorde-web/static/tests/app.test.js
+	node --test crates/clhorde-web/tests/js/app.test.js
 
 lint:
 	cargo clippy -- -D warnings
