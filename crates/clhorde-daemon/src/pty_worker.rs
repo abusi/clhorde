@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
+use tracing::debug;
+
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
@@ -207,6 +209,8 @@ pub fn spawn_pty_worker(
         // Writer dropped here -> PTY master EOF -> child gets SIGHUP
     });
 
+    debug!(prompt_id, cols, rows, "PTY worker spawned");
+
     Ok((
         input_tx,
         PtyHandle {
@@ -251,6 +255,7 @@ pub fn extract_text_from_term(state: &SharedPtyState) -> String {
 
 /// Resize the PTY and the alacritty_terminal Term.
 pub fn resize_pty(handle: &PtyHandle, cols: u16, rows: u16) {
+    debug!(cols, rows, "PTY resized");
     let _ = handle.master.resize(PtySize {
         rows,
         cols,
