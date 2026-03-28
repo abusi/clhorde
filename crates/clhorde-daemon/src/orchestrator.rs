@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use clhorde_core::config::WorktreeCleanup;
 use clhorde_core::keymap::load_settings;
@@ -98,7 +98,11 @@ impl Orchestrator {
                 next_id += 1;
             }
 
+            if !prompts.is_empty() {
+                info!(count = prompts.len(), "restored prompts from disk");
+            }
             persistence::prune_old_prompts(dir, max_saved_prompts);
+            debug!(max = max_saved_prompts, "pruned old prompts");
         }
 
         let (worker_tx, worker_rx) = mpsc::channel(4096);
@@ -271,6 +275,7 @@ impl Orchestrator {
                     if clhorde_core::worktree::is_git_repo(repo_path) {
                         // Spawn worktree creation in a background thread to avoid
                         // blocking the async event loop (Fix #5).
+                        debug!(prompt_id, repo = %repo_path.display(), "creating worktree");
                         self.worktree_creating.insert(prompt_id);
                         let tx = self.worker_tx.clone();
                         let repo = repo_path.to_path_buf();
@@ -330,6 +335,7 @@ impl Orchestrator {
                     debug!(prompt_id, "one-shot worker spawned (no PTY)");
                 }
                 SpawnResult::Error(e) => {
+                    error!(prompt_id, error = %e, "worker spawn failed");
                     self.active_workers = self.active_workers.saturating_sub(1);
                     if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
                         prompt.status = PromptStatus::Failed;
@@ -371,6 +377,7 @@ impl Orchestrator {
                     .broadcast(&DaemonEvent::OutputChunk { prompt_id, text });
             }
             WorkerMessage::TurnComplete { prompt_id } => {
+                debug!(prompt_id, "worker turn complete");
                 let mut save = false;
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
                     if prompt.status == PromptStatus::Running {
@@ -399,6 +406,7 @@ impl Orchestrator {
                 prompt_id,
                 session_id,
             } => {
+                debug!(prompt_id, %session_id, "worker session ID received");
                 if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
                     prompt.session_id = Some(session_id.clone());
                 }
@@ -584,6 +592,7 @@ impl Orchestrator {
     ) {
         use clhorde_core::protocol::ClientRequest;
 
+        debug!(session_id, request = ?req, "handling request");
         match req {
             ClientRequest::SubmitPrompt {
                 text,
@@ -862,6 +871,7 @@ impl Orchestrator {
         if prompt.status != PromptStatus::Completed && prompt.status != PromptStatus::Failed {
             return;
         }
+        info!(prompt_id = prompt.id, "resuming prompt");
         prompt.status = PromptStatus::Pending;
         prompt.resume = true;
         prompt.output = None;
@@ -877,6 +887,7 @@ impl Orchestrator {
     // ── Delete ──
 
     fn delete_prompt(&mut self, prompt_id: usize) {
+        info!(prompt_id, "deleting prompt");
         // Kill running worker if any
         if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
             if prompt.status == PromptStatus::Running || prompt.status == PromptStatus::Idle {
@@ -961,6 +972,7 @@ impl Orchestrator {
     }
 
     fn store_keep(&mut self, filter: &str) -> usize {
+        debug!(filter, "store keep");
         let to_remove: Vec<usize> = self
             .prompts
             .iter()
@@ -986,6 +998,7 @@ impl Orchestrator {
     }
 
     fn clean_worktrees(&self) -> usize {
+        info!("cleaning worktrees");
         let mut count = 0;
         for prompt in &self.prompts {
             if prompt.status == PromptStatus::Completed || prompt.status == PromptStatus::Failed {
@@ -1032,6 +1045,7 @@ impl Orchestrator {
         let Some(wt_path) = prompt.worktree_path.take() else {
             return;
         };
+        debug!(prompt_id, path = %wt_path, "auto-cleanup worktree");
         // Persist the cleared worktree_path
         if let Some(ref dir) = self.prompts_dir {
             if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
@@ -1067,6 +1081,7 @@ impl Orchestrator {
     // ── Shutdown ──
 
     pub fn shutdown(&mut self) {
+        info!(workers = self.worker_inputs.len(), "shutting down workers");
         for (_id, sender) in self.worker_inputs.drain() {
             let _ = sender.send(WorkerInput::Kill);
         }

@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
 use tokio::sync::mpsc;
+use tracing::{debug, error};
 
 use crate::pty_worker::PtyHandle;
 use clhorde_core::prompt::PromptMode;
@@ -77,6 +78,7 @@ pub fn spawn_worker(
 ) -> SpawnResult {
     match mode {
         PromptMode::Interactive => {
+            debug!(prompt_id, "spawning PTY worker");
             let (cols, rows) = pty_size.unwrap_or((80, 24));
             match crate::pty_worker::spawn_pty_worker(
                 prompt_id,
@@ -96,6 +98,7 @@ pub fn spawn_worker(
             }
         }
         PromptMode::OneShot => {
+            debug!(prompt_id, "spawning one-shot worker");
             spawn_oneshot(prompt_id, prompt_text, cwd, tx, resume_session_id);
             SpawnResult::OneShot
         }
@@ -139,6 +142,7 @@ fn spawn_oneshot(
         {
             Ok(child) => child,
             Err(e) => {
+                error!(prompt_id, error = %e, "failed to spawn claude");
                 let _ = tx.blocking_send(WorkerMessage::SpawnError {
                     prompt_id,
                     error: format!("Failed to spawn claude: {e}"),

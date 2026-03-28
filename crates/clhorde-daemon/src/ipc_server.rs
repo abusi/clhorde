@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use clhorde_core::ipc::{self, MAX_FRAME_SIZE, PTY_FRAME_MARKER};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent};
@@ -62,6 +62,7 @@ pub async fn run_server(
         let (stream, _addr) = listener.accept().await?;
         let session_id = next_session_id;
         next_session_id += 1;
+        debug!(session_id, "client connected");
 
         let cmd_tx = cmd_tx.clone();
         let session_register_tx = session_register_tx.clone();
@@ -197,5 +198,6 @@ async fn handle_client(
         _ = read_loop => {},
     }
 
+    debug!(session_id, "client disconnected");
     let _ = session_unregister_tx.send(session_id);
 }
