@@ -1,5 +1,7 @@
 # Monorepo Split Plan Review
 
+**Status: Done**
+
 Review of `14-monorepo-split.md` — issues, missing components, and open questions.
 
 ---
