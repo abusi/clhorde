@@ -505,12 +505,15 @@ function renderDetail(state) {
     const modeLabel = isInteractive ? "interactive" : "one-shot";
     const wt = prompt.worktree ? ' <span class="worktree-indicator">[WT]</span>' : "";
     const elapsed = prompt.elapsed_secs ? ` <span class="mode-indicator">${formatDuration(prompt.elapsed_secs)}</span>` : "";
+    const sessionBadge = prompt.session_id
+        ? ` <span class="mode-indicator" title="${escapeAttr(prompt.session_id)}">session: ${escapeHtml(prompt.session_id.slice(0, 8))}…</span>`
+        : "";
 
     headerEl.innerHTML = `
         <span class="prompt-id">#${prompt.id}</span>
         <span class="${statusClass}">${st}</span>
         <span class="mode-indicator">${modeLabel}</span>
-        ${wt}${elapsed}
+        ${wt}${elapsed}${sessionBadge}
         <span style="flex:1"></span>
         <span class="prompt-text" style="white-space:normal;overflow:visible;text-overflow:unset">${escapeHtml(prompt.text || "")}</span>
     `;
