@@ -1652,4 +1652,96 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── session ID generation ──
+
+    #[tokio::test]
+    async fn dispatch_generates_session_id_for_fresh_prompt() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        assert!(orch.prompts[0].session_id.is_none());
+
+        // dispatch_workers will try to spawn (and fail since claude isn't available
+        // in tests), but the session_id should be generated before spawn.
+        orch.dispatch_workers();
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert!(
+            prompt.session_id.is_some(),
+            "session_id should be generated before spawn"
+        );
+        // Verify it looks like a UUID v4
+        let sid = prompt.session_id.as_ref().unwrap();
+        assert!(
+            uuid::Uuid::parse_str(sid).is_ok(),
+            "session_id should be a valid UUID, got: {sid}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_preserves_existing_session_id() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        orch.prompts[0].session_id = Some("pre-existing-id".into());
+
+        orch.dispatch_workers();
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(
+            prompt.session_id.as_deref(),
+            Some("pre-existing-id"),
+            "should not overwrite an existing session_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_preserves_session_id_for_dispatch() {
+        let mut orch = Orchestrator::new_for_test();
+        orch.max_workers = 0; // prevent dispatch
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+        orch.prompts[0].session_id = Some("sess-original".into());
+
+        orch.handle_request(
+            clhorde_core::protocol::ClientRequest::ResumePrompt { prompt_id: 1 },
+            0,
+        );
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(prompt.status, PromptStatus::Pending);
+        assert!(prompt.resume);
+        assert_eq!(
+            prompt.session_id.as_deref(),
+            Some("sess-original"),
+            "resume should keep the original session_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_id_from_worker_overrides_generated() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Running);
+        orch.prompts[0].session_id = Some("generated-uuid".into());
+
+        orch.apply_message(WorkerMessage::SessionId {
+            prompt_id: 1,
+            session_id: "actual-from-claude".into(),
+        });
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(
+            prompt.session_id.as_deref(),
+            Some("actual-from-claude"),
+            "session_id from worker should override the generated one"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_info_includes_session_id() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Running);
+        orch.prompts[0].session_id = Some("sess-123".into());
+
+        let info = orch.to_prompt_info(&orch.prompts[0]);
+        assert_eq!(info.session_id.as_deref(), Some("sess-123"));
+    }
 }
