@@ -30,8 +30,11 @@ pub fn cmd_status(args: &[String]) -> i32 {
                 return 0;
             }
 
-            println!("{:<4} {:<14} {:<13} PROMPT", "ID", "STATUS", "MODE");
-            println!("{}", "-".repeat(70));
+            println!(
+                "{:<4} {:<14} {:<13} {:<38} PROMPT",
+                "ID", "STATUS", "MODE", "SESSION"
+            );
+            println!("{}", "-".repeat(110));
             for info in &state.prompts {
                 let text = if info.text.len() > 40 {
                     format!("{}...", &info.text[..37])
@@ -41,9 +44,10 @@ pub fn cmd_status(args: &[String]) -> i32 {
                 let text = text.replace('\n', " ");
                 let status_display =
                     format!("{} {}", info.status_symbol(), info.status.to_lowercase());
+                let session = info.session_id.as_deref().unwrap_or("-");
                 println!(
-                    "{:<4} {:<14} {:<13} {}",
-                    info.id, status_display, info.mode, text
+                    "{:<4} {:<14} {:<13} {:<38} {}",
+                    info.id, status_display, info.mode, session, text
                 );
             }
             0

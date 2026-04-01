@@ -531,8 +531,14 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
     // Render prompt preview pane
     if let Some(preview_rect) = preview_area {
         if let Some(selected) = app.list_state.selected() {
-            let prompt_text = &app.prompts[selected].text;
-            let preview = Paragraph::new(prompt_text.as_str())
+            let prompt = &app.prompts[selected];
+            let session_line = prompt
+                .session_id
+                .as_ref()
+                .map(|sid| format!("[session: {sid}]\n"))
+                .unwrap_or_default();
+            let preview_text = format!("{session_line}{}", prompt.text);
+            let preview = Paragraph::new(preview_text)
                 .style(Style::default().fg(Color::White))
                 .block(
                     Block::default()

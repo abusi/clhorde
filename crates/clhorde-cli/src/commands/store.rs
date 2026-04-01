@@ -62,8 +62,11 @@ fn store_list() -> i32 {
                 println!("No stored prompts.");
                 return 0;
             }
-            println!("{:<38} {:<11} {:<13} PROMPT", "UUID", "STATE", "MODE");
-            println!("{}", "-".repeat(78));
+            println!(
+                "{:<38} {:<38} {:<11} {:<13} PROMPT",
+                "UUID", "SESSION", "STATE", "MODE"
+            );
+            println!("{}", "-".repeat(120));
             for info in &prompts {
                 let text = if info.text.len() > 40 {
                     format!("{}...", &info.text[..37])
@@ -71,9 +74,10 @@ fn store_list() -> i32 {
                     info.text.clone()
                 };
                 let text = text.replace('\n', " ");
+                let session = info.session_id.as_deref().unwrap_or("-");
                 println!(
-                    "{:<38} {:<11} {:<13} {}",
-                    info.uuid, info.status, info.mode, text
+                    "{:<38} {:<38} {:<11} {:<13} {}",
+                    info.uuid, session, info.status, info.mode, text
                 );
             }
             println!("\n{} prompt(s) total.", prompts.len());
