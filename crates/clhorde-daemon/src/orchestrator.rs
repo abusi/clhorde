@@ -263,6 +263,15 @@ impl Orchestrator {
                 None
             };
 
+            // Generate a session ID upfront so we can pass --session-id on
+            // initial spawn and have it available for resume immediately.
+            if self.prompts[idx].session_id.is_none() {
+                let generated = uuid::Uuid::new_v4().to_string();
+                self.prompts[idx].session_id = Some(generated);
+                self.persist_prompt_by_id(prompt_id);
+            }
+            let session_id = self.prompts[idx].session_id.clone();
+
             let cwd = if prompt_worktree {
                 if prompt_worktree_path.is_none() {
                     let effective_cwd = prompt_cwd.clone().unwrap_or_else(|| {
@@ -313,6 +322,7 @@ impl Orchestrator {
                 self.worker_tx.clone(),
                 Some((80, 24)), // Default PTY size; clients can resize
                 resume_session_id,
+                session_id,
                 self.pty_byte_tx.clone(),
             );
 

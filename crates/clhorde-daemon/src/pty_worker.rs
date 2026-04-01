@@ -86,6 +86,7 @@ pub fn spawn_pty_worker(
     rows: u16,
     tx: mpsc::Sender<WorkerMessage>,
     resume_session_id: Option<String>,
+    session_id: Option<String>,
     pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
 ) -> Result<(mpsc::UnboundedSender<WorkerInput>, PtyHandle), String> {
     let pty_system = native_pty_system();
@@ -100,15 +101,16 @@ pub fn spawn_pty_worker(
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
     let mut cmd = CommandBuilder::new("claude");
-    if let Some(ref session_id) = resume_session_id {
-        if session_id.is_empty() {
-            cmd.arg("--resume");
-        } else {
-            cmd.arg("--resume");
-            cmd.arg(session_id);
+    if let Some(ref sid) = resume_session_id {
+        cmd.arg("--resume");
+        if !sid.is_empty() {
+            cmd.args(["--session-id", sid]);
         }
     } else {
         cmd.arg(&prompt_text);
+        if let Some(ref sid) = session_id {
+            cmd.args(["--session-id", sid]);
+        }
     }
     cmd.arg("--dangerously-skip-permissions");
     cmd.env_remove("CLAUDECODE");
