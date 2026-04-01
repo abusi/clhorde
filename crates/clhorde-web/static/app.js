@@ -1133,7 +1133,13 @@ function setupEventHandlers() {
             });
 
             if (res.ok) {
-                // Clear form on success
+                // Apply the PromptAdded response immediately instead of
+                // waiting for the WebSocket broadcast (which may race).
+                const info = await res.json().catch(() => null);
+                if (info) {
+                    appState._applyEvent({ type: "PromptAdded", ...info });
+                    appState._notify();
+                }
                 if (promptInput) promptInput.value = "";
                 if (submitError) submitError.textContent = "";
             } else {
