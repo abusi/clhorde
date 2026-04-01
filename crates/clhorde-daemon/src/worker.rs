@@ -74,6 +74,7 @@ pub fn spawn_worker(
     tx: mpsc::Sender<WorkerMessage>,
     pty_size: Option<(u16, u16)>,
     resume_session_id: Option<String>,
+    session_id: Option<String>,
     pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
 ) -> SpawnResult {
     match mode {
@@ -88,6 +89,7 @@ pub fn spawn_worker(
                 rows,
                 tx,
                 resume_session_id,
+                session_id,
                 pty_byte_tx,
             ) {
                 Ok((input_sender, pty_handle)) => SpawnResult::Pty {
@@ -99,7 +101,7 @@ pub fn spawn_worker(
         }
         PromptMode::OneShot => {
             debug!(prompt_id, "spawning one-shot worker");
-            spawn_oneshot(prompt_id, prompt_text, cwd, tx, resume_session_id);
+            spawn_oneshot(prompt_id, prompt_text, cwd, tx, resume_session_id, session_id);
             SpawnResult::OneShot
         }
     }
@@ -111,6 +113,7 @@ fn spawn_oneshot(
     cwd: Option<String>,
     tx: mpsc::Sender<WorkerMessage>,
     resume_session_id: Option<String>,
+    session_id: Option<String>,
 ) {
     std::thread::spawn(move || {
         let mut cmd = Command::new("claude");
@@ -124,12 +127,13 @@ fn spawn_oneshot(
                 "--dangerously-skip-permissions",
             ])
             .env_remove("CLAUDECODE");
-        if let Some(ref session_id) = resume_session_id {
-            if session_id.is_empty() {
-                cmd.arg("--resume");
-            } else {
-                cmd.args(["--resume", session_id]);
+        if let Some(ref sid) = resume_session_id {
+            cmd.arg("--resume");
+            if !sid.is_empty() {
+                cmd.args(["--session-id", sid]);
             }
+        } else if let Some(ref sid) = session_id {
+            cmd.args(["--session-id", sid]);
         }
         if let Some(ref dir) = cwd {
             cmd.current_dir(dir);
