@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.5.0](https://github.com/abusi/clhorde/compare/clhorde-v0.4.0...clhorde-v0.5.0) (2026-04-01)
+
+
+### Features
+
+* **daemon:** generate session ID upfront and pass --session-id to claude CLI ([dee2fbb](https://github.com/abusi/clhorde/commit/dee2fbbf09b2538f2db8f67d5c5fc7e50d62c200)), closes [#58](https://github.com/abusi/clhorde/issues/58)
+* display session ID in CLI, TUI, and web interface ([25aa611](https://github.com/abusi/clhorde/commit/25aa61138675ddb8685ff95460702ac6fab90a06))
+
+
+### Bug Fixes
+
+* **web:** use REST response to update prompt list immediately ([85b9e51](https://github.com/abusi/clhorde/commit/85b9e515c110657b59463ad3b6ef522e9e7235c7)), closes [#59](https://github.com/abusi/clhorde/issues/59)
+
+
+### Documentation
+
+* move web interface plan to docs/plan/ with numbered prefix ([a404907](https://github.com/abusi/clhorde/commit/a4049077256030525c7546836f6f90d5f7a6612b))
+
+
+### Tests
+
+* **daemon:** add tests for session ID generation and resume flow ([e0f8398](https://github.com/abusi/clhorde/commit/e0f8398db6b05f45d86c1e1fcf61d61066ebe42e))
+
+
+### Continuous Integration
+
+* add Renovate configuration for automated Rust dependency updates ([4978abc](https://github.com/abusi/clhorde/commit/4978abc23f7b6df0a76a3167f10654cf9d9c9ec1))
+
+
+### Miscellaneous Chores
+
+* Add MIT License to the project ([dfc528e](https://github.com/abusi/clhorde/commit/dfc528ef2c8c97c9d218d9a24b81bba4364f0361))
+
 ## [0.4.0](https://github.com/abusi/clhorde/compare/clhorde-v0.3.0...clhorde-v0.4.0) (2026-03-28)
 
 
