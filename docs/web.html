@@ -343,6 +343,13 @@
 <span class="tok-section">[Install]</span>
 <span class="tok-key">WantedBy</span>=default.target</code></pre>
 
+      <div class="callout info">
+        <strong>Using mise?</strong> Systemd user services run with a minimal environment and won't inherit your shell's <code>PATH</code>. Wrap the binary with <code>mise exec --</code> and set <code>Environment=PATH=</code> explicitly:
+        <pre><code><span class="tok-section">[Service]</span>
+<span class="tok-key">Environment</span>=PATH=/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin
+<span class="tok-key">ExecStart</span>=/home/user/.local/bin/mise exec -- /path/to/clhorde-web</code></pre>
+      </div>
+
       <pre><code><span class="tok-prompt">$ </span><span class="tok-cmd">systemctl</span> <span class="tok-flag">--user</span> enable clhorde-web.service
 <span class="tok-prompt">$ </span><span class="tok-cmd">systemctl</span> <span class="tok-flag">--user</span> start clhorde-web.service</code></pre>
 
