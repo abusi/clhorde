@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.1](https://github.com/abusi/clhorde/compare/clhorde-v0.5.0...clhorde-v0.5.1) (2026-04-30)
+
+
+### Bug Fixes
+
+* **daemon:** restrict socket and data dir to owner-only permissions ([649f406](https://github.com/abusi/clhorde/commit/649f40644f295e026e525bd53d8a551b625339b5))
+
+
+### Continuous Integration
+
+* remove x86_64-apple-darwin from release build matrix ([205b08e](https://github.com/abusi/clhorde/commit/205b08e9e8ca462d49f74bffbfb0b94faa22c80f))
+
 ## [0.5.0](https://github.com/abusi/clhorde/compare/clhorde-v0.4.0...clhorde-v0.5.0) (2026-04-01)
 
 
