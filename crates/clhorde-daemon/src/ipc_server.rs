@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -54,6 +55,9 @@ pub async fn run_server(
     pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket_path)?;
+    // Restrict socket to owner-only so other local users cannot connect and
+    // submit prompts (which run with --dangerously-skip-permissions).
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
     info!(socket = %socket_path.display(), "IPC server listening");
 
     let mut next_session_id: usize = 1;

@@ -6,6 +6,7 @@ mod worker;
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -94,6 +95,10 @@ fn is_process_alive(pid: i32) -> bool {
 fn acquire_pid_lock(pid_path: &Path) -> Result<File, String> {
     if let Some(parent) = pid_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create dir: {e}"))?;
+        // Tighten to owner-only: the socket lives here and must not be
+        // discoverable or accessible by other local users.
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to secure data dir: {e}"))?;
     }
 
     let mut file = fs::OpenOptions::new()
