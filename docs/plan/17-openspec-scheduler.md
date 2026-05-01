@@ -6,6 +6,23 @@ Pivot clhorde from "TUI for running multiple Claude Code instances in parallel" 
 
 The pivot is additive: existing prompt-management features stay as-is. The scheduler builds **on top of** new low-level primitives (prompt dependencies, shared worktrees) that are useful even outside the OpenSpec context.
 
+## Status (2026-05-02)
+
+Tracked on branch `feat/prompt-dependencies`.
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| 0.1 Prompt dependencies | ✅ shipped | commit `ea2e405`, 10 new tests |
+| 0.2 Shared worktrees | ✅ shipped | commit `c1e7309`, 14 new tests |
+| 0.3 Auto-linking prompts ↔ changes | ⏳ next | |
+| 1   tasks.md parser + DAG | ⏳ pending | |
+| 2   Scheduler execution loop | ⏳ pending | |
+| 3   `clhorde-cli flow` wrappers | ⏳ pending | |
+| 4   TUI restructure (tabs) | ⏳ pending | |
+| 5   Advanced / web | ⏳ pending | |
+
+Workspace tests: **397 passing**, none ignored.
+
 ## Vision
 
 Two complementary modes of working with Claude:
@@ -178,30 +195,49 @@ To keep one entrypoint for users, mirror the scheduler subcommands as `clhorde-c
 
 These primitives are useful **independently of OpenSpec** and unblock everything else.
 
-### 0.1 Prompt dependencies
+### 0.1 Prompt dependencies — ✅ shipped (`ea2e405`)
 
-- New field `Prompt::depends_on: Vec<String>` (UUIDs of other prompts).
-- New `PromptStatus::Blocked` (clearer than overloading `Pending`).
-- `Orchestrator::next_pending_prompt_index` filters prompts whose deps are all `Completed`. If a dep is `Failed`, the dependent stays `Blocked` (manual decision required — no auto-cascade).
-- Cycle detection on submit: DFS over the dep graph; reject with `DaemonEvent::Error` if a cycle is found.
-- IPC additions:
-  - `ClientRequest::SubmitPrompt` gains `depends_on: Vec<String>` (UUIDs).
-  - `ClientRequest::SetDependencies { prompt_id, depends_on }` (for retro-fit).
-  - `PromptInfo` gains `depends_on: Vec<String>` and `blocked_by: Vec<String>` (computed unmet deps for UI).
-- Persistence: `PromptFile.depends_on: Vec<String>` with `#[serde(default)]` for back-compat.
+Delivered:
+- `Prompt::depends_on: Vec<String>` (UUIDs of other prompts).
+- New `PromptStatus::Blocked` 🔒 — set on submit when deps aren't all `Completed`, transitioned to `Pending` by `unblock_dependents()` when the last dep finishes.
+- `Orchestrator::next_pending_prompt_index` filters Pending only; Blocked prompts are skipped and re-evaluated after each `WorkerFinished`.
+- A dependent stays Blocked indefinitely if its dep is `Failed` — no auto-cascade.
+- Cycle detection (`would_create_cycle`, DFS) on `SetDependencies`. Submit-time cycles are impossible (the new prompt has no incoming edges yet).
+- IPC: `ClientRequest::SubmitPrompt { …, depends_on: Vec<usize> }` + new `SetDependencies { prompt_id, depends_on }`. The daemon resolves client-facing IDs to internal UUIDs and returns `DaemonEvent::Error` on unknown IDs.
+- `PromptInfo` exposes `depends_on: Vec<String>` and `blocked_by: Vec<String>` (computed unmet deps).
+- Persistence: `PromptFile.depends_on` with `#[serde(default)]`. Back-compat test in place.
+- Deletion purges the deleted UUID from any other prompt's `depends_on` and re-evaluates blocked dependents.
+
+Plumbing:
+- `clhorde-cli submit "..." --depends-on 1,2,3` (alias `--after`).
+- `clhorde-web POST /api/prompts { "depends_on": [1, 2] }`.
+- TUI sends an empty `depends_on` for now; UI surface deferred to Phase 4.
 
 **Decision: ID resolution at the boundary.** Clients submit prompts referencing IDs (`usize`) for ergonomics; the daemon resolves them to UUIDs at submit time before persisting. Internally everything is UUIDs.
 
-### 0.2 Shared worktrees
+### 0.2 Shared worktrees — ✅ shipped (`c1e7309`)
 
-Today, `dispatch_workers` creates one worktree per prompt that has `worktree=true`. For workflows, all prompts of one workflow must share the same worktree (otherwise section 2 doesn't see what section 1 produced).
+Delivered:
+- `Prompt::worktree_id: Option<String>`, persisted in `PromptOptions` with serde defaults.
+- `clhorde-core::worktree` exposes `create_worktree_named(repo, suffix)` with a sanitized suffix (`[A-Za-z0-9._-]`, runs collapsed, empty falls back to `wt`); `create_worktree(prompt_id)` is a thin wrapper to keep legacy per-prompt naming intact.
+- `dispatch_workers`, when `worktree=true && worktree_id = Some(id)`:
+  1. reuses a sibling's `worktree_path` if already resolved (and broadcasts the propagation),
+  2. skips dispatch (`continue`) if `worktree_id_creation_in_flight(id)` — retried on next `WorktreeCreated`,
+  3. otherwise spawns creation with `<repo>-wt-<sanitized_id>`.
+- `WorktreeCreated` propagates the resolved path to all sibling prompts of the same `worktree_id`. On error, every pending sibling without a path is marked `Failed`; siblings that already had a path keep theirs.
+- Refcounted cleanup:
+  - `maybe_cleanup_worktree` (auto) checks `shared_worktree_active_count(id)` and skips removal while any sibling is in `Pending/Blocked/Running/Idle`.
+  - `clean_worktrees` (manual) deduplicates by `worktree_id` and respects the same refcount.
+  - When the last sibling reaches a terminal state, the path is cleared from all siblings and the git worktree is removed in a background thread.
+- `RetryPrompt` preserves `worktree_id` so the retry rejoins the same shared worktree.
+- IPC: `ClientRequest::SubmitPrompt` and `PromptInfo` carry `worktree_id: Option<String>`.
 
-- New field `Prompt::worktree_id: Option<String>`. If set, the daemon reuses (or creates and shares) a worktree keyed by this id.
-- Worktree creation policy when multiple prompts share an id: the first dispatched prompt creates it; subsequent prompts wait until the worktree exists (re-using existing `worktree_creating` blocking semantics) and inherit the path.
-- Cleanup: a shared worktree is removed only when all referencing prompts are `Completed` or `Failed` (refcount-style).
-- IPC: `ClientRequest::SubmitPrompt` gains `worktree_id: Option<String>`.
+Plumbing:
+- `clhorde-cli submit "..." --worktree --worktree-id <id>`.
+- `clhorde-web POST /api/prompts { "worktree": true, "worktree_id": "flow-42" }`.
+- TUI passes `None` for now (the scheduler will be the primary producer of shared ids).
 
-### 0.3 Auto-linking prompts ↔ OpenSpec changes
+### 0.3 Auto-linking prompts ↔ OpenSpec changes — ⏳ next
 
 Detect which `openspec/changes/<X>/` a prompt produced or modified, with no user action.
 
@@ -397,14 +433,16 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 
 ## Phased delivery
 
-| Phase | Scope | Why now |
-|-------|-------|---------|
-| **0** | Prompt deps + shared worktrees + `Blocked` status + `affected_changes` | Foundational. Useful even without the scheduler. |
-| **1** | `clhorde-scheduler` crate skeleton + tasks.md parser + DAG builder + unit tests | Core algorithm; testable in isolation without IPC. |
-| **2** | Templates + execution loop + watcher + persistence | Minimum viable scheduler — runs on the CLI. |
-| **3** | `clhorde-cli flow` wrappers + `propose`/`queue`/`status`/`apply`/`archive` | Usable by humans end-to-end. |
-| **4** | TUI tabs (`Drafts`, `Workflows`) + scheduler control socket | First-class UX. |
-| **5** | Web routes + advanced (parallel safety, hooks, multi-repo) | Polish. |
+| Phase | Status | Scope | Why now |
+|-------|--------|-------|---------|
+| **0.1** | ✅ `ea2e405` | Prompt dependencies + `Blocked` status | Foundational. Useful even without the scheduler. |
+| **0.2** | ✅ `c1e7309` | Shared worktrees via `worktree_id` + refcounted cleanup | Required for sequential workflow steps to share branch state. |
+| **0.3** | ⏳ next | `affected_changes` auto-link to `openspec/changes/<X>/` | Lets the TUI suggest "queue this change" and the scheduler detect drafts. |
+| **1**   | ⏳ pending | `clhorde-scheduler` crate skeleton + tasks.md parser + DAG builder | Core algorithm; testable in isolation without IPC. |
+| **2**   | ⏳ pending | Templates + execution loop + watcher + persistence | Minimum viable scheduler — runs on the CLI. |
+| **3**   | ⏳ pending | `clhorde-cli flow` wrappers + `propose`/`queue`/`status`/`apply`/`archive` | Usable by humans end-to-end. |
+| **4**   | ⏳ pending | TUI tabs (`Drafts`, `Workflows`) + scheduler control socket | First-class UX. |
+| **5**   | ⏳ pending | Web routes + advanced (parallel safety, hooks, multi-repo) | Polish. |
 
 Each phase is independently shippable. Phase 0 alone is already a feature win; Phase 2 already produces value for users who want a scriptable workflow runner.
 
