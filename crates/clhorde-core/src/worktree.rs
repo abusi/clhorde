@@ -82,12 +82,41 @@ pub fn worktree_exists(repo_root: &Path, worktree_path: &Path) -> bool {
     false
 }
 
-/// Create a detached worktree: git worktree add --detach <path> HEAD
-/// Returns the worktree path on success. If the worktree already exists
-/// (e.g. when resuming a prompt), it is reused.
+/// Sanitize an arbitrary string into a safe worktree directory name suffix.
+/// Keeps `[A-Za-z0-9._-]`, replaces everything else with `-`, collapses runs.
+fn sanitize_worktree_suffix(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+            out.push(c);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "wt".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Create a detached worktree named after a prompt id:
+/// `git worktree add --detach <repo>-wt-<prompt_id> HEAD`.
 pub fn create_worktree(repo_root: &Path, prompt_id: usize) -> Result<PathBuf, String> {
+    create_worktree_named(repo_root, &prompt_id.to_string())
+}
+
+/// Create a detached worktree with a caller-supplied suffix.
+/// Directory layout: `<parent>/<repo>-wt-<sanitized_suffix>`.
+/// If the worktree already exists (registered with git), it is reused.
+pub fn create_worktree_named(repo_root: &Path, suffix: &str) -> Result<PathBuf, String> {
     let name = repo_name(repo_root);
-    let wt_dir = format!("{name}-wt-{prompt_id}");
+    let safe_suffix = sanitize_worktree_suffix(suffix);
+    let wt_dir = format!("{name}-wt-{safe_suffix}");
     let parent = repo_root
         .parent()
         .ok_or_else(|| "Cannot determine parent directory of repo root".to_string())?;
@@ -258,5 +287,49 @@ mod tests {
         let (_tmp, repo) = make_temp_repo();
         let missing = repo.parent().unwrap().join("does-not-exist");
         assert!(!worktree_exists(&repo, &missing));
+    }
+
+    #[test]
+    fn sanitize_worktree_suffix_passthrough() {
+        assert_eq!(sanitize_worktree_suffix("abc-123"), "abc-123");
+        assert_eq!(sanitize_worktree_suffix("Foo.Bar_42"), "Foo.Bar_42");
+    }
+
+    #[test]
+    fn sanitize_worktree_suffix_replaces_unsafe() {
+        assert_eq!(sanitize_worktree_suffix("a/b\\c"), "a-b-c");
+        assert_eq!(sanitize_worktree_suffix("hello world!"), "hello-world");
+    }
+
+    #[test]
+    fn sanitize_worktree_suffix_collapses_runs() {
+        assert_eq!(sanitize_worktree_suffix("a   b"), "a-b");
+        assert_eq!(sanitize_worktree_suffix("//a//"), "a");
+    }
+
+    #[test]
+    fn sanitize_worktree_suffix_empty_falls_back() {
+        assert_eq!(sanitize_worktree_suffix(""), "wt");
+        assert_eq!(sanitize_worktree_suffix("///"), "wt");
+    }
+
+    #[test]
+    fn create_worktree_named_uses_suffix() {
+        let (_tmp, repo) = make_temp_repo();
+        let wt = create_worktree_named(&repo, "my-shared-id").expect("create");
+        assert!(wt.is_dir());
+        let name = wt.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.ends_with("-wt-my-shared-id"),
+            "unexpected dir name: {name}"
+        );
+    }
+
+    #[test]
+    fn create_worktree_named_idempotent() {
+        let (_tmp, repo) = make_temp_repo();
+        let wt = create_worktree_named(&repo, "shared").expect("first");
+        let wt2 = create_worktree_named(&repo, "shared").expect("second reuses");
+        assert_eq!(wt, wt2);
     }
 }

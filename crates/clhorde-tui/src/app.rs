@@ -218,6 +218,7 @@ impl App {
             worktree,
             tags,
             depends_on: Vec::new(),
+            worktree_id: None,
         });
         // Selection will be updated when PromptAdded event arrives
     }
@@ -1875,6 +1876,7 @@ mod tests {
             has_pty: false,
             depends_on: Vec::new(),
             blocked_by: Vec::new(),
+            worktree_id: None,
         }
     }
 

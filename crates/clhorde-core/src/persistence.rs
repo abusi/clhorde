@@ -24,6 +24,8 @@ pub struct PromptOptions {
     pub context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
 }
 
 pub fn default_prompts_dir() -> Option<PathBuf> {
@@ -122,6 +124,7 @@ impl PromptFile {
                 mode: mode.to_string(),
                 context: prompt.cwd.clone(),
                 worktree: if prompt.worktree { Some(true) } else { None },
+                worktree_id: prompt.worktree_id.clone(),
             },
             state: state.to_string(),
             queue_rank: prompt.queue_rank,
@@ -156,6 +159,7 @@ mod tests {
                 mode: "interactive".to_string(),
                 context: Some("/tmp".to_string()),
                 worktree: None,
+                worktree_id: None,
             },
             state: "completed".to_string(),
             queue_rank: 1.0,
@@ -206,6 +210,7 @@ mod tests {
                     mode: "interactive".to_string(),
                     context: None,
                     worktree: None,
+                    worktree_id: None,
                 },
                 state: "completed".to_string(),
                 queue_rank: rank,
@@ -264,6 +269,7 @@ mod tests {
                     mode: "interactive".to_string(),
                     context: None,
                     worktree: None,
+                    worktree_id: None,
                 },
                 state: "completed".to_string(),
                 queue_rank: i as f64,
@@ -301,6 +307,7 @@ mod tests {
                 mode: "interactive".to_string(),
                 context: None,
                 worktree: None,
+                worktree_id: None,
             },
             state: "completed".to_string(),
             queue_rank: 1.0,
@@ -328,6 +335,7 @@ mod tests {
                 mode: "one_shot".to_string(), // legacy format
                 context: None,
                 worktree: None,
+                worktree_id: None,
             },
             state: "completed".to_string(),
             queue_rank: 1.0,
@@ -394,6 +402,7 @@ mod tests {
                 mode: "interactive".to_string(),
                 context: None,
                 worktree: None,
+                worktree_id: None,
             },
             state: "pending".to_string(),
             queue_rank: 1.0,
@@ -420,6 +429,7 @@ mod tests {
                 mode: "interactive".to_string(),
                 context: None,
                 worktree: None,
+                worktree_id: None,
             },
             state: "completed".to_string(),
             queue_rank: 1.0,

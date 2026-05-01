@@ -8,6 +8,7 @@ pub fn cmd_submit(args: &[String]) -> i32 {
     let mut cwd: Option<String> = None;
     let mut worktree = false;
     let mut depends_on: Vec<usize> = Vec::new();
+    let mut worktree_id: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -37,6 +38,14 @@ pub fn cmd_submit(args: &[String]) -> i32 {
             }
             "--worktree" => {
                 worktree = true;
+            }
+            "--worktree-id" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("--worktree-id requires a value");
+                    return 1;
+                }
+                worktree_id = Some(args[i].clone());
             }
             "--depends-on" | "--after" => {
                 i += 1;
@@ -74,7 +83,7 @@ pub fn cmd_submit(args: &[String]) -> i32 {
         Some(t) => t,
         None => {
             eprintln!(
-                "Usage: clhorde-cli submit \"prompt text\" [--mode interactive|one-shot] [--cwd path] [--worktree] [--depends-on 1,2,3]"
+                "Usage: clhorde-cli submit \"prompt text\" [--mode interactive|one-shot] [--cwd path] [--worktree] [--worktree-id <id>] [--depends-on 1,2,3]"
             );
             return 1;
         }
@@ -99,6 +108,7 @@ pub fn cmd_submit(args: &[String]) -> i32 {
                 worktree,
                 tags: vec![],
                 depends_on,
+                worktree_id,
             },
         ];
 

@@ -86,6 +86,11 @@ pub struct Prompt {
     pub worktree: bool,
     /// Path to the created worktree directory (for cleanup).
     pub worktree_path: Option<String>,
+    /// Optional shared worktree key. When two prompts share the same
+    /// `worktree_id`, the daemon creates the worktree once and reuses its
+    /// path for all of them (used by the scheduler to keep a workflow's
+    /// prompts coherent on the same branch).
+    pub worktree_id: Option<String>,
     /// User-defined tags for grouping/filtering (e.g. `@frontend`).
     pub tags: Vec<String>,
     /// UUIDs of prompts that must be Completed before this one can dispatch.
@@ -111,6 +116,7 @@ impl Prompt {
             resume: false,
             worktree: false,
             worktree_path: None,
+            worktree_id: None,
             tags: Vec::new(),
             depends_on: Vec::new(),
         }

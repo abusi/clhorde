@@ -19,6 +19,10 @@ pub enum ClientRequest {
         /// The daemon resolves these to UUIDs at submit time.
         #[serde(default)]
         depends_on: Vec<usize>,
+        /// Optional shared worktree key. Multiple prompts with the same
+        /// `worktree_id` and `worktree: true` reuse a single worktree.
+        #[serde(default)]
+        worktree_id: Option<String>,
     },
     SendInput {
         prompt_id: usize,
@@ -188,6 +192,9 @@ pub struct PromptInfo {
     /// Empty means the prompt is dispatchable.
     #[serde(default)]
     pub blocked_by: Vec<String>,
+    /// Shared worktree key, if any.
+    #[serde(default)]
+    pub worktree_id: Option<String>,
 }
 
 impl PromptInfo {

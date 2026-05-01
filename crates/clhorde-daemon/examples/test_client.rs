@@ -70,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             worktree: false,
             tags: vec!["test".to_string()],
             depends_on: Vec::new(),
+            worktree_id: None,
         },
     )
     .await?;
