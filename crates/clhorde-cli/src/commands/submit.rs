@@ -7,6 +7,7 @@ pub fn cmd_submit(args: &[String]) -> i32 {
     let mut mode = "interactive".to_string();
     let mut cwd: Option<String> = None;
     let mut worktree = false;
+    let mut depends_on: Vec<usize> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -37,6 +38,26 @@ pub fn cmd_submit(args: &[String]) -> i32 {
             "--worktree" => {
                 worktree = true;
             }
+            "--depends-on" | "--after" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("--depends-on requires a comma-separated list of prompt IDs");
+                    return 1;
+                }
+                for tok in args[i].split(',') {
+                    let tok = tok.trim();
+                    if tok.is_empty() {
+                        continue;
+                    }
+                    match tok.parse::<usize>() {
+                        Ok(id) => depends_on.push(id),
+                        Err(_) => {
+                            eprintln!("Invalid prompt ID in --depends-on: {tok}");
+                            return 1;
+                        }
+                    }
+                }
+            }
             _ => {
                 if text.is_none() && !args[i].starts_with('-') {
                     text = Some(args[i].clone());
@@ -53,7 +74,7 @@ pub fn cmd_submit(args: &[String]) -> i32 {
         Some(t) => t,
         None => {
             eprintln!(
-                "Usage: clhorde-cli submit \"prompt text\" [--mode interactive|one-shot] [--cwd path] [--worktree]"
+                "Usage: clhorde-cli submit \"prompt text\" [--mode interactive|one-shot] [--cwd path] [--worktree] [--depends-on 1,2,3]"
             );
             return 1;
         }
@@ -77,6 +98,7 @@ pub fn cmd_submit(args: &[String]) -> i32 {
                 mode,
                 worktree,
                 tags: vec![],
+                depends_on,
             },
         ];
 

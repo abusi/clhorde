@@ -88,6 +88,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let status = prompt.status_enum();
         let (status_char, status_color) = match status {
             PromptStatus::Pending => ("·", Color::DarkGray),
+            PromptStatus::Blocked => ("⊘", Color::DarkGray),
             PromptStatus::Running => ("▶", Color::Cyan),
             PromptStatus::Idle => ("◆", Color::Magenta),
             PromptStatus::Completed => ("✓", Color::Green),
@@ -326,6 +327,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
 
             let status_style = match status {
                 PromptStatus::Pending => Style::default().fg(Color::Yellow),
+                PromptStatus::Blocked => Style::default().fg(Color::DarkGray),
                 PromptStatus::Running => Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -787,6 +789,13 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
             let title = format!(" Output: #{} [{}]{wt_tag} ", prompt.id, cwd_str);
             let content = match status {
                 PromptStatus::Pending => "(pending)".to_string(),
+                PromptStatus::Blocked => {
+                    if prompt.blocked_by.is_empty() {
+                        "(blocked)".to_string()
+                    } else {
+                        format!("(blocked — waiting on {} dependency(ies))", prompt.blocked_by.len())
+                    }
+                }
                 PromptStatus::Running => {
                     let elapsed = prompt.elapsed_display().unwrap_or_else(|| "0.0s".into());
                     match &prompt.output {
@@ -875,6 +884,7 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
             PromptStatus::Completed => Color::Green,
             PromptStatus::Failed => Color::Red,
             PromptStatus::Pending => Color::Yellow,
+            PromptStatus::Blocked => Color::DarkGray,
         }
     } else {
         Color::Rgb(80, 80, 100)

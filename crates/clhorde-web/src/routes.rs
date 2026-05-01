@@ -106,6 +106,8 @@ struct SubmitPromptBody {
     cwd: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    depends_on: Vec<usize>,
 }
 
 fn default_mode() -> String {
@@ -326,6 +328,7 @@ async fn submit_prompt(
         mode: body.mode,
         worktree: body.worktree,
         tags: body.tags,
+        depends_on: body.depends_on,
     };
 
     match state.bridge.send_request(request).await {

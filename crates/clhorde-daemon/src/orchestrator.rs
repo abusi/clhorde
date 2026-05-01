@@ -92,6 +92,7 @@ impl Orchestrator {
                 prompt.worktree = pf.options.worktree.unwrap_or(false);
                 prompt.worktree_path = pf.worktree_path.clone();
                 prompt.tags = pf.tags.clone();
+                prompt.depends_on = pf.depends_on.clone();
                 prompt.status = status;
                 prompt.seen = true;
                 prompts.push(prompt);
@@ -155,6 +156,17 @@ impl Orchestrator {
     // ── Convert to wire types ──
 
     pub fn to_prompt_info(&self, prompt: &Prompt) -> PromptInfo {
+        let blocked_by: Vec<String> = prompt
+            .depends_on
+            .iter()
+            .filter(|dep_uuid| {
+                !self
+                    .prompts
+                    .iter()
+                    .any(|p| &p.uuid == *dep_uuid && p.status == PromptStatus::Completed)
+            })
+            .cloned()
+            .collect();
         PromptInfo {
             id: prompt.id,
             text: prompt.text.clone(),
@@ -174,6 +186,8 @@ impl Orchestrator {
             elapsed_secs: prompt.elapsed_secs(),
             uuid: prompt.uuid.clone(),
             has_pty: self.pty_handles.contains_key(&prompt.id),
+            depends_on: prompt.depends_on.clone(),
+            blocked_by,
         }
     }
 
@@ -193,6 +207,82 @@ impl Orchestrator {
 
     // ── Prompt lifecycle ──
 
+    /// Resolve client-facing prompt IDs to internal UUIDs.
+    /// Returns an error listing any IDs that don't exist.
+    fn resolve_dep_ids(&self, ids: &[usize]) -> Result<Vec<String>, String> {
+        let mut uuids = Vec::with_capacity(ids.len());
+        let mut missing = Vec::new();
+        for &id in ids {
+            match self.prompts.iter().find(|p| p.id == id) {
+                Some(p) => uuids.push(p.uuid.clone()),
+                None => missing.push(id),
+            }
+        }
+        if !missing.is_empty() {
+            return Err(format!("Unknown prompt IDs in depends_on: {missing:?}"));
+        }
+        Ok(uuids)
+    }
+
+    /// Detect whether assigning `new_deps` (UUIDs) to the prompt with `target_uuid`
+    /// would introduce a cycle in the dependency graph.
+    fn would_create_cycle(&self, target_uuid: &str, new_deps: &[String]) -> bool {
+        // DFS from each dep; if we can reach `target_uuid`, there is a cycle.
+        for start in new_deps {
+            if start == target_uuid {
+                return true;
+            }
+            let mut stack = vec![start.clone()];
+            let mut seen: HashSet<String> = HashSet::new();
+            while let Some(node) = stack.pop() {
+                if !seen.insert(node.clone()) {
+                    continue;
+                }
+                if let Some(p) = self.prompts.iter().find(|p| p.uuid == node) {
+                    for d in &p.depends_on {
+                        if d == target_uuid {
+                            return true;
+                        }
+                        stack.push(d.clone());
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether all of `prompt.depends_on` reference Completed prompts.
+    fn all_deps_completed(&self, prompt: &Prompt) -> bool {
+        prompt.depends_on.iter().all(|dep_uuid| {
+            self.prompts
+                .iter()
+                .any(|p| &p.uuid == dep_uuid && p.status == PromptStatus::Completed)
+        })
+    }
+
+    /// After a prompt completes, re-evaluate Blocked prompts and unblock any
+    /// whose deps are now all Completed. Returns the set of prompt IDs that
+    /// transitioned to Pending.
+    fn unblock_dependents(&mut self) -> Vec<usize> {
+        let to_unblock: Vec<usize> = self
+            .prompts
+            .iter()
+            .filter(|p| p.status == PromptStatus::Blocked && self.all_deps_completed(p))
+            .map(|p| p.id)
+            .collect();
+        for id in &to_unblock {
+            if let Some(p) = self.prompts.iter_mut().find(|p| p.id == *id) {
+                p.status = PromptStatus::Pending;
+            }
+            self.persist_prompt_by_id(*id);
+            if let Some(p) = self.prompts.iter().find(|p| p.id == *id) {
+                let info = self.to_prompt_info(p);
+                self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+            }
+        }
+        to_unblock
+    }
+
     pub fn add_prompt(
         &mut self,
         text: String,
@@ -200,10 +290,17 @@ impl Orchestrator {
         mode: PromptMode,
         worktree: bool,
         tags: Vec<String>,
+        depends_on: Vec<String>,
     ) {
         let mut prompt = Prompt::new(self.next_id, text, cwd, mode);
         prompt.worktree = worktree;
         prompt.tags = tags;
+        prompt.depends_on = depends_on;
+        // A fresh prompt has no incoming edges, so cycles are impossible here.
+        // The status starts Blocked if any dep is not yet Completed.
+        if !prompt.depends_on.is_empty() && !self.all_deps_completed(&prompt) {
+            prompt.status = PromptStatus::Blocked;
+        }
         let max_rank = self
             .prompts
             .iter()
@@ -214,7 +311,13 @@ impl Orchestrator {
         self.persist_prompt(&prompt);
         self.maybe_prune();
 
-        info!(prompt_id = prompt.id, mode = %prompt.mode.label(), "prompt added");
+        info!(
+            prompt_id = prompt.id,
+            mode = %prompt.mode.label(),
+            deps = prompt.depends_on.len(),
+            status = ?prompt.status,
+            "prompt added"
+        );
         let info_msg = self.to_prompt_info(&prompt);
         self.prompts.push(prompt);
         self.sessions.broadcast(&DaemonEvent::PromptAdded(info_msg));
@@ -535,6 +638,11 @@ impl Orchestrator {
                     let info = self.to_prompt_info(prompt);
                     self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
                 }
+                // If this prompt completed, see if any Blocked dependents are now free.
+                let unblocked = self.unblock_dependents();
+                if !unblocked.is_empty() {
+                    debug!(?unblocked, "unblocked dependents after Finished");
+                }
                 self.sessions.broadcast(&DaemonEvent::ActiveWorkersChanged {
                     count: self.active_workers,
                 });
@@ -610,10 +718,19 @@ impl Orchestrator {
                 mode,
                 worktree,
                 tags,
+                depends_on,
             } => {
                 let prompt_mode = PromptMode::from_mode_str(&mode);
-                self.add_prompt(text, cwd, prompt_mode, worktree, tags);
-                self.dispatch_workers();
+                match self.resolve_dep_ids(&depends_on) {
+                    Ok(dep_uuids) => {
+                        self.add_prompt(text, cwd, prompt_mode, worktree, tags, dep_uuids);
+                        self.dispatch_workers();
+                    }
+                    Err(message) => {
+                        self.sessions
+                            .send_to(session_id, DaemonEvent::Error { message });
+                    }
+                }
             }
             ClientRequest::SendInput { prompt_id, text } => {
                 // Only echo and send if a worker input channel exists (interactive workers).
@@ -671,7 +788,9 @@ impl Orchestrator {
                         }
                     });
                 if let Some((text, cwd, mode, wt, tags)) = retry_data {
-                    self.add_prompt(text, cwd, mode, wt, tags);
+                    // Retry creates a fresh prompt with no inherited deps —
+                    // by design, the user re-links manually if desired.
+                    self.add_prompt(text, cwd, mode, wt, tags, Vec::new());
                     self.dispatch_workers();
                 }
             }
@@ -714,6 +833,66 @@ impl Orchestrator {
                         self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
                     }
                 }
+            }
+            ClientRequest::SetDependencies {
+                prompt_id,
+                depends_on,
+            } => {
+                let Some(idx) = self.prompts.iter().position(|p| p.id == prompt_id) else {
+                    self.sessions.send_to(
+                        session_id,
+                        DaemonEvent::Error {
+                            message: format!("Unknown prompt {prompt_id}"),
+                        },
+                    );
+                    return;
+                };
+                let current_status = self.prompts[idx].status.clone();
+                if !matches!(
+                    current_status,
+                    PromptStatus::Pending | PromptStatus::Blocked
+                ) {
+                    self.sessions.send_to(
+                        session_id,
+                        DaemonEvent::Error {
+                            message: format!(
+                                "Cannot change dependencies of prompt {prompt_id} in {current_status:?} state"
+                            ),
+                        },
+                    );
+                    return;
+                }
+                let dep_uuids = match self.resolve_dep_ids(&depends_on) {
+                    Ok(u) => u,
+                    Err(message) => {
+                        self.sessions
+                            .send_to(session_id, DaemonEvent::Error { message });
+                        return;
+                    }
+                };
+                let target_uuid = self.prompts[idx].uuid.clone();
+                if self.would_create_cycle(&target_uuid, &dep_uuids) {
+                    self.sessions.send_to(
+                        session_id,
+                        DaemonEvent::Error {
+                            message: format!(
+                                "Refused: dependency change on prompt {prompt_id} would create a cycle"
+                            ),
+                        },
+                    );
+                    return;
+                }
+                self.prompts[idx].depends_on = dep_uuids;
+                self.prompts[idx].status =
+                    if self.all_deps_completed(&self.prompts[idx]) {
+                        PromptStatus::Pending
+                    } else {
+                        PromptStatus::Blocked
+                    };
+                self.persist_prompt_by_id(prompt_id);
+                let info = self.to_prompt_info(&self.prompts[idx]);
+                self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+                self.dispatch_workers();
             }
             ClientRequest::GetState => {
                 let state = self.to_daemon_state();
@@ -906,6 +1085,12 @@ impl Orchestrator {
                 self.active_workers = self.active_workers.saturating_sub(1);
             }
         }
+        // Capture UUID before removal so we can purge it from dependents' lists.
+        let removed_uuid = self
+            .prompts
+            .iter()
+            .find(|p| p.id == prompt_id)
+            .map(|p| p.uuid.clone());
         // Delete persistence file
         if let Some(ref dir) = self.prompts_dir {
             if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
@@ -916,6 +1101,30 @@ impl Orchestrator {
             self.prompts.remove(pos);
             self.sessions
                 .broadcast(&DaemonEvent::PromptRemoved { prompt_id });
+        }
+        // Purge the deleted UUID from any other prompt's depends_on, then
+        // re-evaluate blocked dependents. Deletion implies "no longer needed",
+        // so dependents should not wait on a vanished prompt.
+        if let Some(uuid) = removed_uuid {
+            let affected: Vec<usize> = self
+                .prompts
+                .iter()
+                .filter(|p| p.depends_on.iter().any(|d| d == &uuid))
+                .map(|p| p.id)
+                .collect();
+            for id in &affected {
+                if let Some(p) = self.prompts.iter_mut().find(|p| p.id == *id) {
+                    p.depends_on.retain(|d| d != &uuid);
+                }
+                self.persist_prompt_by_id(*id);
+                if let Some(p) = self.prompts.iter().find(|p| p.id == *id) {
+                    let info = self.to_prompt_info(p);
+                    self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+                }
+            }
+            if !affected.is_empty() {
+                self.unblock_dependents();
+            }
         }
     }
 
@@ -1107,6 +1316,7 @@ impl Orchestrator {
 mod tests {
     use super::*;
     use clhorde_core::prompt::Prompt;
+    use clhorde_core::protocol::ClientRequest;
 
     /// Helper: insert a prompt with a given status directly into the orchestrator.
     fn insert_prompt(orch: &mut Orchestrator, id: usize, status: PromptStatus) {
@@ -1272,6 +1482,184 @@ mod tests {
         assert!(matches!(event, DaemonEvent::Unsubscribed));
     }
 
+    // ── dependencies ──
+
+    #[tokio::test]
+    async fn add_prompt_with_unmet_deps_starts_blocked() {
+        let mut orch = Orchestrator::new_for_test();
+        // Insert a Pending prompt with id 1 and capture its UUID
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        let dep_uuid = orch.prompts[0].uuid.clone();
+
+        orch.add_prompt(
+            "child".into(),
+            None,
+            PromptMode::Interactive,
+            false,
+            vec![],
+            vec![dep_uuid],
+        );
+        let child = orch.prompts.iter().find(|p| p.id == 2).unwrap();
+        assert_eq!(child.status, PromptStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn add_prompt_with_completed_deps_starts_pending() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+        let dep_uuid = orch.prompts[0].uuid.clone();
+
+        orch.add_prompt(
+            "child".into(),
+            None,
+            PromptMode::Interactive,
+            false,
+            vec![],
+            vec![dep_uuid],
+        );
+        let child = orch.prompts.iter().find(|p| p.id == 2).unwrap();
+        assert_eq!(child.status, PromptStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_blocked_prompts() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        let dep_uuid = orch.prompts[0].uuid.clone();
+        orch.add_prompt(
+            "child".into(),
+            None,
+            PromptMode::Interactive,
+            false,
+            vec![],
+            vec![dep_uuid],
+        );
+        // The pending parent at idx 0 should be picked first; the blocked
+        // child at idx 1 must not appear.
+        let idx = orch.next_pending_prompt_index();
+        assert_eq!(idx, Some(0));
+        // Blocking the parent (set to Blocked) leaves nothing dispatchable.
+        orch.prompts[0].status = PromptStatus::Blocked;
+        assert_eq!(orch.next_pending_prompt_index(), None);
+    }
+
+    #[tokio::test]
+    async fn unblock_dependents_transitions_blocked_to_pending() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Running);
+        let dep_uuid = orch.prompts[0].uuid.clone();
+        orch.add_prompt(
+            "child".into(),
+            None,
+            PromptMode::Interactive,
+            false,
+            vec![],
+            vec![dep_uuid],
+        );
+        assert_eq!(orch.prompts[1].status, PromptStatus::Blocked);
+        // Mark the parent Completed; unblock_dependents should run.
+        orch.prompts[0].status = PromptStatus::Completed;
+        let unblocked = orch.unblock_dependents();
+        assert_eq!(unblocked, vec![2]);
+        assert_eq!(orch.prompts[1].status, PromptStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn dep_on_failed_prompt_keeps_dependent_blocked() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Failed);
+        let dep_uuid = orch.prompts[0].uuid.clone();
+        orch.add_prompt(
+            "child".into(),
+            None,
+            PromptMode::Interactive,
+            false,
+            vec![],
+            vec![dep_uuid],
+        );
+        assert_eq!(orch.prompts[1].status, PromptStatus::Blocked);
+        // unblock_dependents must not free dependents of Failed prompts.
+        let unblocked = orch.unblock_dependents();
+        assert!(unblocked.is_empty());
+        assert_eq!(orch.prompts[1].status, PromptStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn would_create_cycle_detects_self_loop() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        let uuid = orch.prompts[0].uuid.clone();
+        assert!(orch.would_create_cycle(&uuid, &[uuid.clone()]));
+    }
+
+    #[tokio::test]
+    async fn would_create_cycle_detects_indirect_cycle() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        insert_prompt(&mut orch, 2, PromptStatus::Pending);
+        let uuid_a = orch.prompts[0].uuid.clone();
+        let uuid_b = orch.prompts[1].uuid.clone();
+        // a depends on b; making b depend on a would close the loop.
+        orch.prompts[0].depends_on = vec![uuid_b.clone()];
+        assert!(orch.would_create_cycle(&uuid_b, &[uuid_a]));
+    }
+
+    #[tokio::test]
+    async fn resolve_dep_ids_returns_error_for_unknown() {
+        let orch = Orchestrator::new_for_test();
+        match orch.resolve_dep_ids(&[42]) {
+            Ok(_) => panic!("should have errored"),
+            Err(msg) => assert!(msg.contains("42")),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_prompt_purges_deps_and_unblocks() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        let dep_uuid = orch.prompts[0].uuid.clone();
+        orch.add_prompt(
+            "child".into(),
+            None,
+            PromptMode::Interactive,
+            false,
+            vec![],
+            vec![dep_uuid.clone()],
+        );
+        assert_eq!(orch.prompts[1].status, PromptStatus::Blocked);
+
+        orch.delete_prompt(1);
+        // The child's depends_on should be empty now, and status Pending.
+        let child = orch.prompts.iter().find(|p| p.id == 2).unwrap();
+        assert!(child.depends_on.is_empty());
+        assert_eq!(child.status, PromptStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn submit_prompt_with_unknown_dep_id_returns_error() {
+        let mut orch = Orchestrator::new_for_test();
+        let (event_tx, mut event_rx) = mpsc::channel(1024);
+        orch.sessions.add_session_with_id(1, event_tx);
+
+        orch.handle_request(
+            ClientRequest::SubmitPrompt {
+                text: "child".into(),
+                cwd: None,
+                mode: "interactive".into(),
+                worktree: false,
+                tags: vec![],
+                depends_on: vec![999],
+            },
+            1,
+        );
+        let event = event_rx.try_recv().expect("should receive Error");
+        match event {
+            DaemonEvent::Error { message } => assert!(message.contains("999")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(orch.prompts.is_empty());
+    }
+
     // ── add_prompt ──
 
     #[tokio::test]
@@ -1279,12 +1667,26 @@ mod tests {
         let mut orch = Orchestrator::new_for_test();
         assert_eq!(orch.next_id, 1);
 
-        orch.add_prompt("hello".into(), None, PromptMode::Interactive, false, vec![]);
+        orch.add_prompt(
+            "hello".into(),
+            None,
+            PromptMode::Interactive,
+            false,
+            vec![],
+            vec![],
+        );
         assert_eq!(orch.prompts.len(), 1);
         assert_eq!(orch.prompts[0].id, 1);
         assert_eq!(orch.next_id, 2);
 
-        orch.add_prompt("world".into(), None, PromptMode::OneShot, false, vec![]);
+        orch.add_prompt(
+            "world".into(),
+            None,
+            PromptMode::OneShot,
+            false,
+            vec![],
+            vec![],
+        );
         assert_eq!(orch.prompts.len(), 2);
         assert_eq!(orch.prompts[1].id, 2);
         assert_eq!(orch.next_id, 3);
@@ -1297,7 +1699,14 @@ mod tests {
         orch.sessions.add_session_with_id(1, tx);
         orch.sessions.set_subscribed(1, true);
 
-        orch.add_prompt("test".into(), None, PromptMode::Interactive, false, vec![]);
+        orch.add_prompt(
+            "test".into(),
+            None,
+            PromptMode::Interactive,
+            false,
+            vec![],
+            vec![],
+        );
 
         let event = rx.try_recv().expect("should receive PromptAdded");
         assert!(matches!(event, DaemonEvent::PromptAdded(_)));
@@ -1641,6 +2050,7 @@ mod tests {
                 None,
                 PromptMode::Interactive,
                 false,
+                Vec::new(),
                 Vec::new(),
             );
             // Small sleep to ensure UUID v7 ordering

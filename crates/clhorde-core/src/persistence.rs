@@ -14,6 +14,8 @@ pub struct PromptFile {
     pub worktree_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -108,6 +110,7 @@ impl PromptFile {
         let mode = prompt.mode.label();
         let state = match prompt.status {
             crate::prompt::PromptStatus::Pending => "pending",
+            crate::prompt::PromptStatus::Blocked => "blocked",
             crate::prompt::PromptStatus::Running => "running",
             crate::prompt::PromptStatus::Idle => "running",
             crate::prompt::PromptStatus::Completed => "completed",
@@ -125,6 +128,7 @@ impl PromptFile {
             session_id: prompt.session_id.clone(),
             worktree_path: prompt.worktree_path.clone(),
             tags: prompt.tags.clone(),
+            depends_on: prompt.depends_on.clone(),
         }
     }
 }
@@ -158,6 +162,7 @@ mod tests {
             session_id: Some("sess-123".to_string()),
             worktree_path: None,
             tags: Vec::new(),
+            depends_on: Vec::new(),
         };
 
         save_prompt(&dir, &uuid1, &data);
@@ -207,6 +212,7 @@ mod tests {
                 session_id: None,
                 worktree_path: None,
                 tags: Vec::new(),
+                depends_on: Vec::new(),
             };
             save_prompt(&dir, &uuid, &data);
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -264,6 +270,7 @@ mod tests {
                 session_id: None,
                 worktree_path: None,
                 tags: Vec::new(),
+                depends_on: Vec::new(),
             };
             save_prompt(&dir, &uuid, &data);
             uuids.push(uuid);
@@ -300,6 +307,7 @@ mod tests {
             session_id: None,
             worktree_path: None,
             tags: Vec::new(),
+            depends_on: Vec::new(),
         };
         save_prompt(&dir, &uuid, &data);
 
@@ -326,6 +334,7 @@ mod tests {
             session_id: None,
             worktree_path: None,
             tags: Vec::new(),
+            depends_on: Vec::new(),
         };
         save_prompt(&dir, &uuid, &data);
         let loaded = load_all_prompts(&dir);
@@ -356,6 +365,51 @@ mod tests {
     }
 
     #[test]
+    fn persistence_backward_compat_no_depends_on_field() {
+        // Old files (pre-dependencies) lack the depends_on field — verify they load.
+        let dir = temp_prompts_dir();
+        let uuid = uuid::Uuid::now_v7().to_string();
+        let path = dir.join(format!("{uuid}.json"));
+        let legacy_json = r#"{
+            "prompt": "legacy",
+            "options": { "mode": "interactive", "context": null },
+            "state": "completed",
+            "queue_rank": 1.0,
+            "session_id": null
+        }"#;
+        std::fs::write(&path, legacy_json).unwrap();
+        let loaded = load_all_prompts(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].1.depends_on.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_roundtrip_with_depends_on() {
+        let dir = temp_prompts_dir();
+        let uuid = uuid::Uuid::now_v7().to_string();
+        let data = PromptFile {
+            prompt: "with deps".to_string(),
+            options: PromptOptions {
+                mode: "interactive".to_string(),
+                context: None,
+                worktree: None,
+            },
+            state: "pending".to_string(),
+            queue_rank: 1.0,
+            session_id: None,
+            worktree_path: None,
+            tags: Vec::new(),
+            depends_on: vec!["uuid-a".to_string(), "uuid-b".to_string()],
+        };
+        save_prompt(&dir, &uuid, &data);
+        let loaded = load_all_prompts(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1.depends_on, vec!["uuid-a", "uuid-b"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn delete_prompt() {
         let dir = temp_prompts_dir();
 
@@ -372,6 +426,7 @@ mod tests {
             session_id: None,
             worktree_path: None,
             tags: Vec::new(),
+            depends_on: Vec::new(),
         };
         save_prompt(&dir, &uuid, &data);
         assert_eq!(load_all_prompts(&dir).len(), 1);

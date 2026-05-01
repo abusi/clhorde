@@ -69,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mode: "one-shot".to_string(),
             worktree: false,
             tags: vec!["test".to_string()],
+            depends_on: Vec::new(),
         },
     )
     .await?;

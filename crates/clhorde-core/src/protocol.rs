@@ -15,6 +15,10 @@ pub enum ClientRequest {
         mode: String,
         worktree: bool,
         tags: Vec<String>,
+        /// Prompt IDs (as known to the client) that must complete before this one runs.
+        /// The daemon resolves these to UUIDs at submit time.
+        #[serde(default)]
+        depends_on: Vec<usize>,
     },
     SendInput {
         prompt_id: usize,
@@ -49,6 +53,12 @@ pub enum ClientRequest {
     SetPromptMode {
         prompt_id: usize,
         mode: String,
+    },
+    /// Replace the dependency list of a Pending or Blocked prompt.
+    /// IDs are resolved to UUIDs server-side.
+    SetDependencies {
+        prompt_id: usize,
+        depends_on: Vec<usize>,
     },
     GetState,
     GetPromptOutput {
@@ -171,6 +181,13 @@ pub struct PromptInfo {
     pub elapsed_secs: Option<f64>,
     pub uuid: String,
     pub has_pty: bool,
+    /// UUIDs of prompts this one depends on.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Subset of `depends_on` that is not yet Completed (computed by the daemon).
+    /// Empty means the prompt is dispatchable.
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
 }
 
 impl PromptInfo {
@@ -178,6 +195,7 @@ impl PromptInfo {
     pub fn status_enum(&self) -> crate::prompt::PromptStatus {
         match self.status.as_str() {
             "Pending" => crate::prompt::PromptStatus::Pending,
+            "Blocked" => crate::prompt::PromptStatus::Blocked,
             "Running" => crate::prompt::PromptStatus::Running,
             "Idle" => crate::prompt::PromptStatus::Idle,
             "Completed" => crate::prompt::PromptStatus::Completed,
@@ -200,6 +218,7 @@ impl PromptInfo {
     pub fn status_symbol(&self) -> &'static str {
         match self.status.as_str() {
             "Pending" => "⏳",
+            "Blocked" => "🔒",
             "Running" => "🔄",
             "Idle" => "💬",
             "Completed" => "✅",

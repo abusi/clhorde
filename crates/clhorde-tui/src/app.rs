@@ -217,6 +217,7 @@ impl App {
             mode: self.default_mode.label().to_string(),
             worktree,
             tags,
+            depends_on: Vec::new(),
         });
         // Selection will be updated when PromptAdded event arrives
     }
@@ -1872,6 +1873,8 @@ mod tests {
             elapsed_secs: None,
             uuid: format!("test-uuid-{id}"),
             has_pty: false,
+            depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         }
     }
 

@@ -36,6 +36,8 @@ impl PromptMode {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PromptStatus {
     Pending,
+    /// Awaiting completion of one or more dependencies.
+    Blocked,
     Running,
     /// Turn complete, process alive, waiting for follow-up input.
     Idle,
@@ -47,6 +49,7 @@ impl PromptStatus {
     pub fn symbol(&self) -> &str {
         match self {
             PromptStatus::Pending => "⏳",
+            PromptStatus::Blocked => "🔒",
             PromptStatus::Running => "🔄",
             PromptStatus::Idle => "💬",
             PromptStatus::Completed => "✅",
@@ -85,6 +88,8 @@ pub struct Prompt {
     pub worktree_path: Option<String>,
     /// User-defined tags for grouping/filtering (e.g. `@frontend`).
     pub tags: Vec<String>,
+    /// UUIDs of prompts that must be Completed before this one can dispatch.
+    pub depends_on: Vec<String>,
 }
 
 impl Prompt {
@@ -107,6 +112,7 @@ impl Prompt {
             worktree: false,
             worktree_path: None,
             tags: Vec::new(),
+            depends_on: Vec::new(),
         }
     }
 
@@ -258,6 +264,7 @@ mod tests {
     #[test]
     fn status_symbols() {
         assert_eq!(PromptStatus::Pending.symbol(), "⏳");
+        assert_eq!(PromptStatus::Blocked.symbol(), "🔒");
         assert_eq!(PromptStatus::Running.symbol(), "🔄");
         assert_eq!(PromptStatus::Idle.symbol(), "💬");
         assert_eq!(PromptStatus::Completed.symbol(), "✅");
@@ -279,6 +286,7 @@ mod tests {
         assert!(p.started_at_ms.is_none());
         assert!(p.finished_at_ms.is_none());
         assert!(!p.seen);
+        assert!(p.depends_on.is_empty());
     }
 
     #[test]
