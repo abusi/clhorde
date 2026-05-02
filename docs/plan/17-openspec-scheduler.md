@@ -19,14 +19,14 @@ Tracked on branch `feat/prompt-dependencies`.
 | 2.1 Binary skeleton + daemon_client | ✅ shipped | clap CLI, long-lived IPC client, reconnect loop; 17 new tests |
 | 2.2 Discovery + workflow types + persistence | ✅ shipped | TOML marker, state machine, JSON store; 32 new tests |
 | 2.3 FS watcher + state machine | ✅ shipped | `notify_debouncer_full`, orchestrator + reconcile; 26 new tests |
-| 2.4 Templates + dispatch | ⏳ next | |
-| 2.5 openspec/changes/ snapshot in scheduler | ⏳ pending | |
+| 2.4 Templates + dispatch | ✅ shipped | Tera engine, DAG dispatch, apply→verify→archive lifecycle; 35 new tests |
+| 2.5 openspec/changes/ snapshot in scheduler | ⏳ next | |
 | 2.6 CLI subcommands wired to daemon | ⏳ pending | |
 | 3   `clhorde-cli flow` wrappers | ⏳ pending | |
 | 4   TUI restructure (tabs) | ⏳ pending | |
 | 5   Advanced / web | ⏳ pending | |
 
-Workspace tests: **534 passing**, none ignored.
+Workspace tests: **569 passing**, none ignored.
 
 ## Vision
 
@@ -371,39 +371,21 @@ Delivered:
 
 26 new tests (workspace 508 → 534), driving the orchestrator with synthetic `FsEvent`s plus one live-watcher smoke test that creates a `.clhorde-ready` and asserts the event surfaces within 2s.
 
-### 2.4 Templates + prompt dispatch — ⏳ pending
+### 2.4 Templates + prompt dispatch — ✅ shipped
 
-Scope:
-- `templates.rs` — Tera engine loading from `~/.config/clhorde/scheduler/templates/` with sane built-in defaults (`propose.md`, `apply-section.md`, `verify.md`, `archive.md`). Per-project override at `openspec/.clhorde-scheduler/templates/`.
-- DAG → prompt translation: for each runnable node, render the template, then submit a prompt to the daemon with `depends_on` populated from already-dispatched predecessor UUIDs and `worktree_id` set to the workflow id (so all of a workflow's prompts share one branch state).
-- `tasks.md` is the source of truth for completion: on `WorkerFinished` re-parse and decide section/task `done`-ness. Worker exited 0 but tasks unchecked → configurable (`pause` default, `retry` opt-in).
+Delivered:
+- `templates.rs` — Tera engine with four built-in templates (`propose`, `apply-section`, `verify`, `archive`) included via `include_str!`. Override resolution: per-project (`<root>/openspec/.clhorde-scheduler/templates/`) beats user (`~/.config/clhorde/scheduler/templates/`) beats built-in. Malformed or unreadable overrides log a warning and fall through to the next layer; only known template names are renderable so a stray file with a typo can't accidentally route a prompt.
+- `dispatch.rs` — pure decision helpers: `next_runnable_nodes(dag, completed, dispatched)`, `is_section_done`, `is_task_done`, `is_node_done`. Granularity-agnostic; the orchestrator stays small because every "what fires next" decision lives here.
+- `orchestrator.rs` extension — outbound `mpsc::UnboundedSender<ClientRequest>`, `WorkflowRuntime` with the apply DAG plus per-node dispatch bookkeeping, and a single `try_advance(name)` entry point invoked after every FS or daemon event. Phases:
+  - `Queued` + parsed tasks → build DAG, transition to `Implementing`, dispatch initial wave with `worktree=true`, `worktree_id = <workflow>`, and `depends_on` populated from predecessor prompt ids that arrived via `PromptAdded`.
+  - `Implementing` + each `WorkerFinished` → re-parse `tasks.md`, mark the node complete iff its section/task boxes are all ticked. Worker exit ≠ 0 fails the workflow; exit 0 with unchecked boxes also fails (the "pause" default in the original plan, surfaced as `Failed { reason }` so it shows up in `status`).
+  - `Implementing` complete → `Verifying`, then `Archiving`, then `Archived`. Verify/archive are single-prompt phases that re-use the same template engine and tag scheme.
+- Tag-based correlation: every dispatched prompt gets `clhorde-scheduler/wf=<name>/phase=<phase>[/node=<id>]` so `PromptAdded` and `WorkerFinished` events route back to the right workflow without touching the daemon.
+- `main.rs` — outbound channel forwarded to the daemon socket inside the existing select! loop; daemon events also feed `Orchestrator::handle_daemon_event`. Watcher and reconcile logic from 2.3 are unchanged.
 
-Default `apply-section.md`:
+35 new tests (workspace 534 → 569): template rendering + override layering, pure DAG dispatch (initial wave, fan-in, parallel branches), and end-to-end orchestrator scenarios driving apply → verify → archive with synthetic `PromptAdded` / `WorkerFinished` events through the outbound channel.
 
-```
-You are working on OpenSpec change `{{change_name}}`.
-
-Read the proposal, design, and specs in:
-  {{change_dir}}/proposal.md
-  {{change_dir}}/design.md
-  {{change_dir}}/specs/
-
-Your job: complete section {{section_id}} ({{section_title}}) of {{change_dir}}/tasks.md.
-
-Tasks to implement:
-{{tasks_block}}
-
-When each task is done, edit {{change_dir}}/tasks.md and change `- [ ]` to `- [x]`
-for that exact line. Do not start any other section.
-
-Run any relevant tests after the section. If tests fail, fix and re-run.
-Stop when all tasks of this section are checked.
-```
-
-Tests:
-- Template rendering for each phase template against a fixture workflow.
-- Template override resolution (per-project beats user beats built-in).
-- Dispatch decisions: pure `next_runnable_nodes(dag, completed_set)` returning the indices that should fire now.
+In-flight workflows that survive a scheduler crash currently re-dispatch from scratch on next reconcile (the runtime cache is in-memory only). Cross-restart correctness for partially-finished workflows is deferred — Phase 2.6's CLI surface and Phase 4's TUI both want explicit retry/resume affordances anyway.
 
 ### 2.5 OpenSpec FS detection in the scheduler — ⏳ pending
 
@@ -503,8 +485,8 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 | **2.1** | ✅ `9382e38` | Binary skeleton + clap CLI + long-lived daemon client | Foundation; all later sub-phases bolt onto this. |
 | **2.2** | ✅ shipped | Discovery + workflow types + persistence | Pure data layer; 32 new tests, no watcher needed. |
 | **2.3** | ✅ shipped | FS watcher + state machine wiring | Reactivity without prompt dispatch yet; 26 new tests + live smoke. |
-| **2.4** | ⏳ pending | Tera templates + prompt dispatch via daemon | First end-to-end run of a real workflow. |
-| **2.5** | ⏳ pending | `openspec/changes/` snapshot in scheduler → `SetAnnotation` writes | Restores the user-visible auto-link feature, agnostic-daemon-friendly. |
+| **2.4** | ✅ shipped | Tera templates + prompt dispatch via daemon | First end-to-end run of a real workflow; 35 new tests. |
+| **2.5** | ⏳ next | `openspec/changes/` snapshot in scheduler → `SetAnnotation` writes | Restores the user-visible auto-link feature, agnostic-daemon-friendly. |
 | **2.6** | ⏳ pending | One-shot CLI subcommands implemented | Scriptable usage; `clhorde-scheduler queue add-oauth` etc. |
 | **3**   | ⏳ pending | `clhorde-cli flow` wrappers + scheduler control socket | Single CLI entrypoint for users; remote-control of a long-lived scheduler. |
 | **4**   | ⏳ pending | TUI tabs (`Drafts`, `Workflows`) | First-class UX. |
