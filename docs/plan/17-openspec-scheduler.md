@@ -17,16 +17,16 @@ Tracked on branch `feat/prompt-dependencies`.
 | 0.3 Generic prompt annotations | ✅ shipped | 9 new tests; daemon stays workflow-agnostic |
 | 1   tasks.md parser + DAG | ✅ shipped | new `clhorde-scheduler` crate (lib-only); 53 new tests |
 | 2.1 Binary skeleton + daemon_client | ✅ shipped | clap CLI, long-lived IPC client, reconnect loop; 17 new tests |
-| 2.2 Discovery + workflow types + persistence | ⏳ next | |
-| 2.3 FS watcher + state machine | ⏳ pending | |
-| 2.4 Templates + dispatch | ⏳ pending | |
+| 2.2 Discovery + workflow types + persistence | ✅ shipped | TOML marker, state machine, JSON store; 32 new tests |
+| 2.3 FS watcher + state machine | ✅ shipped | `notify_debouncer_full`, orchestrator + reconcile; 26 new tests |
+| 2.4 Templates + dispatch | ⏳ next | |
 | 2.5 openspec/changes/ snapshot in scheduler | ⏳ pending | |
 | 2.6 CLI subcommands wired to daemon | ⏳ pending | |
 | 3   `clhorde-cli flow` wrappers | ⏳ pending | |
 | 4   TUI restructure (tabs) | ⏳ pending | |
 | 5   Advanced / web | ⏳ pending | |
 
-Workspace tests: **476 passing**, none ignored.
+Workspace tests: **534 passing**, none ignored.
 
 ## Vision
 
@@ -349,31 +349,27 @@ Delivered:
 
 Latent issue surfaced here for follow-up: `ClientRequest::SetMaxWorkers(usize)` is a newtype variant containing a primitive, which `serde_json` cannot serialize under `#[serde(tag = "type")]`. Tracked as a separate fix; doesn't block the scheduler since we don't issue that request from here.
 
-### 2.2 Discovery + workflow types + persistence — ⏳ next
+### 2.2 Discovery + workflow types + persistence — ✅ shipped
 
-Scope:
-- `openspec/discovery.rs` — `scan(root) -> Vec<DiscoveredChange>` walks `<root>/openspec/changes/*/`, classifies each as `Drafted` (no `.clhorde-ready`) or `Queued` (marker present). Reads optional metadata from the marker (priority, `depends_on`, `worktree_branch`, `parallel_sections`, `max_section_retries`).
-- `workflow.rs` — `Workflow { name, status, dag, started_at, prompt_ids, ... }` plus a pure state machine for `Drafted → Queued → Implementing → Verifying → Archiving → Archived` (+ `Failed { reason }`, `Cancelled`). Transition functions return `Result` so invalid moves surface clearly.
-- `persistence.rs` — `~/.local/share/clhorde/workflows/<name>.json` save/load/delete with `#[serde(default)]` on every new field for back-compat.
+Delivered:
+- `openspec::discovery::scan(root)` walks `<root>/openspec/changes/*/` and classifies each entry as `Drafted` or `Queued(MarkerMetadata)`. The marker is plain TOML (`priority`, `depends_on`, `worktree_branch`, `parallel_sections`, `max_section_retries`); unknown fields are ignored, malformed markers degrade to `Drafted` (with a warning), and dotfile entries (`.archive/`) are skipped.
+- `workflow::Workflow` with a pure state machine for `Drafted → Queued → Implementing → Verifying → Archiving → Archived` plus `Failed { reason }` / `Cancelled`. `cancel`/`fail` are valid from any non-terminal state; every illegal transition returns `TransitionError { from, attempted }`.
+- `persistence::WorkflowStore` saves to `~/.local/share/clhorde/workflows/<name>.json` via tempfile + atomic rename. Workflow names are validated (rejects path traversal and dotfiles). Every persisted field carries `#[serde(default)]`; the back-compat test loads a minimal historical record cleanly.
+- The `dag` is intentionally not persisted — Phase 2.4 rebuilds it from `tasks.md`.
 
-Tests:
-- Discovery on temp-dir fixtures: empty repo, draft only, marker only, both, malformed marker.
-- Marker parsing: empty body (all defaults), each individual field, unknown fields ignored.
-- State machine: every legal transition + a sample of illegal ones (e.g. `Archived → Implementing`).
-- Persistence round-trip + back-compat for a future field.
+32 new tests (workspace 476 → 508).
 
 **Marker format:** TOML rather than YAML — already in workspace deps, no new dependency, and the marker payload is small enough that human readability isn't impacted.
 
-### 2.3 FS watcher + state machine wiring — ⏳ pending
+### 2.3 FS watcher + state machine wiring — ✅ shipped
 
-Scope:
-- `watcher.rs` using `notify` for `openspec/changes/**/.clhorde-ready` (created/removed) and `openspec/changes/**/tasks.md` (modified). Debounce via `notify_debouncer_full` to absorb editor save bursts.
-- Glue in `orchestrator.rs`: on marker created → `Workflow::start`, on marker removed → `Workflow::cancel`, on tasks.md modified → re-parse and refresh node `done` state. No prompt dispatch yet — only state transitions and persistence.
-- Hook discovery on startup so existing markers come back into the active set after a scheduler restart.
+Delivered:
+- `watcher::spawn` runs `notify_debouncer_full` against `<root>/openspec/changes/`, classifies each path through pure `classify_path` / `classify_event` helpers, and forwards a stream of `FsEvent { MarkerCreated | MarkerRemoved | TasksModified }` over an `mpsc::UnboundedSender`. Marker create-vs-remove is decided by re-checking presence on disk, which collapses platform-dependent `notify` event semantics into the only two states the orchestrator cares about.
+- `orchestrator::Orchestrator` owns the in-memory workflow map plus the `WorkflowStore`. `handle_event` mutates state and persists; `reconcile` reads the store + scans the FS so markers that appeared (or disappeared) while the scheduler was offline are folded back into the active set. Edge cases: marker re-creation on a `Queued` workflow refreshes metadata only; marker removal on a running workflow → `cancel`; missing `tasks.md` clears the parsed cache silently.
+- The `daemon` subcommand now calls `reconcile` on startup, spawns the watcher, and applies events via the orchestrator while the daemon connection reconnects in the background. Watcher failures are non-fatal — the daemon stays up so the user can still run `apply` manually once Phase 2.6 lands.
+- Phase 2.3 stops short of dispatching prompts; the parsed `tasks.md` graph is cached on `Orchestrator` for Phase 2.4 to consume.
 
-Tests:
-- Synthetic FS events drive the state machine via the `notify` debouncer's test mode (no real watcher).
-- Restart: pre-populate workflows on disk + markers on disk, assert reconciliation.
+26 new tests (workspace 508 → 534), driving the orchestrator with synthetic `FsEvent`s plus one live-watcher smoke test that creates a `.clhorde-ready` and asserts the event surfaces within 2s.
 
 ### 2.4 Templates + prompt dispatch — ⏳ pending
 
@@ -505,8 +501,8 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 | **0.3** | ✅ shipped | Generic `Prompt::annotations` + `SetAnnotation` IPC | Workflow-agnostic primitive. OpenSpec FS detection moves to Phase 2. |
 | **1**   | ✅ shipped | `clhorde-scheduler` crate skeleton + tasks.md parser + DAG builder | Core algorithm; testable in isolation without IPC. |
 | **2.1** | ✅ `9382e38` | Binary skeleton + clap CLI + long-lived daemon client | Foundation; all later sub-phases bolt onto this. |
-| **2.2** | ⏳ next | Discovery + workflow types + persistence | Pure data layer; testable without the watcher. |
-| **2.3** | ⏳ pending | FS watcher + state machine wiring | Reactivity without prompt dispatch yet. |
+| **2.2** | ✅ shipped | Discovery + workflow types + persistence | Pure data layer; 32 new tests, no watcher needed. |
+| **2.3** | ✅ shipped | FS watcher + state machine wiring | Reactivity without prompt dispatch yet; 26 new tests + live smoke. |
 | **2.4** | ⏳ pending | Tera templates + prompt dispatch via daemon | First end-to-end run of a real workflow. |
 | **2.5** | ⏳ pending | `openspec/changes/` snapshot in scheduler → `SetAnnotation` writes | Restores the user-visible auto-link feature, agnostic-daemon-friendly. |
 | **2.6** | ⏳ pending | One-shot CLI subcommands implemented | Scriptable usage; `clhorde-scheduler queue add-oauth` etc. |
