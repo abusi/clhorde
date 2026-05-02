@@ -1,0 +1,12 @@
+[package]
+name = "clhorde-scheduler"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+clhorde-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true

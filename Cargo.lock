@@ -387,6 +387,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clhorde-scheduler"
+version = "0.5.1"
+dependencies = [
+ "clhorde-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "clhorde-tui"
 version = "0.5.1"
 dependencies = [

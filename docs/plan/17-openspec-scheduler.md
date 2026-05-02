@@ -15,13 +15,13 @@ Tracked on branch `feat/prompt-dependencies`.
 | 0.1 Prompt dependencies | ✅ shipped | commit `ea2e405`, 10 new tests |
 | 0.2 Shared worktrees | ✅ shipped | commit `c1e7309`, 14 new tests |
 | 0.3 Generic prompt annotations | ✅ shipped | 9 new tests; daemon stays workflow-agnostic |
-| 1   tasks.md parser + DAG | ⏳ next | |
-| 2   Scheduler execution loop + openspec FS detection | ⏳ pending | |
+| 1   tasks.md parser + DAG | ✅ shipped | new `clhorde-scheduler` crate (lib-only); 53 new tests |
+| 2   Scheduler execution loop + openspec FS detection | ⏳ next | |
 | 3   `clhorde-cli flow` wrappers | ⏳ pending | |
 | 4   TUI restructure (tabs) | ⏳ pending | |
 | 5   Advanced / web | ⏳ pending | |
 
-Workspace tests: **406 passing**, none ignored.
+Workspace tests: **459 passing**, none ignored.
 
 ## Vision
 
@@ -256,13 +256,35 @@ What this enables:
 
 The race window between `WorkerStarted` broadcast and the scheduler taking its first snapshot is acceptable in practice (Claude Code takes seconds to do anything FS-visible). If it ever bites, we add an explicit "watch_dirs" parameter on submit — still as a generic primitive — without baking OpenSpec into the daemon.
 
-## Phase 1 — Tasks.md parser & DAG builder
+## Phase 1 — Tasks.md parser & DAG builder — ✅ shipped
 
-### Parser output
+Delivered (lib-only crate `clhorde-scheduler`, no binary yet — Phase 2 adds it):
+
+- `clhorde-scheduler::openspec::tasks_parser`
+  - `parse(&str) -> TaskGraph`. Line-based parser (no `pulldown-cmark` — the constrained subset is simpler hand-rolled and gives exact line numbers for free).
+  - Recognizes `## N. Title`, `### N.M Title`, and list markers `- `/`* `/`+ ` followed by `[ ]`/`[x]`/`[X]`.
+  - Tracks fenced code blocks (` ``` ` and `~~~`) so task-like lines inside code samples are ignored.
+  - Strips inline `<!-- ... -->` from titles and task text but preserves the verbatim `source_line` for the annotations pass.
+  - Tolerates prose between items, free-form tasks (empty id), and `H1` documentation lines.
+  - Drops orphan tasks that appear before any heading and headings without a leading dotted id.
+- `clhorde-scheduler::openspec::annotations`
+  - `annotate(TaskGraph) -> Vec<AnnotatedSection>`. Walks the tree once and re-scans each `source_line` for `<!-- clhorde: ... -->` comments.
+  - Recognized keys: `depends`, `parallel-with`, `granularity` (`section`|`task`|`phase`), `prompt-template` on sections; `needs` on tasks.
+  - Multiple directives separated by `;`; multi-value lists by `,` or whitespace.
+  - Unknown keys are silently ignored (forward-compat); malformed comments don't block the workflow.
+- `clhorde-scheduler::openspec::dag`
+  - `build(&[AnnotatedSection]) -> Result<Dag, DagError>`.
+  - Granularity (Section / Task / Phase) is picked from the first section that sets it; default is Section.
+  - Section default policy: section *i* depends on section *i-1* in source order. `depends` annotation **replaces** the default. `parallel-with` is recorded as a hint without removing edges.
+  - Task granularity: tasks default to sequential within their section, reset across sections; `needs` annotations override.
+  - Phase granularity: collapses everything to one `apply` node.
+  - Three-color DFS cycle detection; reports the back-edge path on `DagError::Cycle`. Unknown ids surface as `DagError::UnknownRef { kind }`. Empty input → `DagError::Empty`.
+
+53 unit tests cover all of the above (parser, annotations, DAG, error paths, cycle shapes).
+
+### Original design notes (kept for reference)
 
 ```rust
-// in clhorde-scheduler::openspec::tasks_parser
-
 struct TaskGraph {
     sections: Vec<Section>,
     annotations: GraphAnnotations,
@@ -285,11 +307,7 @@ struct TaskItem {
 }
 ```
 
-Use `pulldown-cmark` for robust Markdown parsing. The parser must:
-- Recognize `## N. Title` and `### N.M Title` as section headers.
-- Recognize `- [ ]` / `- [x]` (case-insensitive) as task items.
-- Tolerate extra leading whitespace and prose between items.
-- Preserve `line_range` for each task so the scheduler can write back `[x]` without re-rendering the whole file.
+The shipped types diverge slightly: `Section` and `TaskItem` carry a `source_line: String` field used by the annotations pass instead of an inline `deps`/`parallel_with`; annotations live on the post-walk `AnnotatedSection`/`AnnotatedTask` envelopes. `line_range` is currently always single-line — multi-line task continuation can be added when a real workflow needs it.
 
 ### Annotations
 
@@ -446,8 +464,8 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 | **0.1** | ✅ `ea2e405` | Prompt dependencies + `Blocked` status | Foundational. Useful even without the scheduler. |
 | **0.2** | ✅ `c1e7309` | Shared worktrees via `worktree_id` + refcounted cleanup | Required for sequential workflow steps to share branch state. |
 | **0.3** | ✅ shipped | Generic `Prompt::annotations` + `SetAnnotation` IPC | Workflow-agnostic primitive. OpenSpec FS detection moves to Phase 2. |
-| **1**   | ⏳ next | `clhorde-scheduler` crate skeleton + tasks.md parser + DAG builder | Core algorithm; testable in isolation without IPC. |
-| **2**   | ⏳ pending | Templates + execution loop + watcher + persistence + openspec/changes snapshot/diff in scheduler | Minimum viable scheduler — runs on the CLI. Owns `openspec.affected_changes` annotation. |
+| **1**   | ✅ shipped | `clhorde-scheduler` crate skeleton + tasks.md parser + DAG builder | Core algorithm; testable in isolation without IPC. |
+| **2**   | ⏳ next | Templates + execution loop + watcher + persistence + openspec/changes snapshot/diff in scheduler | Minimum viable scheduler — runs on the CLI. Owns `openspec.affected_changes` annotation. |
 | **3**   | ⏳ pending | `clhorde-cli flow` wrappers + `propose`/`queue`/`status`/`apply`/`archive` | Usable by humans end-to-end. |
 | **4**   | ⏳ pending | TUI tabs (`Drafts`, `Workflows`) + scheduler control socket | First-class UX. |
 | **5**   | ⏳ pending | Web routes + advanced (parallel safety, hooks, multi-repo) | Polish. |
