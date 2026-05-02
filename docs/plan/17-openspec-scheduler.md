@@ -22,11 +22,11 @@ Tracked on branch `feat/prompt-dependencies`.
 | 2.4 Templates + dispatch | ✅ shipped | Tera engine, DAG dispatch, apply→verify→archive lifecycle; 35 new tests |
 | 2.5 openspec/changes/ snapshot in scheduler | ✅ shipped | content-hash snapshot/diff + `SetAnnotation` writes on every observed worker; 21 new tests |
 | 2.6 CLI subcommands wired to daemon | ✅ shipped | every stub replaced; one-shot `Ping`/`Pong` fence; 23 new tests |
-| 3   `clhorde-cli flow` wrappers | ⏳ next | |
-| 4   TUI restructure (tabs) | ⏳ pending | |
+| 3   `clhorde-cli flow` wrappers + scheduler control socket | ✅ shipped | `~/.local/share/clhorde/scheduler.sock`, live remote-control; 25 new tests |
+| 4   TUI restructure (tabs) | ⏳ next | |
 | 5   Advanced / web | ⏳ pending | |
 
-Workspace tests: **613 passing**, none ignored.
+Workspace tests: **639 passing**, none ignored.
 
 ## Vision
 
@@ -417,14 +417,28 @@ Delivered:
 
 23 new tests (workspace 590 → 613): 4 one-shot daemon helper cases (Ping/Pong, timeout, disconnect, irrelevant-event filtering) + 19 command tests covering every FS effect, error path (missing change dir, missing workflow, `templates edit` non-zero exit), and the request shape for daemon-coupled phase prompts.
 
-## Phase 3 — `clhorde-cli flow` + scheduler control socket — ⏳ pending
+## Phase 3 — `clhorde-cli flow` + scheduler control socket — ✅ shipped
 
-Two pieces, both small once Phase 2 has landed:
+Delivered:
 
-1. **`clhorde-cli flow <subcommand>`** — thin wrappers that exec `clhorde-scheduler <subcommand>` with the same args, so users learn a single CLI. Implementation: `Command::new(...).args(...).status()`. Argument forwarding is verbatim; we don't try to re-derive a clap surface in `clhorde-cli`.
-2. **Scheduler control socket** at `~/.local/share/clhorde/scheduler.sock`. Until Phase 3 the long-lived `daemon` subcommand is talk-only over the daemon socket; one-shot CLI commands address the daemon directly. The control socket lets the TUI (Phase 4) and `clhorde-cli flow status` ask the *running scheduler* for live workflow state without re-reading every `~/.local/share/clhorde/workflows/*.json` file. Same length-delimited frame protocol as `clhorded`'s socket; minimal request set: `Status`, `Cancel`, `Retry { name, section }`.
+- **Scheduler control socket** at `~/.local/share/clhorde/scheduler.sock` (helper `clhorde_core::ipc::scheduler_socket_path` lives next to the existing `daemon_socket_path`). Same length-delimited JSON framing as `clhorded`. New `clhorde_scheduler::control` module with three submodules:
+  - `protocol` — `ControlRequest::{Ping, Status { name? }, Cancel { name }, Retry { name, section }}` and `ControlResponse::{Pong, Status { workflows }, Ok { message }, Error { message }}` plus `WorkflowSummary` (name, status label, optional `failure_reason`, priority, timestamps, prompt UUIDs). Every optional field is `#[serde(default, skip_serializing_if = "Option::is_none")]` for forward/back compat.
+  - `server` — `spawn(Arc<Mutex<Orchestrator>>, socket_path)` runs the accept loop; per-client `run_with_streams` is generic over `AsyncRead + AsyncWrite` so unit tests drive both sides through `tokio::io::duplex`. Pure `dispatch_request(orch, req)` is exposed for in-process tests. Stale socket files are unlinked before bind.
+  - `client` — `request(req)` and `request_at(path, req)` for one-shot calls; `request_many_at` keeps a connection open for sequenced requests. Friendly `ControlError::Unreachable` carries the canonical "Is it running? Start with: clhorde-scheduler daemon" message.
+- **Orchestrator extensions** wired into the control surface without touching the FS/event handlers:
+  - `summaries()` / `summary(name)` — pure read into the wire-format `WorkflowSummary`.
+  - `cancel_workflow(name)` — best-effort marker removal then the existing `on_marker_removed` transition; returns `"unqueued"` / `"cancelled"` / `"noop"` so the caller can echo it.
+  - `retry_section(name, section_id)` — resets `Failed → Implementing` if needed, re-parses `tasks.md`, rebuilds the DAG, renders the apply template, and ships one `SubmitPrompt` through the existing outbound channel. Refreshes the runtime cache so `note_prompt`/`WorkerFinished` correlate against the retry just like a freshly-dispatched node.
+- **Daemon main-loop refactor**: the `Orchestrator` is now wrapped in `Arc<std::sync::Mutex<>>`. Each `select!` arm takes the lock briefly (no `.await` happens under the guard). The control socket spawn is non-fatal — if bind fails the daemon stays up, only remote control is degraded. SIGINT and orchestrator-channel-closed paths unlink the socket before exit.
+- **`clhorde-cli flow <subcommand>`** in `commands/flow.rs` — `std::process::Command::new(bin).args(args).status()`. Binary resolution prefers the sibling-of-current-exe (`target/release/clhorde-scheduler` next to `clhorde-cli`) and falls back to `PATH`. Argument forwarding is verbatim; we don't re-derive a clap surface in `clhorde-cli`. Help text and the dispatch table are updated.
 
-Tests: control-socket round-trips driven through `tokio::io::duplex`, mirroring the daemon-client tests.
+25 new tests (workspace 614 → 639):
+- 1 ipc path-helper sanity check;
+- 9 protocol JSON round-trips (incl. unknown-variant rejection and back-compat for `WorkflowSummary` defaults);
+- 6 pure `dispatch_request` cases (Ping, empty/populated Status, named Status with unknown name, Cancel happy/unknown, Retry unknown);
+- 3 duplex framing tests (`run_with_streams` Ping, malformed-JSON yields Error, two requests on one connection);
+- 3 client tests against a real `UnixListener` (Ping round-trip, Unreachable on missing socket, request order preservation);
+- 3 `clhorde-cli flow` wrapper tests (verbatim arg forwarding via a fake binary, exit-code propagation, missing-binary path).
 
 ## Phase 4 — TUI restructure
 
@@ -496,8 +510,8 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 | **2.4** | ✅ shipped | Tera templates + prompt dispatch via daemon | First end-to-end run of a real workflow; 35 new tests. |
 | **2.5** | ✅ shipped | `openspec/changes/` snapshot in scheduler → `SetAnnotation` writes | User-visible auto-link, agnostic-daemon-friendly; 21 new tests. |
 | **2.6** | ✅ shipped | One-shot CLI subcommands implemented | Scriptable usage end-to-end; 23 new tests. |
-| **3**   | ⏳ pending | `clhorde-cli flow` wrappers + scheduler control socket | Single CLI entrypoint for users; remote-control of a long-lived scheduler. |
-| **4**   | ⏳ pending | TUI tabs (`Drafts`, `Workflows`) | First-class UX. |
+| **3**   | ✅ shipped | `clhorde-cli flow` wrappers + scheduler control socket | Single CLI entrypoint; live remote-control of a long-lived scheduler; 25 new tests. |
+| **4**   | ⏳ next | TUI tabs (`Drafts`, `Workflows`) | First-class UX. |
 | **5**   | ⏳ pending | Web routes + advanced (parallel safety, hooks, multi-repo) | Polish. |
 
 Each phase is independently shippable. Phase 0 alone is already a feature win; Phase 2.4 already produces value for users who want a scriptable workflow runner.
