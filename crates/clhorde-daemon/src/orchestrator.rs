@@ -94,6 +94,7 @@ impl Orchestrator {
                 prompt.worktree_id = pf.options.worktree_id.clone();
                 prompt.tags = pf.tags.clone();
                 prompt.depends_on = pf.depends_on.clone();
+                prompt.annotations = pf.annotations.clone();
                 prompt.status = status;
                 prompt.seen = true;
                 prompts.push(prompt);
@@ -190,6 +191,7 @@ impl Orchestrator {
             depends_on: prompt.depends_on.clone(),
             blocked_by,
             worktree_id: prompt.worktree_id.clone(),
+            annotations: prompt.annotations.clone(),
         }
     }
 
@@ -1038,6 +1040,29 @@ impl Orchestrator {
                 self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
                 self.dispatch_workers();
             }
+            ClientRequest::SetAnnotation {
+                prompt_id,
+                key,
+                value,
+            } => {
+                let Some(idx) = self.prompts.iter().position(|p| p.id == prompt_id) else {
+                    self.sessions.send_to(
+                        session_id,
+                        DaemonEvent::Error {
+                            message: format!("Unknown prompt {prompt_id}"),
+                        },
+                    );
+                    return;
+                };
+                if value.is_null() {
+                    self.prompts[idx].annotations.remove(&key);
+                } else {
+                    self.prompts[idx].annotations.insert(key, value);
+                }
+                self.persist_prompt_by_id(prompt_id);
+                let info = self.to_prompt_info(&self.prompts[idx]);
+                self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+            }
             ClientRequest::GetState => {
                 let state = self.to_daemon_state();
                 self.sessions
@@ -1676,6 +1701,161 @@ mod tests {
         orch.handle_request(ClientRequest::Unsubscribe, 1);
         let event = event_rx.try_recv().expect("should receive Unsubscribed");
         assert!(matches!(event, DaemonEvent::Unsubscribed));
+    }
+
+    // ── annotations (Phase 0.3) ──
+
+    #[tokio::test]
+    async fn set_annotation_inserts_value() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+
+        orch.handle_request(
+            ClientRequest::SetAnnotation {
+                prompt_id: 1,
+                key: "openspec.affected_changes".to_string(),
+                value: serde_json::json!(["add-oauth"]),
+            },
+            0,
+        );
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(
+            prompt.annotations["openspec.affected_changes"],
+            serde_json::json!(["add-oauth"])
+        );
+    }
+
+    #[tokio::test]
+    async fn set_annotation_overwrites_existing_value() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+
+        for value in [serde_json::json!("v1"), serde_json::json!("v2")] {
+            orch.handle_request(
+                ClientRequest::SetAnnotation {
+                    prompt_id: 1,
+                    key: "k".to_string(),
+                    value,
+                },
+                0,
+            );
+        }
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(prompt.annotations["k"], serde_json::json!("v2"));
+        assert_eq!(prompt.annotations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_annotation_null_removes_key() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+        orch.prompts[0]
+            .annotations
+            .insert("k".to_string(), serde_json::json!("v"));
+
+        orch.handle_request(
+            ClientRequest::SetAnnotation {
+                prompt_id: 1,
+                key: "k".to_string(),
+                value: serde_json::Value::Null,
+            },
+            0,
+        );
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert!(prompt.annotations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_annotation_unknown_prompt_returns_error() {
+        let mut orch = Orchestrator::new_for_test();
+
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        orch.sessions.add_session_with_id(7, event_tx);
+        orch.sessions.set_subscribed(7, true);
+
+        orch.handle_request(
+            ClientRequest::SetAnnotation {
+                prompt_id: 999,
+                key: "k".to_string(),
+                value: serde_json::json!("v"),
+            },
+            7,
+        );
+
+        let event = event_rx.try_recv().expect("expected Error event");
+        match event {
+            DaemonEvent::Error { message } => assert!(message.contains("999")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_annotation_broadcasts_prompt_updated() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        orch.sessions.add_session_with_id(7, event_tx);
+        orch.sessions.set_subscribed(7, true);
+
+        orch.handle_request(
+            ClientRequest::SetAnnotation {
+                prompt_id: 1,
+                key: "k".to_string(),
+                value: serde_json::json!("v"),
+            },
+            7,
+        );
+
+        let mut last_info: Option<PromptInfo> = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let DaemonEvent::PromptUpdated(info) = ev {
+                last_info = Some(info);
+            }
+        }
+        let info = last_info.expect("expected PromptUpdated");
+        assert_eq!(info.id, 1);
+        assert_eq!(info.annotations["k"], serde_json::json!("v"));
+    }
+
+    #[tokio::test]
+    async fn annotations_persist_through_restoration() {
+        // The orchestrator restores annotations from PromptFile on startup.
+        // Round-trip through PromptFile::from_prompt and back via the same
+        // restoration code path the daemon uses in `new()`.
+        use clhorde_core::persistence::PromptFile;
+
+        let mut prompt = clhorde_core::prompt::Prompt::new(
+            1,
+            "test".to_string(),
+            None,
+            PromptMode::Interactive,
+        );
+        prompt.annotations.insert(
+            "openspec.affected_changes".to_string(),
+            serde_json::json!(["add-oauth"]),
+        );
+        let pf = PromptFile::from_prompt(&prompt);
+        assert_eq!(
+            pf.annotations["openspec.affected_changes"],
+            serde_json::json!(["add-oauth"])
+        );
+
+        // Simulate restoration on a fresh prompt struct.
+        let mut restored = clhorde_core::prompt::Prompt::new(
+            1,
+            pf.prompt.clone(),
+            pf.options.context.clone(),
+            PromptMode::Interactive,
+        );
+        restored.annotations = pf.annotations.clone();
+        assert_eq!(
+            restored.annotations["openspec.affected_changes"],
+            serde_json::json!(["add-oauth"])
+        );
     }
 
     // ── dependencies ──

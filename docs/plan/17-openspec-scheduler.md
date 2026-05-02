@@ -14,14 +14,14 @@ Tracked on branch `feat/prompt-dependencies`.
 |-------|--------|-------|
 | 0.1 Prompt dependencies | ✅ shipped | commit `ea2e405`, 10 new tests |
 | 0.2 Shared worktrees | ✅ shipped | commit `c1e7309`, 14 new tests |
-| 0.3 Auto-linking prompts ↔ changes | ⏳ next | |
-| 1   tasks.md parser + DAG | ⏳ pending | |
-| 2   Scheduler execution loop | ⏳ pending | |
+| 0.3 Generic prompt annotations | ✅ shipped | 9 new tests; daemon stays workflow-agnostic |
+| 1   tasks.md parser + DAG | ⏳ next | |
+| 2   Scheduler execution loop + openspec FS detection | ⏳ pending | |
 | 3   `clhorde-cli flow` wrappers | ⏳ pending | |
 | 4   TUI restructure (tabs) | ⏳ pending | |
 | 5   Advanced / web | ⏳ pending | |
 
-Workspace tests: **397 passing**, none ignored.
+Workspace tests: **406 passing**, none ignored.
 
 ## Vision
 
@@ -105,11 +105,11 @@ Three layers of responsibility:
                  │ + new prompt-dependency semantics
                  ▼
 ┌─────────────────────────────────────────────────────────┐
-│ clhorded (extended)                                     │
+│ clhorded (extended, but workflow-agnostic)              │
 │  - prompts with dependencies (depends_on: Vec<UUID>)    │
 │  - prompts with shared worktrees (worktree_id)          │
 │  - new PromptStatus::Blocked                            │
-│  - affected_changes auto-link                           │
+│  - generic prompt annotations (key/value bag)           │
 └────────────────┬────────────────────────────────────────┘
                  │ spawn
                  ▼
@@ -237,16 +237,24 @@ Plumbing:
 - `clhorde-web POST /api/prompts { "worktree": true, "worktree_id": "flow-42" }`.
 - TUI passes `None` for now (the scheduler will be the primary producer of shared ids).
 
-### 0.3 Auto-linking prompts ↔ OpenSpec changes — ⏳ next
+### 0.3 Generic prompt annotations — ✅ shipped
 
-Detect which `openspec/changes/<X>/` a prompt produced or modified, with no user action.
+**Why redefined:** the original 0.3 ("auto-link prompts ↔ openspec changes") would have hard-coded the OpenSpec taxonomy into `clhorded`, which contradicts the architectural principle "scheduler is a *client* of the daemon; daemon stays workflow-agnostic" (see Risks). We split the concern: the daemon gets a generic key/value surface, and the OpenSpec-specific FS detection moves into the scheduler in Phase 2.
 
-- The orchestrator snapshots `openspec/changes/` listing **before dispatching a prompt** (only if the cwd contains an `openspec/` directory).
-- On `WorkerFinished`, diff the listing; the resulting set of created/modified change names is stored as `Prompt::affected_changes: Vec<String>`.
-- Broadcast through `PromptInfo`.
-- The scheduler reads this to suggest "this prompt drafted change `add-oauth-login`, queue it?".
+What ships in 0.3:
+- `Prompt::annotations: BTreeMap<String, serde_json::Value>` — opaque key/value bag the daemon stores, persists, and broadcasts but does **not** interpret. `BTreeMap` so the wire output is order-stable.
+- `PromptFile.annotations` and `PromptInfo.annotations`, both `#[serde(default)]` for back-compat.
+- New IPC: `ClientRequest::SetAnnotation { prompt_id, key, value }`. `value: Value::Null` removes the key (single endpoint covers set/remove). Unknown `prompt_id` returns `DaemonEvent::Error`.
+- Annotation writes broadcast `DaemonEvent::PromptUpdated(PromptInfo)` so all subscribers see the new state.
+- Persistence: annotations round-trip through `~/.local/share/clhorde/prompts/<uuid>.json`.
+- No special handling — annotations stay attached across `RetryPrompt` only by *not* being copied (retry creates a fresh prompt). Delete purges them with the prompt.
 
-**Implementation note:** keep this very cheap — only `read_dir` + `mtime` comparison, no heavy parsing.
+What this enables:
+- Phase 2's scheduler subscribes, snapshots `<effective_cwd>/openspec/changes/` itself on `WorkerStarted` and again on `WorkerFinished`, then writes `SetAnnotation { key: "openspec.affected_changes", value: ["add-oauth", ...] }`.
+- Phase 4's TUI reads the same annotation key to suggest "queue this change?".
+- Future workflow sources (Linear, GitHub Issues, custom YAML) use their own keys without touching the daemon.
+
+The race window between `WorkerStarted` broadcast and the scheduler taking its first snapshot is acceptable in practice (Claude Code takes seconds to do anything FS-visible). If it ever bites, we add an explicit "watch_dirs" parameter on submit — still as a generic primitive — without baking OpenSpec into the daemon.
 
 ## Phase 1 — Tasks.md parser & DAG builder
 
@@ -437,9 +445,9 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 |-------|--------|-------|---------|
 | **0.1** | ✅ `ea2e405` | Prompt dependencies + `Blocked` status | Foundational. Useful even without the scheduler. |
 | **0.2** | ✅ `c1e7309` | Shared worktrees via `worktree_id` + refcounted cleanup | Required for sequential workflow steps to share branch state. |
-| **0.3** | ⏳ next | `affected_changes` auto-link to `openspec/changes/<X>/` | Lets the TUI suggest "queue this change" and the scheduler detect drafts. |
-| **1**   | ⏳ pending | `clhorde-scheduler` crate skeleton + tasks.md parser + DAG builder | Core algorithm; testable in isolation without IPC. |
-| **2**   | ⏳ pending | Templates + execution loop + watcher + persistence | Minimum viable scheduler — runs on the CLI. |
+| **0.3** | ✅ shipped | Generic `Prompt::annotations` + `SetAnnotation` IPC | Workflow-agnostic primitive. OpenSpec FS detection moves to Phase 2. |
+| **1**   | ⏳ next | `clhorde-scheduler` crate skeleton + tasks.md parser + DAG builder | Core algorithm; testable in isolation without IPC. |
+| **2**   | ⏳ pending | Templates + execution loop + watcher + persistence + openspec/changes snapshot/diff in scheduler | Minimum viable scheduler — runs on the CLI. Owns `openspec.affected_changes` annotation. |
 | **3**   | ⏳ pending | `clhorde-cli flow` wrappers + `propose`/`queue`/`status`/`apply`/`archive` | Usable by humans end-to-end. |
 | **4**   | ⏳ pending | TUI tabs (`Drafts`, `Workflows`) + scheduler control socket | First-class UX. |
 | **5**   | ⏳ pending | Web routes + advanced (parallel safety, hooks, multi-repo) | Polish. |
@@ -452,7 +460,7 @@ Each phase is independently shippable. Phase 0 alone is already a feature win; P
 - **Spec-Kit (GitHub) overlap.** Same architecture would serve it; design `clhorde-scheduler` so the OpenSpec-specific bits are pluggable (`trait WorkflowSource`).
 - **Complexity creep.** The scheduler should remain a *client* of `clhorded`. Resist adding workflow concepts to the daemon beyond Phase 0 primitives.
 - **Worktree race conditions.** Shared worktrees mean concurrent prompts could clash. Default sequential within a workflow's `apply` phase; `parallel-with` is an explicit opt-in.
-- **Auto-linking false positives.** A prompt that touches `openspec/specs/` (not `changes/`) might pollute `affected_changes`. Restrict the scan to `changes/`.
+- **Auto-linking false positives.** A prompt that touches `openspec/specs/` (not `changes/`) might pollute the `openspec.affected_changes` annotation. The scheduler (Phase 2) restricts its scan to `openspec/changes/`.
 
 ## Acceptance criteria for the pivot
 

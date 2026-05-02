@@ -1877,6 +1877,7 @@ mod tests {
             depends_on: Vec::new(),
             blocked_by: Vec::new(),
             worktree_id: None,
+            annotations: std::collections::BTreeMap::new(),
         }
     }
 

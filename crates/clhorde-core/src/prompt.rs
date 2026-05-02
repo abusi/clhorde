@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PromptMode {
@@ -95,6 +98,11 @@ pub struct Prompt {
     pub tags: Vec<String>,
     /// UUIDs of prompts that must be Completed before this one can dispatch.
     pub depends_on: Vec<String>,
+    /// Opaque key/value bag for clients to attach domain-specific metadata
+    /// (e.g. the scheduler stores `openspec.affected_changes` here). The
+    /// daemon stores, persists, and broadcasts this map but never interprets
+    /// its contents. `BTreeMap` for stable serialization order.
+    pub annotations: BTreeMap<String, Value>,
 }
 
 impl Prompt {
@@ -119,6 +127,7 @@ impl Prompt {
             worktree_id: None,
             tags: Vec::new(),
             depends_on: Vec::new(),
+            annotations: BTreeMap::new(),
         }
     }
 
@@ -293,6 +302,7 @@ mod tests {
         assert!(p.finished_at_ms.is_none());
         assert!(!p.seen);
         assert!(p.depends_on.is_empty());
+        assert!(p.annotations.is_empty());
     }
 
     #[test]

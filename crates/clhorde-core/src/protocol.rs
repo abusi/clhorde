@@ -1,6 +1,9 @@
 //! IPC protocol message types for daemon <-> TUI/CLI communication.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Current protocol version. Increment when making breaking changes to
 /// `ClientRequest`, `DaemonEvent`, or `DaemonState`.
@@ -63,6 +66,14 @@ pub enum ClientRequest {
     SetDependencies {
         prompt_id: usize,
         depends_on: Vec<usize>,
+    },
+    /// Write or remove a single annotation on a prompt. The daemon stores
+    /// the value verbatim and never interprets it. Pass `Value::Null` to
+    /// remove the key. Unknown `prompt_id` returns `DaemonEvent::Error`.
+    SetAnnotation {
+        prompt_id: usize,
+        key: String,
+        value: Value,
     },
     GetState,
     GetPromptOutput {
@@ -195,6 +206,10 @@ pub struct PromptInfo {
     /// Shared worktree key, if any.
     #[serde(default)]
     pub worktree_id: Option<String>,
+    /// Opaque annotations attached by clients. The daemon does not interpret
+    /// these — see `Prompt::annotations`.
+    #[serde(default)]
+    pub annotations: BTreeMap<String, Value>,
 }
 
 impl PromptInfo {
