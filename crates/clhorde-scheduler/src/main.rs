@@ -1,16 +1,17 @@
 //! `clhorde-scheduler` binary entrypoint.
 //!
-//! Phase 2.3 wires the FS watcher and orchestrator into the long-lived
-//! `daemon` subcommand: on startup the orchestrator reconciles against
-//! disk, then the watcher streams `FsEvent`s for the orchestrator to apply.
-//! Prompt dispatch lands in Phase 2.4. Other subcommands are still stubs
-//! until Phase 2.6.
+//! - `daemon` runs the long-lived watcher (FS + daemon events drive the
+//!   orchestrator).
+//! - Every other subcommand is a one-shot wrapper around a function in
+//!   [`clhorde_scheduler::commands`]. The bodies live there so they can be
+//!   unit-tested without spawning a process.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use clhorde_scheduler::cli::{Cli, Command, DaemonArgs};
+use clhorde_scheduler::cli::{Cli, Command, DaemonArgs, TemplatesAction};
+use clhorde_scheduler::commands::{self, CommandError, CommandOutput};
 use clhorde_scheduler::daemon_client::{self, DaemonMessage};
 use clhorde_scheduler::orchestrator::Orchestrator;
 use clhorde_scheduler::persistence::WorkflowStore;
@@ -27,18 +28,62 @@ async fn main() -> ExitCode {
 
     match cli.command {
         Command::Daemon(args) => run_daemon(args).await,
-        Command::Apply(_)
-        | Command::Archive(_)
-        | Command::Cancel(_)
-        | Command::Drafts(_)
-        | Command::Propose(_)
-        | Command::Queue(_)
-        | Command::Retry(_)
-        | Command::Status(_)
-        | Command::Templates(_)
-        | Command::Unqueue(_) => {
-            eprintln!("This subcommand is not implemented yet (Phase 2.6+).");
-            ExitCode::from(2)
+        Command::Queue(args) => run_one_shot(commands::queue(args)),
+        Command::Unqueue(args) => {
+            run_one_shot(commands::unqueue(args, None))
+        }
+        Command::Drafts(args) => run_one_shot(commands::drafts(args)),
+        Command::Status(args) => match WorkflowStore::open_default() {
+            Ok(store) => run_one_shot(commands::status(args, &store)),
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
+        },
+        Command::Templates(args) => match args.action {
+            TemplatesAction::Path => run_one_shot(commands::templates_path()),
+            TemplatesAction::Edit => run_one_shot(commands::templates_edit(None)),
+        },
+        Command::Cancel(args) => match WorkflowStore::open_default() {
+            Ok(store) => run_one_shot(commands::cancel(args, None, &store)),
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
+        },
+        Command::Apply(args) => run_one_shot(commands::apply(args).await),
+        Command::Archive(args) => {
+            run_one_shot(commands::archive(args, None).await)
+        }
+        Command::Propose(args) => run_one_shot(commands::propose(args).await),
+        Command::Retry(args) => match WorkflowStore::open_default() {
+            Ok(store) => {
+                run_one_shot(commands::retry(args, None, &store).await)
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
+        },
+    }
+}
+
+/// Adapt a `Result<CommandOutput, CommandError>` to an `ExitCode`. Stdout is
+/// printed verbatim; errors go to stderr and yield `1`.
+fn run_one_shot(result: Result<CommandOutput, CommandError>) -> ExitCode {
+    match result {
+        Ok(out) => {
+            if !out.stdout.is_empty() {
+                print!("{}", out.stdout);
+            }
+            if !out.stderr.is_empty() {
+                eprint!("{}", out.stderr);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
         }
     }
 }

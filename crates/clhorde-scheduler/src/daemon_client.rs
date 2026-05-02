@@ -48,6 +48,78 @@ pub async fn connect() -> Result<
     Ok(spawn_loops(reader, writer))
 }
 
+/// Errors from one-shot CLI flows. Surfaced to the user as the "Is the
+/// daemon running?" message in the CLI wrapper.
+#[derive(Debug)]
+pub enum OneShotError {
+    /// Could not connect — daemon not running, socket missing, perms wrong.
+    Unreachable(io::Error),
+    /// The writer or reader half closed mid-send. Usually means the daemon
+    /// crashed while we were talking to it.
+    Disconnected,
+    /// The daemon never replied with a Pong within the budget. The caller
+    /// should treat this as a failure: we don't know whether the daemon
+    /// processed the requests.
+    Timeout,
+}
+
+impl std::fmt::Display for OneShotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OneShotError::Unreachable(e) => {
+                write!(f, "cannot reach daemon ({e}). Is it running? Start with: clhorded")
+            }
+            OneShotError::Disconnected => write!(f, "daemon disconnected mid-send"),
+            OneShotError::Timeout => write!(f, "timed out waiting for daemon Pong"),
+        }
+    }
+}
+
+impl std::error::Error for OneShotError {}
+
+/// Default budget for [`send_one_shot`] before declaring [`OneShotError::Timeout`].
+pub const ONE_SHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send a sequence of requests over a fresh, short-lived daemon connection.
+///
+/// After the requests, a [`ClientRequest::Ping`] is appended. The daemon
+/// processes requests in order, so a `Pong` reply guarantees every prior
+/// request was received and dequeued. Without this fence we'd race the
+/// connection close against the daemon reading our final frame.
+pub async fn send_one_shot(
+    requests: Vec<ClientRequest>,
+) -> Result<(), OneShotError> {
+    let (tx, rx) = connect().await.map_err(OneShotError::Unreachable)?;
+    drive_one_shot(tx, rx, requests, ONE_SHOT_TIMEOUT).await
+}
+
+/// Test hook for [`send_one_shot`] that doesn't open a real Unix socket.
+pub async fn drive_one_shot(
+    tx: mpsc::UnboundedSender<ClientRequest>,
+    mut rx: mpsc::UnboundedReceiver<DaemonMessage>,
+    requests: Vec<ClientRequest>,
+    timeout: std::time::Duration,
+) -> Result<(), OneShotError> {
+    for req in requests {
+        tx.send(req).map_err(|_| OneShotError::Disconnected)?;
+    }
+    tx.send(ClientRequest::Ping)
+        .map_err(|_| OneShotError::Disconnected)?;
+
+    loop {
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(DaemonMessage::Event(ev))) => match *ev {
+                clhorde_core::protocol::DaemonEvent::Pong => return Ok(()),
+                _ => continue,
+            },
+            Ok(Some(DaemonMessage::Disconnected)) | Ok(None) => {
+                return Err(OneShotError::Disconnected);
+            }
+            Err(_) => return Err(OneShotError::Timeout),
+        }
+    }
+}
+
 /// Test-friendly hook: take any AsyncRead/AsyncWrite halves and run the same
 /// read/write loops the production path uses. Lets us drive both ends of a
 /// `tokio::io::duplex` pair in unit tests.
@@ -288,5 +360,97 @@ mod tests {
             },
             other => panic!("expected Event, got {other:?}"),
         }
+    }
+
+    // ── one-shot helper ──
+
+    #[tokio::test]
+    async fn one_shot_returns_after_pong() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<ClientRequest>();
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<DaemonMessage>();
+
+        // Fake daemon: feed back a Pong as soon as we see the Ping.
+        tokio::spawn(async move {
+            while let Some(req) = req_rx.recv().await {
+                if matches!(req, ClientRequest::Ping) {
+                    let _ = msg_tx
+                        .send(DaemonMessage::Event(Box::new(DaemonEvent::Pong)));
+                    break;
+                }
+            }
+        });
+
+        let result = drive_one_shot(
+            req_tx,
+            msg_rx,
+            vec![ClientRequest::Subscribe],
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(result, Ok(())));
+    }
+
+    #[tokio::test]
+    async fn one_shot_times_out_when_daemon_silent() {
+        let (req_tx, _req_rx) = mpsc::unbounded_channel::<ClientRequest>();
+        let (_msg_tx, msg_rx) = mpsc::unbounded_channel::<DaemonMessage>();
+        // No fake daemon — Ping never gets a response.
+        let result = drive_one_shot(
+            req_tx,
+            msg_rx,
+            vec![ClientRequest::Subscribe],
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(matches!(result, Err(OneShotError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn one_shot_reports_disconnect() {
+        let (req_tx, _req_rx) = mpsc::unbounded_channel::<ClientRequest>();
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<DaemonMessage>();
+        // Drop the daemon side immediately.
+        drop(msg_tx);
+
+        let result = drive_one_shot(
+            req_tx,
+            msg_rx,
+            vec![ClientRequest::Subscribe],
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, Err(OneShotError::Disconnected)));
+    }
+
+    #[tokio::test]
+    async fn one_shot_skips_irrelevant_events_until_pong() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<ClientRequest>();
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<DaemonMessage>();
+
+        // Daemon emits a couple of unrelated events before the Pong.
+        tokio::spawn(async move {
+            while let Some(req) = req_rx.recv().await {
+                if matches!(req, ClientRequest::Ping) {
+                    let _ = msg_tx.send(DaemonMessage::Event(Box::new(
+                        DaemonEvent::MaxWorkersChanged { count: 3 },
+                    )));
+                    let _ = msg_tx.send(DaemonMessage::Event(Box::new(
+                        DaemonEvent::ActiveWorkersChanged { count: 1 },
+                    )));
+                    let _ = msg_tx
+                        .send(DaemonMessage::Event(Box::new(DaemonEvent::Pong)));
+                    break;
+                }
+            }
+        });
+
+        let result = drive_one_shot(
+            req_tx,
+            msg_rx,
+            vec![ClientRequest::Subscribe],
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(result, Ok(())));
     }
 }

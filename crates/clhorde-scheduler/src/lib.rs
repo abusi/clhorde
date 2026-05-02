@@ -14,6 +14,7 @@
 //! lands in 2.2+.
 
 pub mod cli;
+pub mod commands;
 pub mod daemon_client;
 pub mod dispatch;
 pub mod openspec;
