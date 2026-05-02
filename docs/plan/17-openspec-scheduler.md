@@ -335,17 +335,52 @@ Granularity decides the prompt unit:
 - `task`: one prompt per `- [ ]` item — only if explicitly set, since context overhead is steep.
 - `phase`: one prompt for the entire `apply` — fallback to OpenSpec's native flow.
 
-## Phase 2 — Prompt templates
+## Phase 2 — Scheduler runtime
 
-A directory `~/.config/clhorde/scheduler/templates/` with [Tera](https://keats.github.io/tera/) templates:
+The full execution loop, broken into shippable slices. Each sub-phase ends with a green test suite and its own commit so we can land it incrementally.
 
-```
-templates/
-├── propose.md         # vars: {{idea}}, {{repo_name}}
-├── apply-section.md   # vars: {{change_name}}, {{section_id}}, {{section_title}}, {{tasks_block}}, {{change_dir}}
-├── verify.md          # vars: {{change_name}}
-└── archive.md         # vars: {{change_name}}
-```
+### 2.1 Binary skeleton + daemon client — ✅ shipped (`9382e38`)
+
+Delivered:
+- `clhorde-scheduler::cli` — clap-derive subcommand types (`daemon`, `apply`, `archive`, `cancel`, `drafts`, `propose`, `queue`, `unqueue`, `retry`, `status`, `templates path|edit`). Global `--log` flag for tracing filter override. Pure parsing, no IPC — fully unit-testable.
+- `clhorde-scheduler::daemon_client` — long-lived async IPC connector mirroring the TUI's pattern. Reader and writer drive independent `tokio::spawn` tasks fed by `mpsc` channels; PTY frames are dropped (the scheduler only reads structured events), malformed JSON is logged and skipped without disconnecting. `spawn_loops` exposed for in-memory testing via `tokio::io::duplex`.
+- `main.rs` — runtime, tracing, and a `daemon` subcommand that subscribes and idles until SIGINT, reconnecting with backoff when the daemon goes away. All other subcommands stub out (return exit code 2) until 2.6.
+- 17 new tests: 12 CLI parsing scenarios + 5 daemon-client lifecycle (event delivery, disconnect, PTY filter, malformed JSON resilience, state-snapshot round-trip).
+
+Latent issue surfaced here for follow-up: `ClientRequest::SetMaxWorkers(usize)` is a newtype variant containing a primitive, which `serde_json` cannot serialize under `#[serde(tag = "type")]`. Tracked as a separate fix; doesn't block the scheduler since we don't issue that request from here.
+
+### 2.2 Discovery + workflow types + persistence — ⏳ next
+
+Scope:
+- `openspec/discovery.rs` — `scan(root) -> Vec<DiscoveredChange>` walks `<root>/openspec/changes/*/`, classifies each as `Drafted` (no `.clhorde-ready`) or `Queued` (marker present). Reads optional metadata from the marker (priority, `depends_on`, `worktree_branch`, `parallel_sections`, `max_section_retries`).
+- `workflow.rs` — `Workflow { name, status, dag, started_at, prompt_ids, ... }` plus a pure state machine for `Drafted → Queued → Implementing → Verifying → Archiving → Archived` (+ `Failed { reason }`, `Cancelled`). Transition functions return `Result` so invalid moves surface clearly.
+- `persistence.rs` — `~/.local/share/clhorde/workflows/<name>.json` save/load/delete with `#[serde(default)]` on every new field for back-compat.
+
+Tests:
+- Discovery on temp-dir fixtures: empty repo, draft only, marker only, both, malformed marker.
+- Marker parsing: empty body (all defaults), each individual field, unknown fields ignored.
+- State machine: every legal transition + a sample of illegal ones (e.g. `Archived → Implementing`).
+- Persistence round-trip + back-compat for a future field.
+
+**Marker format:** TOML rather than YAML — already in workspace deps, no new dependency, and the marker payload is small enough that human readability isn't impacted.
+
+### 2.3 FS watcher + state machine wiring — ⏳ pending
+
+Scope:
+- `watcher.rs` using `notify` for `openspec/changes/**/.clhorde-ready` (created/removed) and `openspec/changes/**/tasks.md` (modified). Debounce via `notify_debouncer_full` to absorb editor save bursts.
+- Glue in `orchestrator.rs`: on marker created → `Workflow::start`, on marker removed → `Workflow::cancel`, on tasks.md modified → re-parse and refresh node `done` state. No prompt dispatch yet — only state transitions and persistence.
+- Hook discovery on startup so existing markers come back into the active set after a scheduler restart.
+
+Tests:
+- Synthetic FS events drive the state machine via the `notify` debouncer's test mode (no real watcher).
+- Restart: pre-populate workflows on disk + markers on disk, assert reconciliation.
+
+### 2.4 Templates + prompt dispatch — ⏳ pending
+
+Scope:
+- `templates.rs` — Tera engine loading from `~/.config/clhorde/scheduler/templates/` with sane built-in defaults (`propose.md`, `apply-section.md`, `verify.md`, `archive.md`). Per-project override at `openspec/.clhorde-scheduler/templates/`.
+- DAG → prompt translation: for each runnable node, render the template, then submit a prompt to the daemon with `depends_on` populated from already-dispatched predecessor UUIDs and `worktree_id` set to the workflow id (so all of a workflow's prompts share one branch state).
+- `tasks.md` is the source of truth for completion: on `WorkerFinished` re-parse and decide section/task `done`-ness. Worker exited 0 but tasks unchecked → configurable (`pause` default, `retry` opt-in).
 
 Default `apply-section.md`:
 
@@ -369,42 +404,41 @@ Run any relevant tests after the section. If tests fail, fix and re-run.
 Stop when all tasks of this section are checked.
 ```
 
-Per-project override: `openspec/.clhorde-scheduler/templates/` takes precedence over the user-level one.
+Tests:
+- Template rendering for each phase template against a fixture workflow.
+- Template override resolution (per-project beats user beats built-in).
+- Dispatch decisions: pure `next_runnable_nodes(dag, completed_set)` returning the indices that should fire now.
 
-## Phase 3 — Workflow execution loop
+### 2.5 OpenSpec FS detection in the scheduler — ⏳ pending
 
-The scheduler's main loop, in pseudocode:
+Scope:
+- Move the `openspec/changes/` snapshot/diff (originally proposed as Phase 0.3) into the scheduler. Snapshot is taken locally at the moment a `WorkerStarted { prompt_id, … }` event lands; second snapshot at `WorkerFinished`. Diff produces a sorted list of touched change names.
+- Write the result back to the daemon as `ClientRequest::SetAnnotation { prompt_id, key: "openspec.affected_changes", value: [...] }` (the primitive shipped in Phase 0.3).
+- TUI / Drafts tab consumes the same annotation later in Phase 4.
 
-```rust
-loop {
-    select! {
-        // 1. New / removed marker files
-        ev = fs_watcher.recv() => match ev {
-            Created(.clhorde-ready) => start_workflow(change_name),
-            Removed(.clhorde-ready) => maybe_cancel(change_name),
-            Modified(tasks.md)      => refresh_workflow_state(change_name),
-        },
+Tests:
+- Pure snapshot/diff tests on temp-dir fixtures (already prototyped during the Phase 0.3 reshape; we keep the same shape, only the host crate moves).
+- End-to-end: synthetic `WorkerStarted` / `WorkerFinished` events drive the scheduler, expected `SetAnnotation` request appears on the outbound mpsc channel.
 
-        // 2. Daemon events (we are subscribed)
-        ev = daemon.recv() => match ev {
-            WorkerFinished { prompt_id, exit_code } => {
-                if let Some(workflow) = lookup_by_prompt(prompt_id) {
-                    workflow.on_prompt_done(prompt_id, exit_code);
-                    // re-read tasks.md, advance phase, dispatch next prompts
-                }
-            }
-            // ...
-        },
+### 2.6 CLI subcommands wired through — ⏳ pending
 
-        // 3. CLI requests on a control socket (status, cancel, retry)
-        cmd = ctrl.recv() => handle_ctrl(cmd),
-    }
-}
-```
+Scope:
+- Replace the stub bodies for `apply`, `archive`, `cancel`, `drafts`, `propose`, `queue`, `unqueue`, `retry`, `status`, `templates path|edit` with real implementations. One-shot subcommands open a short-lived daemon connection, the long-lived watcher already lives in `daemon`.
+- A scheduler-side control socket (`~/.local/share/clhorde/scheduler.sock`) is *not* required at this stage — short-lived subcommands can reach the daemon directly and address workflows by name.
+- `clhorde-cli flow <subcommand>` wrappers that exec into `clhorde-scheduler <subcommand>` so users only need to learn one CLI. (Strictly that's Phase 3 — listed here only because the bridge is trivial.)
 
-Dispatching a workflow phase = computing the set of currently-runnable nodes from the DAG, templating their prompts, and submitting them with `depends_on` filled in by the previous-section UUIDs and `worktree_id` set to the workflow id.
+Tests:
+- Each subcommand path: build the expected `ClientRequest` (or FS effect) and assert it.
+- Failure paths: daemon down → exit code 1 with the standard "Is it running?" message.
 
-The scheduler **trusts `tasks.md` as the source of truth for completion**. After each `WorkerFinished`, it re-parses `tasks.md`. A section is "done" when all its `- [ ]` are now `- [x]`. If the worker exited 0 but tasks weren't all checked, the scheduler can either retry or pause and ask (configurable, default: pause).
+## Phase 3 — `clhorde-cli flow` + scheduler control socket — ⏳ pending
+
+Two pieces, both small once Phase 2 has landed:
+
+1. **`clhorde-cli flow <subcommand>`** — thin wrappers that exec `clhorde-scheduler <subcommand>` with the same args, so users learn a single CLI. Implementation: `Command::new(...).args(...).status()`. Argument forwarding is verbatim; we don't try to re-derive a clap surface in `clhorde-cli`.
+2. **Scheduler control socket** at `~/.local/share/clhorde/scheduler.sock`. Until Phase 3 the long-lived `daemon` subcommand is talk-only over the daemon socket; one-shot CLI commands address the daemon directly. The control socket lets the TUI (Phase 4) and `clhorde-cli flow status` ask the *running scheduler* for live workflow state without re-reading every `~/.local/share/clhorde/workflows/*.json` file. Same length-delimited frame protocol as `clhorded`'s socket; minimal request set: `Status`, `Cancel`, `Retry { name, section }`.
+
+Tests: control-socket round-trips driven through `tokio::io::duplex`, mirroring the daemon-client tests.
 
 ## Phase 4 — TUI restructure
 
@@ -470,12 +504,17 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 | **0.2** | ✅ `c1e7309` | Shared worktrees via `worktree_id` + refcounted cleanup | Required for sequential workflow steps to share branch state. |
 | **0.3** | ✅ shipped | Generic `Prompt::annotations` + `SetAnnotation` IPC | Workflow-agnostic primitive. OpenSpec FS detection moves to Phase 2. |
 | **1**   | ✅ shipped | `clhorde-scheduler` crate skeleton + tasks.md parser + DAG builder | Core algorithm; testable in isolation without IPC. |
-| **2**   | ⏳ next | Templates + execution loop + watcher + persistence + openspec/changes snapshot/diff in scheduler | Minimum viable scheduler — runs on the CLI. Owns `openspec.affected_changes` annotation. |
-| **3**   | ⏳ pending | `clhorde-cli flow` wrappers + `propose`/`queue`/`status`/`apply`/`archive` | Usable by humans end-to-end. |
-| **4**   | ⏳ pending | TUI tabs (`Drafts`, `Workflows`) + scheduler control socket | First-class UX. |
+| **2.1** | ✅ `9382e38` | Binary skeleton + clap CLI + long-lived daemon client | Foundation; all later sub-phases bolt onto this. |
+| **2.2** | ⏳ next | Discovery + workflow types + persistence | Pure data layer; testable without the watcher. |
+| **2.3** | ⏳ pending | FS watcher + state machine wiring | Reactivity without prompt dispatch yet. |
+| **2.4** | ⏳ pending | Tera templates + prompt dispatch via daemon | First end-to-end run of a real workflow. |
+| **2.5** | ⏳ pending | `openspec/changes/` snapshot in scheduler → `SetAnnotation` writes | Restores the user-visible auto-link feature, agnostic-daemon-friendly. |
+| **2.6** | ⏳ pending | One-shot CLI subcommands implemented | Scriptable usage; `clhorde-scheduler queue add-oauth` etc. |
+| **3**   | ⏳ pending | `clhorde-cli flow` wrappers + scheduler control socket | Single CLI entrypoint for users; remote-control of a long-lived scheduler. |
+| **4**   | ⏳ pending | TUI tabs (`Drafts`, `Workflows`) | First-class UX. |
 | **5**   | ⏳ pending | Web routes + advanced (parallel safety, hooks, multi-repo) | Polish. |
 
-Each phase is independently shippable. Phase 0 alone is already a feature win; Phase 2 already produces value for users who want a scriptable workflow runner.
+Each phase is independently shippable. Phase 0 alone is already a feature win; Phase 2.4 already produces value for users who want a scriptable workflow runner.
 
 ## Risks
 
