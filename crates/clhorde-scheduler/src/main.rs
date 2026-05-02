@@ -1,15 +1,22 @@
 //! `clhorde-scheduler` binary entrypoint.
 //!
-//! Phase 2.1 wires up the CLI and the long-lived `daemon` subcommand to the
-//! daemon over IPC. Subscribe + log incoming events; idle until SIGINT.
-//! Workflow logic (FS watcher, dispatch, archiving) lands in 2.2+.
+//! Phase 2.3 wires the FS watcher and orchestrator into the long-lived
+//! `daemon` subcommand: on startup the orchestrator reconciles against
+//! disk, then the watcher streams `FsEvent`s for the orchestrator to apply.
+//! Prompt dispatch lands in Phase 2.4. Other subcommands are still stubs
+//! until Phase 2.6.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use clhorde_scheduler::cli::{Cli, Command};
+use clhorde_scheduler::cli::{Cli, Command, DaemonArgs};
 use clhorde_scheduler::daemon_client::{self, DaemonMessage};
+use clhorde_scheduler::orchestrator::Orchestrator;
+use clhorde_scheduler::persistence::WorkflowStore;
+use clhorde_scheduler::watcher::{self, FsEvent};
 use clhorde_core::protocol::ClientRequest;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -19,7 +26,7 @@ async fn main() -> ExitCode {
     init_tracing(cli.log.as_deref());
 
     match cli.command {
-        Command::Daemon(_) => run_daemon().await,
+        Command::Daemon(args) => run_daemon(args).await,
         Command::Apply(_)
         | Command::Archive(_)
         | Command::Cancel(_)
@@ -30,7 +37,7 @@ async fn main() -> ExitCode {
         | Command::Status(_)
         | Command::Templates(_)
         | Command::Unqueue(_) => {
-            eprintln!("This subcommand is not implemented yet (Phase 2.2+).");
+            eprintln!("This subcommand is not implemented yet (Phase 2.6+).");
             ExitCode::from(2)
         }
     }
@@ -48,10 +55,48 @@ fn init_tracing(override_filter: Option<&str>) {
         .init();
 }
 
-/// `daemon` subcommand: connect, subscribe, idle until SIGINT, reconnecting
-/// when the daemon goes away.
-async fn run_daemon() -> ExitCode {
+/// `daemon` subcommand: reconcile against disk, spawn the FS watcher, then
+/// keep a long-lived daemon connection open while applying watcher events
+/// to the orchestrator. Reconnects to the daemon with backoff; the watcher
+/// stays up across daemon disconnects.
+async fn run_daemon(args: DaemonArgs) -> ExitCode {
     info!("clhorde-scheduler daemon starting");
+
+    let root = match resolve_root(args.root) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Cannot resolve scheduler root: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    info!(root = %root.display(), "scheduler root");
+
+    let store = match WorkflowStore::open_default() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Cannot open workflow store: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut orch = Orchestrator::new(root.clone(), store);
+    if let Err(e) = orch.reconcile() {
+        warn!(error = %e, "initial reconcile failed; continuing");
+    }
+
+    let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<FsEvent>();
+    let _watcher_handle = match watcher::spawn(root.clone(), fs_tx) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            // Watcher failure is recoverable — the daemon connection still
+            // works, the user just doesn't get reactive workflow updates
+            // until the next manual `apply`. Log and proceed.
+            warn!(
+                error = %e,
+                "filesystem watcher could not start; reactive workflow updates disabled"
+            );
+            None
+        }
+    };
 
     loop {
         match daemon_client::connect().await {
@@ -74,6 +119,17 @@ async fn run_daemon() -> ExitCode {
                                 break;
                             }
                         },
+                        ev = fs_rx.recv() => match ev {
+                            Some(ev) => {
+                                tracing::debug!(?ev, "fs event");
+                                if let Err(e) = orch.handle_event(ev) {
+                                    warn!(error = %e, "orchestrator event failed");
+                                }
+                            }
+                            None => {
+                                warn!("scheduler: fs watcher channel closed");
+                            }
+                        },
                         _ = tokio::signal::ctrl_c() => {
                             info!("scheduler: SIGINT received, shutting down");
                             return ExitCode::SUCCESS;
@@ -86,7 +142,14 @@ async fn run_daemon() -> ExitCode {
             }
         }
 
-        // Wait before retrying so we don't spin if the daemon is down.
+        // Drain any FS events that arrived while we were disconnected so we
+        // don't lose them on the next reconnect.
+        while let Ok(ev) = fs_rx.try_recv() {
+            if let Err(e) = orch.handle_event(ev) {
+                warn!(error = %e, "orchestrator event failed during reconnect");
+            }
+        }
+
         tokio::select! {
             _ = sleep_backoff() => {}
             _ = tokio::signal::ctrl_c() => {
@@ -94,6 +157,13 @@ async fn run_daemon() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
         }
+    }
+}
+
+fn resolve_root(arg: Option<PathBuf>) -> std::io::Result<PathBuf> {
+    match arg {
+        Some(p) => Ok(p),
+        None => std::env::current_dir(),
     }
 }
 
