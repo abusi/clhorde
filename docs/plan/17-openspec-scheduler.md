@@ -21,12 +21,12 @@ Tracked on branch `feat/prompt-dependencies`.
 | 2.3 FS watcher + state machine | ✅ shipped | `notify_debouncer_full`, orchestrator + reconcile; 26 new tests |
 | 2.4 Templates + dispatch | ✅ shipped | Tera engine, DAG dispatch, apply→verify→archive lifecycle; 35 new tests |
 | 2.5 openspec/changes/ snapshot in scheduler | ✅ shipped | content-hash snapshot/diff + `SetAnnotation` writes on every observed worker; 21 new tests |
-| 2.6 CLI subcommands wired to daemon | ⏳ next | |
-| 3   `clhorde-cli flow` wrappers | ⏳ pending | |
+| 2.6 CLI subcommands wired to daemon | ✅ shipped | every stub replaced; one-shot `Ping`/`Pong` fence; 23 new tests |
+| 3   `clhorde-cli flow` wrappers | ⏳ next | |
 | 4   TUI restructure (tabs) | ⏳ pending | |
 | 5   Advanced / web | ⏳ pending | |
 
-Workspace tests: **590 passing**, none ignored.
+Workspace tests: **613 passing**, none ignored.
 
 ## Vision
 
@@ -397,16 +397,25 @@ Delivered:
 
 21 new tests (workspace 569 → 590): 14 pure snapshot/diff cases (added/removed/modified files, nested specs/, dotfile filtering, scope limited to `openspec/changes/`) + 7 orchestrator scenarios driving synthetic daemon events through the outbound channel and asserting on the resulting `SetAnnotation` payloads (full diff, empty diff, missing baseline, missing cwd, worktree precedence, `PromptRemoved` cleanup, `StateSnapshot` cwd backfill).
 
-### 2.6 CLI subcommands wired through — ⏳ pending
+### 2.6 CLI subcommands wired through — ✅ shipped
 
-Scope:
-- Replace the stub bodies for `apply`, `archive`, `cancel`, `drafts`, `propose`, `queue`, `unqueue`, `retry`, `status`, `templates path|edit` with real implementations. One-shot subcommands open a short-lived daemon connection, the long-lived watcher already lives in `daemon`.
-- A scheduler-side control socket (`~/.local/share/clhorde/scheduler.sock`) is *not* required at this stage — short-lived subcommands can reach the daemon directly and address workflows by name.
-- `clhorde-cli flow <subcommand>` wrappers that exec into `clhorde-scheduler <subcommand>` so users only need to learn one CLI. (Strictly that's Phase 3 — listed here only because the bridge is trivial.)
+Delivered:
+- New `commands.rs` module: every previously-stubbed subcommand (`queue`, `unqueue`, `drafts`, `status`, `templates path|edit`, `apply`, `archive`, `cancel`, `retry`, `propose`) is implemented as a pure function returning `Result<CommandOutput, CommandError>`. `main.rs` adapts the result to an `ExitCode` and writes stdout/stderr — the body is testable without spawning a process.
+- FS-only flows touch `<root>/openspec/changes/` and `~/.local/share/clhorde/workflows/` directly:
+  - `queue` writes the TOML marker; refuses if `openspec/changes/<name>/` doesn't exist.
+  - `unqueue` removes the marker; missing marker is idempotent.
+  - `drafts` filters `discovery::scan` for `Drafted` and prints sorted names.
+  - `status` either lists every workflow as `<name>: <status> (<detail>)` or, when `<name>` is given, prints a labeled `key: value` block (priority, depends_on, queued_at, started_at, finished_at, prompt UUIDs). Missing workflow is an error.
+  - `templates path` prints `~/.config/clhorde/scheduler/templates/`. `templates edit` creates the directory if missing then runs `$EDITOR` (with `$VISUAL` and `vi` fallbacks); failures propagate.
+- Daemon-coupled flows go through a new `daemon_client::send_one_shot(requests)` helper that connects, sends every request, then sends a `Ping` and waits for `Pong` so we know the daemon dequeued every prior frame before we disconnect (otherwise the close races the daemon's read). Errors map to `OneShotError::{Unreachable, Disconnected, Timeout}` with the canonical "Is it running? Start with: clhorded" message on `Unreachable`.
+- `apply <name>`: builds an in-process `Orchestrator` (no watcher), reconciles, calls `try_advance(name)`, drains the outbound channel, and ships every queued `SubmitPrompt` through the one-shot helper. Re-running picks up the next wave.
+- `archive <name>`: renders the `archive` template and ships one `SubmitPrompt` with the canonical archive tag.
+- `propose <idea>`: renders the `propose` template, ships one `SubmitPrompt` with `worktree=false` (the directory it'll create lives in the main repo, not a worktree).
+- `cancel <name>`: removes the marker if present and updates the persisted workflow (`unqueue` if Queued, `cancel` if running). Daemon-side worker termination is intentionally not done here — a watching scheduler picks up the marker removal and cancels through the orchestrator. Standalone callers without a running scheduler get the persisted-state update for free.
+- `retry <name> --section N`: resets `Failed` workflows back to `Implementing`, re-parses `tasks.md`, builds the DAG, finds node `N`, renders the apply template, and ships one `SubmitPrompt`.
+- A scheduler-side control socket is still not in play — that's Phase 3.
 
-Tests:
-- Each subcommand path: build the expected `ClientRequest` (or FS effect) and assert it.
-- Failure paths: daemon down → exit code 1 with the standard "Is it running?" message.
+23 new tests (workspace 590 → 613): 4 one-shot daemon helper cases (Ping/Pong, timeout, disconnect, irrelevant-event filtering) + 19 command tests covering every FS effect, error path (missing change dir, missing workflow, `templates edit` non-zero exit), and the request shape for daemon-coupled phase prompts.
 
 ## Phase 3 — `clhorde-cli flow` + scheduler control socket — ⏳ pending
 
@@ -486,7 +495,7 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 | **2.3** | ✅ shipped | FS watcher + state machine wiring | Reactivity without prompt dispatch yet; 26 new tests + live smoke. |
 | **2.4** | ✅ shipped | Tera templates + prompt dispatch via daemon | First end-to-end run of a real workflow; 35 new tests. |
 | **2.5** | ✅ shipped | `openspec/changes/` snapshot in scheduler → `SetAnnotation` writes | User-visible auto-link, agnostic-daemon-friendly; 21 new tests. |
-| **2.6** | ⏳ pending | One-shot CLI subcommands implemented | Scriptable usage; `clhorde-scheduler queue add-oauth` etc. |
+| **2.6** | ✅ shipped | One-shot CLI subcommands implemented | Scriptable usage end-to-end; 23 new tests. |
 | **3**   | ⏳ pending | `clhorde-cli flow` wrappers + scheduler control socket | Single CLI entrypoint for users; remote-control of a long-lived scheduler. |
 | **4**   | ⏳ pending | TUI tabs (`Drafts`, `Workflows`) | First-class UX. |
 | **5**   | ⏳ pending | Web routes + advanced (parallel safety, hooks, multi-repo) | Polish. |
