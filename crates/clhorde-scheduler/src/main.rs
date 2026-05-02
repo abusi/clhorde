@@ -8,14 +8,17 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use clhorde_scheduler::cli::{Cli, Command, DaemonArgs, TemplatesAction};
 use clhorde_scheduler::commands::{self, CommandError, CommandOutput};
+use clhorde_scheduler::control;
 use clhorde_scheduler::daemon_client::{self, DaemonMessage};
 use clhorde_scheduler::orchestrator::Orchestrator;
 use clhorde_scheduler::persistence::WorkflowStore;
 use clhorde_scheduler::watcher::{self, FsEvent};
+use clhorde_core::ipc::scheduler_socket_path;
 use clhorde_core::protocol::ClientRequest;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -124,9 +127,16 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
         }
     };
     let (orch_tx, mut orch_rx) = mpsc::unbounded_channel::<ClientRequest>();
-    let mut orch = Orchestrator::new(root.clone(), store, orch_tx);
-    if let Err(e) = orch.reconcile() {
-        warn!(error = %e, "initial reconcile failed; continuing");
+    let orch = Arc::new(Mutex::new(Orchestrator::new(
+        root.clone(),
+        store,
+        orch_tx,
+    )));
+    {
+        let mut g = orch.lock().expect("orchestrator mutex poisoned");
+        if let Err(e) = g.reconcile() {
+            warn!(error = %e, "initial reconcile failed; continuing");
+        }
     }
 
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<FsEvent>();
@@ -139,6 +149,22 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
             warn!(
                 error = %e,
                 "filesystem watcher could not start; reactive workflow updates disabled"
+            );
+            None
+        }
+    };
+
+    // Spawn the control socket so `clhorde-cli flow status` (and Phase 4's
+    // TUI) can talk to this scheduler instance. Failure to bind is
+    // non-fatal — the daemon flow still works without remote control.
+    let control_socket = scheduler_socket_path();
+    let _control_handle = match control::server::spawn(orch.clone(), control_socket.clone()) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            warn!(
+                error = %e,
+                socket = %control_socket.display(),
+                "control socket bind failed; remote control disabled",
             );
             None
         }
@@ -159,7 +185,8 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
                         msg = rx.recv() => match msg {
                             Some(DaemonMessage::Event(ev)) => {
                                 tracing::trace!(?ev, "daemon event");
-                                if let Err(e) = orch.handle_daemon_event(&ev) {
+                                let mut g = orch.lock().expect("orch mutex");
+                                if let Err(e) = g.handle_daemon_event(&ev) {
                                     warn!(error = %e, "orchestrator daemon event failed");
                                 }
                             }
@@ -171,7 +198,8 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
                         ev = fs_rx.recv() => match ev {
                             Some(ev) => {
                                 tracing::debug!(?ev, "fs event");
-                                if let Err(e) = orch.handle_event(ev) {
+                                let mut g = orch.lock().expect("orch mutex");
+                                if let Err(e) = g.handle_event(ev) {
                                     warn!(error = %e, "orchestrator fs event failed");
                                 }
                             }
@@ -189,11 +217,13 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
                             None => {
                                 // Should never happen — orch_tx is held by Orchestrator.
                                 warn!("scheduler: orchestrator outbound channel closed");
+                                cleanup_control_socket(&control_socket);
                                 return ExitCode::SUCCESS;
                             }
                         },
                         _ = tokio::signal::ctrl_c() => {
                             info!("scheduler: SIGINT received, shutting down");
+                            cleanup_control_socket(&control_socket);
                             return ExitCode::SUCCESS;
                         }
                     }
@@ -208,7 +238,8 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
         // don't lose them on the next reconnect. Outbound requests stay
         // buffered in the channel for the next connection to forward.
         while let Ok(ev) = fs_rx.try_recv() {
-            if let Err(e) = orch.handle_event(ev) {
+            let mut g = orch.lock().expect("orch mutex");
+            if let Err(e) = g.handle_event(ev) {
                 warn!(error = %e, "orchestrator event failed during reconnect");
             }
         }
@@ -217,10 +248,15 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
             _ = sleep_backoff() => {}
             _ = tokio::signal::ctrl_c() => {
                 info!("scheduler: SIGINT received during reconnect wait");
+                cleanup_control_socket(&control_socket);
                 return ExitCode::SUCCESS;
             }
         }
     }
+}
+
+fn cleanup_control_socket(path: &PathBuf) {
+    let _ = std::fs::remove_file(path);
 }
 
 fn resolve_root(arg: Option<PathBuf>) -> std::io::Result<PathBuf> {

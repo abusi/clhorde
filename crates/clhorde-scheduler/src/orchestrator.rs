@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent, PromptInfo};
 use tokio::sync::mpsc;
 
+use crate::control::WorkflowSummary;
 use crate::dispatch::{is_node_done, next_runnable_nodes};
 use crate::openspec::affected_changes::{self, ChangesSnapshot};
 use crate::openspec::annotations::{annotate, AnnotatedSection};
@@ -55,15 +56,27 @@ const AFFECTED_CHANGES_KEY: &str = "openspec.affected_changes";
 
 /// Errors surfaced from the orchestrator. We deliberately keep this small —
 /// most callers want to log-and-continue, not to branch on the cause.
+///
+/// The `NotFound` / `BadRequest` / `Io` / `Render` variants only show up on
+/// the control-socket entry points (`cancel_workflow`, `retry_section`); the
+/// existing FS/event handlers continue to surface only `Store`.
 #[derive(Debug)]
 pub enum OrchestratorError {
     Store(StoreError),
+    NotFound(String),
+    BadRequest(String),
+    Io(std::io::Error),
+    Render(String),
 }
 
 impl std::fmt::Display for OrchestratorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OrchestratorError::Store(e) => write!(f, "store: {e}"),
+            OrchestratorError::NotFound(n) => write!(f, "no such workflow: {n}"),
+            OrchestratorError::BadRequest(s) => f.write_str(s),
+            OrchestratorError::Io(e) => write!(f, "io: {e}"),
+            OrchestratorError::Render(s) => write!(f, "render: {s}"),
         }
     }
 }
@@ -72,6 +85,8 @@ impl std::error::Error for OrchestratorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             OrchestratorError::Store(e) => Some(e),
+            OrchestratorError::Io(e) => Some(e),
+            _ => None,
         }
     }
 }
@@ -79,6 +94,12 @@ impl std::error::Error for OrchestratorError {
 impl From<StoreError> for OrchestratorError {
     fn from(e: StoreError) -> Self {
         OrchestratorError::Store(e)
+    }
+}
+
+impl From<std::io::Error> for OrchestratorError {
+    fn from(e: std::io::Error) -> Self {
+        OrchestratorError::Io(e)
     }
 }
 
@@ -198,6 +219,178 @@ impl Orchestrator {
             .get(name)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    // ── control-socket entry points ──
+
+    /// Snapshot every workflow as a [`WorkflowSummary`]. Used by the
+    /// scheduler control socket to answer `Status { name: None }`.
+    pub fn summaries(&self) -> Vec<WorkflowSummary> {
+        self.workflows.values().map(workflow_summary).collect()
+    }
+
+    /// Snapshot one workflow as a [`WorkflowSummary`], or `None` if it
+    /// does not exist.
+    pub fn summary(&self, name: &str) -> Option<WorkflowSummary> {
+        self.workflows.get(name).map(workflow_summary)
+    }
+
+    /// Remove the `.clhorde-ready` marker on disk (if present) and
+    /// transition the workflow to `Cancelled` (or `Drafted`, if it was
+    /// only queued). Equivalent to a watcher seeing the marker disappear,
+    /// but driven explicitly so the control socket gets a synchronous
+    /// confirmation.
+    ///
+    /// `kind` semantics in the returned tuple:
+    /// - `"unqueued"`: Queued → Drafted.
+    /// - `"cancelled"`: Implementing/Verifying/Archiving → Cancelled.
+    /// - `"noop"`: terminal or already-Drafted; no state change but the
+    ///   marker (if present) was still removed.
+    pub fn cancel_workflow(
+        &mut self,
+        name: &str,
+    ) -> Result<&'static str, OrchestratorError> {
+        let marker = self
+            .root
+            .join("openspec")
+            .join("changes")
+            .join(name)
+            .join(".clhorde-ready");
+        match fs::remove_file(&marker) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(OrchestratorError::Io(e)),
+        }
+
+        let kind = match self.workflows.get(name).map(|w| w.status.clone()) {
+            Some(WorkflowStatus::Queued) => "unqueued",
+            Some(WorkflowStatus::Implementing)
+            | Some(WorkflowStatus::Verifying)
+            | Some(WorkflowStatus::Archiving) => "cancelled",
+            Some(_) => "noop",
+            None => return Err(OrchestratorError::NotFound(name.to_string())),
+        };
+
+        // Reuse the existing transition logic. It does the right thing:
+        // Queued→Drafted, Implementing/Verifying/Archiving→Cancelled, and
+        // saves the result.
+        self.on_marker_removed(name.to_string())?;
+        Ok(kind)
+    }
+
+    /// Re-dispatch a single apply-phase node by its `tasks.md` id. If the
+    /// workflow is `Failed`, it is reset to `Implementing` so the next
+    /// `WorkerFinished` advances it. The dispatch goes through the usual
+    /// outbound channel — i.e. it lands in the daemon as if the
+    /// orchestrator had decided to dispatch it.
+    pub fn retry_section(
+        &mut self,
+        name: &str,
+        section_id: &str,
+    ) -> Result<(), OrchestratorError> {
+        // Load + ensure the workflow is in a state we can retry from.
+        let mut wf = self
+            .workflows
+            .remove(name)
+            .ok_or_else(|| OrchestratorError::NotFound(name.to_string()))?;
+        match wf.status {
+            WorkflowStatus::Failed { .. } => {
+                wf.status = WorkflowStatus::Implementing;
+            }
+            WorkflowStatus::Archived | WorkflowStatus::Cancelled => {
+                self.workflows.insert(name.to_string(), wf);
+                return Err(OrchestratorError::BadRequest(format!(
+                    "{name}: cannot retry a terminal workflow"
+                )));
+            }
+            _ => {}
+        }
+
+        // Re-parse `tasks.md` and rebuild the DAG. We do not assume the
+        // in-memory parsed_tasks is fresh; the user may have edited the
+        // file between the failure and the retry.
+        self.refresh_tasks(name);
+        let sections = match self.parsed_tasks.get(name).cloned() {
+            Some(s) => s,
+            None => {
+                self.workflows.insert(name.to_string(), wf);
+                return Err(OrchestratorError::BadRequest(format!(
+                    "{name}: tasks.md missing or unreadable"
+                )));
+            }
+        };
+        let built_dag = match dag::build(&sections) {
+            Ok(d) => d,
+            Err(e) => {
+                self.workflows.insert(name.to_string(), wf);
+                return Err(OrchestratorError::BadRequest(format!(
+                    "{name}: dag: {e}"
+                )));
+            }
+        };
+        let node = match built_dag.nodes.iter().find(|n| n.id == section_id) {
+            Some(n) => n.clone(),
+            None => {
+                self.workflows.insert(name.to_string(), wf);
+                return Err(OrchestratorError::BadRequest(format!(
+                    "{name}: no node {section_id}"
+                )));
+            }
+        };
+
+        let section = sections.iter().find(|s| s.section.id == node.id);
+        let tasks_block = section
+            .map(|s| {
+                s.items
+                    .iter()
+                    .map(|t| {
+                        let mark = if t.task.done { "[x]" } else { "[ ]" };
+                        format!("- {} {} {}", mark, t.task.id, t.task.text)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let prompt = self.render_apply(name, &node, &tasks_block);
+        let tag = expected_apply_tag(name, &node.id);
+        let request = ClientRequest::SubmitPrompt {
+            text: prompt,
+            cwd: Some(self.root.to_string_lossy().into_owned()),
+            mode: PROMPT_MODE.to_string(),
+            worktree: true,
+            tags: vec![tag.clone()],
+            depends_on: Vec::new(),
+            worktree_id: Some(name.to_string()),
+        };
+        if let Err(e) = self.outbound.send(request) {
+            tracing::warn!(name, error = %e, "outbound channel closed (retry)");
+        } else {
+            // Refresh the runtime so `note_prompt` finds an entry to fill
+            // when `PromptAdded` arrives. Without this, retries from a
+            // clean restart (no in-memory runtime) would miss the
+            // correlation.
+            let dag_clone = built_dag.clone();
+            let runtime = self.runtimes.entry(name.to_string()).or_default();
+            runtime.dag.get_or_insert(dag_clone);
+            if let Some(idx) = built_dag
+                .nodes
+                .iter()
+                .position(|n| n.id == node.id)
+            {
+                runtime.apply.insert(
+                    idx,
+                    NodeDispatch {
+                        tag,
+                        ..NodeDispatch::default()
+                    },
+                );
+            }
+        }
+        if let Err(e) = self.store.save(&wf) {
+            tracing::warn!(name, error = %e, "persist after retry failed");
+        }
+        self.workflows.insert(name.to_string(), wf);
+        Ok(())
     }
 
     /// Process one [`FsEvent`].
@@ -929,6 +1122,32 @@ impl Orchestrator {
             }),
             Err(_) => MarkerMetadata::default(),
         }
+    }
+}
+
+/// Convert a [`Workflow`] into the wire-format [`WorkflowSummary`] used
+/// by the control socket. Pure transformation; lives outside the impl
+/// block so tests can call it directly.
+fn workflow_summary(wf: &Workflow) -> WorkflowSummary {
+    let (status, failure_reason) = match &wf.status {
+        WorkflowStatus::Drafted => ("drafted", None),
+        WorkflowStatus::Queued => ("queued", None),
+        WorkflowStatus::Implementing => ("implementing", None),
+        WorkflowStatus::Verifying => ("verifying", None),
+        WorkflowStatus::Archiving => ("archiving", None),
+        WorkflowStatus::Archived => ("archived", None),
+        WorkflowStatus::Cancelled => ("cancelled", None),
+        WorkflowStatus::Failed { reason } => ("failed", Some(reason.clone())),
+    };
+    WorkflowSummary {
+        name: wf.name.clone(),
+        status: status.to_string(),
+        failure_reason,
+        priority: wf.metadata.priority.unwrap_or(0),
+        queued_at: wf.queued_at,
+        started_at: wf.started_at,
+        finished_at: wf.finished_at,
+        prompt_ids: wf.prompt_ids.clone(),
     }
 }
 
