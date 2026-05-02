@@ -390,9 +390,13 @@ dependencies = [
 name = "clhorde-scheduler"
 version = "0.5.1"
 dependencies = [
+ "clap",
  "clhorde-core",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

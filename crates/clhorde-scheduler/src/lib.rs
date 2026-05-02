@@ -1,6 +1,6 @@
 //! `clhorde-scheduler` — workflow runtime for spec-driven AI development.
 //!
-//! Phase 1 ships the pure-algorithm pieces:
+//! Phase 1 shipped the pure-algorithm pieces:
 //! - [`openspec::tasks_parser`] turns an OpenSpec `tasks.md` into a structured
 //!   [`TaskGraph`](openspec::tasks_parser::TaskGraph).
 //! - [`openspec::annotations`] parses `<!-- clhorde: ... -->` directives
@@ -9,7 +9,10 @@
 //!   cyclic configurations.
 //!
 //! Phase 2 adds the binary, the daemon client, the FS watcher, and the
-//! workflow execution loop. Until then this crate is library-only and has no
-//! runtime side effects.
+//! workflow execution loop. Sub-phase 2.1 ships the [`cli`] argument types
+//! and the [`daemon_client`] long-lived IPC connector. Real workflow logic
+//! lands in 2.2+.
 
+pub mod cli;
+pub mod daemon_client;
 pub mod openspec;

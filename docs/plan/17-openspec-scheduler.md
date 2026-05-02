@@ -16,12 +16,17 @@ Tracked on branch `feat/prompt-dependencies`.
 | 0.2 Shared worktrees | ✅ shipped | commit `c1e7309`, 14 new tests |
 | 0.3 Generic prompt annotations | ✅ shipped | 9 new tests; daemon stays workflow-agnostic |
 | 1   tasks.md parser + DAG | ✅ shipped | new `clhorde-scheduler` crate (lib-only); 53 new tests |
-| 2   Scheduler execution loop + openspec FS detection | ⏳ next | |
+| 2.1 Binary skeleton + daemon_client | ✅ shipped | clap CLI, long-lived IPC client, reconnect loop; 17 new tests |
+| 2.2 Discovery + workflow types + persistence | ⏳ next | |
+| 2.3 FS watcher + state machine | ⏳ pending | |
+| 2.4 Templates + dispatch | ⏳ pending | |
+| 2.5 openspec/changes/ snapshot in scheduler | ⏳ pending | |
+| 2.6 CLI subcommands wired to daemon | ⏳ pending | |
 | 3   `clhorde-cli flow` wrappers | ⏳ pending | |
 | 4   TUI restructure (tabs) | ⏳ pending | |
 | 5   Advanced / web | ⏳ pending | |
 
-Workspace tests: **459 passing**, none ignored.
+Workspace tests: **476 passing**, none ignored.
 
 ## Vision
 
