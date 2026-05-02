@@ -20,13 +20,13 @@ Tracked on branch `feat/prompt-dependencies`.
 | 2.2 Discovery + workflow types + persistence | ✅ shipped | TOML marker, state machine, JSON store; 32 new tests |
 | 2.3 FS watcher + state machine | ✅ shipped | `notify_debouncer_full`, orchestrator + reconcile; 26 new tests |
 | 2.4 Templates + dispatch | ✅ shipped | Tera engine, DAG dispatch, apply→verify→archive lifecycle; 35 new tests |
-| 2.5 openspec/changes/ snapshot in scheduler | ⏳ next | |
-| 2.6 CLI subcommands wired to daemon | ⏳ pending | |
+| 2.5 openspec/changes/ snapshot in scheduler | ✅ shipped | content-hash snapshot/diff + `SetAnnotation` writes on every observed worker; 21 new tests |
+| 2.6 CLI subcommands wired to daemon | ⏳ next | |
 | 3   `clhorde-cli flow` wrappers | ⏳ pending | |
 | 4   TUI restructure (tabs) | ⏳ pending | |
 | 5   Advanced / web | ⏳ pending | |
 
-Workspace tests: **569 passing**, none ignored.
+Workspace tests: **590 passing**, none ignored.
 
 ## Vision
 
@@ -387,16 +387,15 @@ Delivered:
 
 In-flight workflows that survive a scheduler crash currently re-dispatch from scratch on next reconcile (the runtime cache is in-memory only). Cross-restart correctness for partially-finished workflows is deferred — Phase 2.6's CLI surface and Phase 4's TUI both want explicit retry/resume affordances anyway.
 
-### 2.5 OpenSpec FS detection in the scheduler — ⏳ pending
+### 2.5 OpenSpec FS detection in the scheduler — ✅ shipped
 
-Scope:
-- Move the `openspec/changes/` snapshot/diff (originally proposed as Phase 0.3) into the scheduler. Snapshot is taken locally at the moment a `WorkerStarted { prompt_id, … }` event lands; second snapshot at `WorkerFinished`. Diff produces a sorted list of touched change names.
-- Write the result back to the daemon as `ClientRequest::SetAnnotation { prompt_id, key: "openspec.affected_changes", value: [...] }` (the primitive shipped in Phase 0.3).
-- TUI / Drafts tab consumes the same annotation later in Phase 4.
+Delivered:
+- `openspec::affected_changes` — `snapshot(root)` walks `<root>/openspec/changes/*/` recursively and produces a `ChangesSnapshot { entries: BTreeMap<change_name, ChangeFingerprint { files: BTreeMap<rel_path, (size, content_hash)> }> }`. `diff(before, after)` returns a sorted, deduplicated list of change names whose fingerprints differ (added, removed, or any file changed). Content-hashed (`DefaultHasher` over file bytes) rather than mtime-based, so atomic-rename saves with identical bytes don't produce false positives.
+- Orchestrator wiring — two new small maps, `prompt_cwds: HashMap<usize, PathBuf>` and `prompt_baselines: HashMap<usize, ChangesSnapshot>`. `PromptAdded`/`PromptUpdated`/`StateSnapshot` populate the cwd map (`worktree_path` wins over `cwd` because that's where edits actually land). `WorkerStarted` snapshots into `prompt_baselines`. `WorkerFinished` re-snapshots, diffs, and emits `ClientRequest::SetAnnotation { key: "openspec.affected_changes", value: [...] }` over the existing outbound channel. `PromptRemoved` cleans both maps.
+- Empty diffs are written explicitly so consumers can distinguish *"watched, nothing changed"* from *"scheduler missed this prompt entirely"* (in which case no annotation appears at all). Phase 4's Drafts tab will rely on that distinction.
+- The annotation flow runs for **every** prompt the scheduler observes, not just scheduler-dispatched ones — manual TUI prompts that touch `openspec/changes/` get auto-tagged the same way, which is the original Phase 0.3 user-visible feature, just hosted in the scheduler instead of the daemon.
 
-Tests:
-- Pure snapshot/diff tests on temp-dir fixtures (already prototyped during the Phase 0.3 reshape; we keep the same shape, only the host crate moves).
-- End-to-end: synthetic `WorkerStarted` / `WorkerFinished` events drive the scheduler, expected `SetAnnotation` request appears on the outbound mpsc channel.
+21 new tests (workspace 569 → 590): 14 pure snapshot/diff cases (added/removed/modified files, nested specs/, dotfile filtering, scope limited to `openspec/changes/`) + 7 orchestrator scenarios driving synthetic daemon events through the outbound channel and asserting on the resulting `SetAnnotation` payloads (full diff, empty diff, missing baseline, missing cwd, worktree precedence, `PromptRemoved` cleanup, `StateSnapshot` cwd backfill).
 
 ### 2.6 CLI subcommands wired through — ⏳ pending
 
@@ -486,7 +485,7 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 | **2.2** | ✅ shipped | Discovery + workflow types + persistence | Pure data layer; 32 new tests, no watcher needed. |
 | **2.3** | ✅ shipped | FS watcher + state machine wiring | Reactivity without prompt dispatch yet; 26 new tests + live smoke. |
 | **2.4** | ✅ shipped | Tera templates + prompt dispatch via daemon | First end-to-end run of a real workflow; 35 new tests. |
-| **2.5** | ⏳ next | `openspec/changes/` snapshot in scheduler → `SetAnnotation` writes | Restores the user-visible auto-link feature, agnostic-daemon-friendly. |
+| **2.5** | ✅ shipped | `openspec/changes/` snapshot in scheduler → `SetAnnotation` writes | User-visible auto-link, agnostic-daemon-friendly; 21 new tests. |
 | **2.6** | ⏳ pending | One-shot CLI subcommands implemented | Scriptable usage; `clhorde-scheduler queue add-oauth` etc. |
 | **3**   | ⏳ pending | `clhorde-cli flow` wrappers + scheduler control socket | Single CLI entrypoint for users; remote-control of a long-lived scheduler. |
 | **4**   | ⏳ pending | TUI tabs (`Drafts`, `Workflows`) | First-class UX. |
