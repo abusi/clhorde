@@ -8,4 +8,5 @@
 
 pub mod annotations;
 pub mod dag;
+pub mod discovery;
 pub mod tasks_parser;

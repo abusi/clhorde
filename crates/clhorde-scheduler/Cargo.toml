@@ -14,7 +14,12 @@ path = "src/main.rs"
 clhorde-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

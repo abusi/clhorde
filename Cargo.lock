@@ -298,6 +298,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -390,11 +391,14 @@ dependencies = [
 name = "clhorde-scheduler"
 version = "0.5.1"
 dependencies = [
+ "chrono",
  "clap",
  "clhorde-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

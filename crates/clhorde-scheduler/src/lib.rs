@@ -16,3 +16,5 @@
 pub mod cli;
 pub mod daemon_client;
 pub mod openspec;
+pub mod persistence;
+pub mod workflow;
