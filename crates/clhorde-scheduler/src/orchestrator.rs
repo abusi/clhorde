@@ -27,6 +27,7 @@ use clhorde_core::protocol::{ClientRequest, DaemonEvent, PromptInfo};
 use tokio::sync::mpsc;
 
 use crate::dispatch::{is_node_done, next_runnable_nodes};
+use crate::openspec::affected_changes::{self, ChangesSnapshot};
 use crate::openspec::annotations::{annotate, AnnotatedSection};
 use crate::openspec::dag::{self, Dag};
 use crate::openspec::discovery::{self, ChangeStatus, MarkerMetadata};
@@ -44,6 +45,13 @@ const TAG_PREFIX: &str = "clhorde-scheduler";
 /// one-shot so it can react to a clean exit signal; interactive PTY prompts
 /// don't fit the unattended dispatch loop.
 const PROMPT_MODE: &str = "oneshot";
+
+/// Annotation key written on every prompt the scheduler observed run, with
+/// the sorted list of `openspec/changes/<X>/` directories whose content
+/// differed between [`DaemonEvent::WorkerStarted`] and
+/// [`DaemonEvent::WorkerFinished`]. Always written when a baseline was
+/// captured — an empty list signals "we watched, nothing changed".
+const AFFECTED_CHANGES_KEY: &str = "openspec.affected_changes";
 
 /// Errors surfaced from the orchestrator. We deliberately keep this small —
 /// most callers want to log-and-continue, not to branch on the cause.
@@ -118,6 +126,14 @@ pub struct Orchestrator {
     runtimes: BTreeMap<String, WorkflowRuntime>,
     templates: TemplateEngine,
     outbound: mpsc::UnboundedSender<ClientRequest>,
+    /// Effective working directory per prompt id, learned from
+    /// `PromptAdded` / `PromptUpdated`. Prefers `worktree_path` over `cwd`
+    /// because the worker's edits land in the worktree, not the original
+    /// repo. Used solely to take `openspec/changes/` snapshots.
+    prompt_cwds: HashMap<usize, PathBuf>,
+    /// Baseline snapshot captured at `WorkerStarted`. Cleared on
+    /// `WorkerFinished` after the diff is emitted (or on `PromptRemoved`).
+    prompt_baselines: HashMap<usize, ChangesSnapshot>,
 }
 
 impl Orchestrator {
@@ -136,6 +152,8 @@ impl Orchestrator {
             runtimes: BTreeMap::new(),
             templates,
             outbound,
+            prompt_cwds: HashMap::new(),
+            prompt_baselines: HashMap::new(),
         }
     }
 
@@ -208,16 +226,36 @@ impl Orchestrator {
     ) -> Result<(), OrchestratorError> {
         match event {
             DaemonEvent::PromptAdded(info) | DaemonEvent::PromptUpdated(info) => {
+                self.note_prompt_cwd(info);
                 self.note_prompt(info);
+            }
+            DaemonEvent::StateSnapshot(state) => {
+                // After a reconnect we may have missed a string of events;
+                // populate the cwd map from the snapshot so future
+                // `WorkerStarted`s have a path to fall back on. We do *not*
+                // backfill `prompt_baselines` for already-running prompts —
+                // a baseline taken mid-run would be misleading.
+                for info in &state.prompts {
+                    self.note_prompt_cwd(info);
+                    self.note_prompt(info);
+                }
+            }
+            DaemonEvent::WorkerStarted { prompt_id } => {
+                self.capture_baseline(*prompt_id);
             }
             DaemonEvent::WorkerFinished {
                 prompt_id,
                 exit_code,
             } => {
+                self.emit_affected_changes(*prompt_id);
                 if let Some(name) = self.workflow_owning_prompt(*prompt_id) {
                     self.note_worker_finished(&name, *prompt_id, *exit_code);
                     self.try_advance(&name)?;
                 }
+            }
+            DaemonEvent::PromptRemoved { prompt_id } => {
+                self.prompt_cwds.remove(prompt_id);
+                self.prompt_baselines.remove(prompt_id);
             }
             _ => {}
         }
@@ -553,6 +591,60 @@ impl Orchestrator {
     }
 
     // ── daemon-event helpers ──
+
+    /// Update [`Self::prompt_cwds`] from a freshly-seen `PromptInfo`. The
+    /// effective cwd is `worktree_path` when the prompt runs in a worktree,
+    /// otherwise the original `cwd`. Prompts with neither are skipped —
+    /// `affected_changes` requires a directory to snapshot.
+    fn note_prompt_cwd(&mut self, info: &PromptInfo) {
+        let path = info
+            .worktree_path
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(info.cwd.as_deref())
+            .map(PathBuf::from);
+        if let Some(p) = path {
+            self.prompt_cwds.insert(info.id, p);
+        }
+    }
+
+    /// Take the baseline `openspec/changes/` snapshot for a prompt that
+    /// just started. Silently no-ops if we have no cwd for it (the
+    /// scheduler missed `PromptAdded`, e.g. it joined mid-flight).
+    fn capture_baseline(&mut self, prompt_id: usize) {
+        let Some(cwd) = self.prompt_cwds.get(&prompt_id).cloned() else {
+            return;
+        };
+        let snap = affected_changes::snapshot(&cwd);
+        self.prompt_baselines.insert(prompt_id, snap);
+    }
+
+    /// Diff the post-finish snapshot against the baseline and write the
+    /// `openspec.affected_changes` annotation. Always emits when a baseline
+    /// existed — an empty list means "watched, nothing changed", which is
+    /// distinguishable from a missing key.
+    fn emit_affected_changes(&mut self, prompt_id: usize) {
+        let Some(cwd) = self.prompt_cwds.get(&prompt_id).cloned() else {
+            return;
+        };
+        let Some(before) = self.prompt_baselines.remove(&prompt_id) else {
+            return;
+        };
+        let after = affected_changes::snapshot(&cwd);
+        let affected = affected_changes::diff(&before, &after);
+        let request = ClientRequest::SetAnnotation {
+            prompt_id,
+            key: AFFECTED_CHANGES_KEY.to_string(),
+            value: serde_json::json!(affected),
+        };
+        if let Err(e) = self.outbound.send(request) {
+            tracing::warn!(
+                prompt_id,
+                error = %e,
+                "could not send openspec.affected_changes annotation"
+            );
+        }
+    }
 
     fn note_prompt(&mut self, info: &PromptInfo) {
         let Some((name, target)) = parse_scheduler_tag(&info.tags) else {
@@ -1280,6 +1372,232 @@ mod tests {
     fn unrelated_tags_are_ignored() {
         assert!(parse_scheduler_tag(&["user-tag".into()]).is_none());
         assert!(parse_scheduler_tag(&["clhorde-scheduler/garbage".into()]).is_none());
+    }
+
+    // ── openspec.affected_changes (Phase 2.5) ──
+
+    fn make_prompt_info(
+        id: usize,
+        cwd: Option<&Path>,
+        worktree_path: Option<&Path>,
+    ) -> PromptInfo {
+        PromptInfo {
+            id,
+            text: String::new(),
+            cwd: cwd.map(|p| p.to_string_lossy().into_owned()),
+            mode: "oneshot".into(),
+            status: "Pending".into(),
+            output: None,
+            error: None,
+            worktree: worktree_path.is_some(),
+            worktree_path: worktree_path.map(|p| p.to_string_lossy().into_owned()),
+            session_id: None,
+            tags: Vec::new(),
+            queue_rank: 0.0,
+            seen: false,
+            resume: false,
+            output_len: 0,
+            elapsed_secs: None,
+            uuid: format!("uuid-{id}"),
+            has_pty: false,
+            depends_on: Vec::new(),
+            blocked_by: Vec::new(),
+            worktree_id: None,
+            annotations: BTreeMap::new(),
+        }
+    }
+
+    fn write_change_file(root: &Path, change: &str, file: &str, body: &str) {
+        let p = root.join("openspec").join("changes").join(change);
+        fs::create_dir_all(&p).unwrap();
+        fs::write(p.join(file), body).unwrap();
+    }
+
+    fn find_set_annotation(
+        rx: &mut mpsc::UnboundedReceiver<ClientRequest>,
+        prompt_id: usize,
+    ) -> Option<(String, serde_json::Value)> {
+        for req in drain_requests(rx) {
+            if let ClientRequest::SetAnnotation {
+                prompt_id: pid,
+                key,
+                value,
+            } = req
+            {
+                if pid == prompt_id {
+                    return Some((key, value));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn worker_lifecycle_emits_affected_changes_annotation() {
+        let (tmp, mut orch, mut rx) = fixture();
+        // Pre-existing change directory.
+        write_change_file(tmp.path(), "add-oauth", "proposal.md", "v1");
+
+        // Daemon tells us about a prompt that runs in tmp.
+        let info = make_prompt_info(42, Some(tmp.path()), None);
+        orch.handle_daemon_event(&DaemonEvent::PromptAdded(info))
+            .unwrap();
+        // Drain anything from PromptAdded itself (none expected).
+        drain_requests(&mut rx);
+
+        // WorkerStarted: baseline snapshot taken.
+        orch.handle_daemon_event(&DaemonEvent::WorkerStarted { prompt_id: 42 })
+            .unwrap();
+
+        // Worker writes to one change directory.
+        write_change_file(tmp.path(), "add-oauth", "proposal.md", "v2 different");
+        // And touches a brand-new change.
+        write_change_file(tmp.path(), "fix-login", "proposal.md", "new");
+
+        orch.handle_daemon_event(&DaemonEvent::WorkerFinished {
+            prompt_id: 42,
+            exit_code: Some(0),
+        })
+        .unwrap();
+
+        let (key, value) = find_set_annotation(&mut rx, 42).expect("annotation");
+        assert_eq!(key, "openspec.affected_changes");
+        let arr = value.as_array().unwrap();
+        let names: Vec<&str> = arr.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(names, vec!["add-oauth", "fix-login"]);
+    }
+
+    #[test]
+    fn worker_lifecycle_emits_empty_list_when_nothing_changed() {
+        // Plan note: an empty list is informative — distinguishes
+        // "watched, nothing changed" from "scheduler missed this prompt".
+        let (tmp, mut orch, mut rx) = fixture();
+        write_change_file(tmp.path(), "add-oauth", "proposal.md", "v1");
+
+        let info = make_prompt_info(7, Some(tmp.path()), None);
+        orch.handle_daemon_event(&DaemonEvent::PromptAdded(info))
+            .unwrap();
+        orch.handle_daemon_event(&DaemonEvent::WorkerStarted { prompt_id: 7 })
+            .unwrap();
+        // No FS changes between started and finished.
+        orch.handle_daemon_event(&DaemonEvent::WorkerFinished {
+            prompt_id: 7,
+            exit_code: Some(0),
+        })
+        .unwrap();
+
+        let (_key, value) = find_set_annotation(&mut rx, 7).expect("annotation");
+        assert_eq!(value, serde_json::json!([]));
+    }
+
+    #[test]
+    fn worker_finished_without_baseline_emits_no_annotation() {
+        // The scheduler joined mid-flight and missed WorkerStarted —
+        // no baseline, no annotation.
+        let (tmp, mut orch, mut rx) = fixture();
+        write_change_file(tmp.path(), "add-oauth", "proposal.md", "v1");
+
+        let info = make_prompt_info(99, Some(tmp.path()), None);
+        orch.handle_daemon_event(&DaemonEvent::PromptAdded(info))
+            .unwrap();
+        // Skip WorkerStarted entirely.
+        orch.handle_daemon_event(&DaemonEvent::WorkerFinished {
+            prompt_id: 99,
+            exit_code: Some(0),
+        })
+        .unwrap();
+
+        assert!(find_set_annotation(&mut rx, 99).is_none());
+    }
+
+    #[test]
+    fn worker_started_without_known_cwd_does_not_panic() {
+        // Daemon emitted WorkerStarted for a prompt we never saw a
+        // PromptAdded for — silently no-op.
+        let (_tmp, mut orch, _rx) = fixture();
+        orch.handle_daemon_event(&DaemonEvent::WorkerStarted { prompt_id: 1234 })
+            .unwrap();
+        // (no assertion — the only contract is "no panic, no annotation").
+    }
+
+    #[test]
+    fn worktree_path_takes_precedence_over_cwd_for_snapshot() {
+        // The scheduler should snapshot the worktree (where edits actually
+        // land), not the original cwd.
+        let (tmp, mut orch, mut rx) = fixture();
+        let cwd = TempDir::new().unwrap();
+        let worktree = TempDir::new().unwrap();
+
+        write_change_file(cwd.path(), "in-cwd-only", "f.md", "x");
+        write_change_file(worktree.path(), "in-worktree", "f.md", "x");
+
+        let info = make_prompt_info(5, Some(cwd.path()), Some(worktree.path()));
+        orch.handle_daemon_event(&DaemonEvent::PromptAdded(info))
+            .unwrap();
+        orch.handle_daemon_event(&DaemonEvent::WorkerStarted { prompt_id: 5 })
+            .unwrap();
+
+        // Edit only the worktree.
+        write_change_file(worktree.path(), "in-worktree", "f.md", "y");
+        orch.handle_daemon_event(&DaemonEvent::WorkerFinished {
+            prompt_id: 5,
+            exit_code: Some(0),
+        })
+        .unwrap();
+
+        let (_key, value) = find_set_annotation(&mut rx, 5).expect("annotation");
+        let names: Vec<&str> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["in-worktree"]);
+        // Sanity: keep tmp/cwd alive until end of test.
+        let _ = (tmp, cwd, worktree);
+    }
+
+    #[test]
+    fn prompt_removed_drops_baseline_and_cwd() {
+        let (tmp, mut orch, _rx) = fixture();
+        write_change_file(tmp.path(), "x", "f.md", "x");
+
+        let info = make_prompt_info(1, Some(tmp.path()), None);
+        orch.handle_daemon_event(&DaemonEvent::PromptAdded(info))
+            .unwrap();
+        orch.handle_daemon_event(&DaemonEvent::WorkerStarted { prompt_id: 1 })
+            .unwrap();
+        assert!(orch.prompt_baselines.contains_key(&1));
+        assert!(orch.prompt_cwds.contains_key(&1));
+
+        orch.handle_daemon_event(&DaemonEvent::PromptRemoved { prompt_id: 1 })
+            .unwrap();
+        assert!(!orch.prompt_baselines.contains_key(&1));
+        assert!(!orch.prompt_cwds.contains_key(&1));
+    }
+
+    #[test]
+    fn state_snapshot_populates_cwd_map_for_running_prompts() {
+        // After reconnect, the daemon ships a full StateSnapshot. We use
+        // it to populate cwds so future WorkerFinished events can still
+        // produce diffs (when paired with a future WorkerStarted).
+        use clhorde_core::protocol::{DaemonState, PROTOCOL_VERSION};
+
+        let (tmp, mut orch, _rx) = fixture();
+        let info = make_prompt_info(11, Some(tmp.path()), None);
+        let state = DaemonState {
+            prompts: vec![info],
+            max_workers: 1,
+            active_workers: 0,
+            default_mode: "interactive".into(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        orch.handle_daemon_event(&DaemonEvent::StateSnapshot(state))
+            .unwrap();
+        assert_eq!(
+            orch.prompt_cwds.get(&11).map(PathBuf::as_path),
+            Some(tmp.path())
+        );
     }
 
     // ── pre-existing FS-only tests preserved ──

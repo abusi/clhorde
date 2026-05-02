@@ -6,6 +6,7 @@
 //! custom YAML) can sit beside it without bleeding the OpenSpec taxonomy
 //! into the rest of the crate.
 
+pub mod affected_changes;
 pub mod annotations;
 pub mod dag;
 pub mod discovery;
