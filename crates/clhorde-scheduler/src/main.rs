@@ -78,7 +78,8 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut orch = Orchestrator::new(root.clone(), store);
+    let (orch_tx, mut orch_rx) = mpsc::unbounded_channel::<ClientRequest>();
+    let mut orch = Orchestrator::new(root.clone(), store, orch_tx);
     if let Err(e) = orch.reconcile() {
         warn!(error = %e, "initial reconcile failed; continuing");
     }
@@ -112,7 +113,10 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
                     tokio::select! {
                         msg = rx.recv() => match msg {
                             Some(DaemonMessage::Event(ev)) => {
-                                tracing::debug!(?ev, "daemon event");
+                                tracing::trace!(?ev, "daemon event");
+                                if let Err(e) = orch.handle_daemon_event(&ev) {
+                                    warn!(error = %e, "orchestrator daemon event failed");
+                                }
                             }
                             Some(DaemonMessage::Disconnected) | None => {
                                 warn!("scheduler: daemon disconnected, reconnecting");
@@ -123,11 +127,24 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
                             Some(ev) => {
                                 tracing::debug!(?ev, "fs event");
                                 if let Err(e) = orch.handle_event(ev) {
-                                    warn!(error = %e, "orchestrator event failed");
+                                    warn!(error = %e, "orchestrator fs event failed");
                                 }
                             }
                             None => {
                                 warn!("scheduler: fs watcher channel closed");
+                            }
+                        },
+                        req = orch_rx.recv() => match req {
+                            Some(req) => {
+                                if tx.send(req).is_err() {
+                                    warn!("scheduler: daemon writer closed; reconnecting");
+                                    break;
+                                }
+                            }
+                            None => {
+                                // Should never happen — orch_tx is held by Orchestrator.
+                                warn!("scheduler: orchestrator outbound channel closed");
+                                return ExitCode::SUCCESS;
                             }
                         },
                         _ = tokio::signal::ctrl_c() => {
@@ -143,7 +160,8 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
         }
 
         // Drain any FS events that arrived while we were disconnected so we
-        // don't lose them on the next reconnect.
+        // don't lose them on the next reconnect. Outbound requests stay
+        // buffered in the channel for the next connection to forward.
         while let Ok(ev) = fs_rx.try_recv() {
             if let Err(e) = orch.handle_event(ev) {
                 warn!(error = %e, "orchestrator event failed during reconnect");

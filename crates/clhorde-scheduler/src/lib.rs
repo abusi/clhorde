@@ -15,8 +15,10 @@
 
 pub mod cli;
 pub mod daemon_client;
+pub mod dispatch;
 pub mod openspec;
 pub mod orchestrator;
 pub mod persistence;
+pub mod templates;
 pub mod watcher;
 pub mod workflow;
