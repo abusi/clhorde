@@ -745,9 +745,17 @@ impl App {
                 }
             }
             (KeyCode::Char('r'), KeyModifiers::NONE) => {
-                // Force the next tick to refetch — same idiom as the
-                // status poll on the list views.
-                self.detail_last_poll = None;
+                // Push events from the SubscribeDetail stream keep the
+                // overlay fresh on their own. `r` queues an explicit
+                // one-shot Detail RPC for the rare case where a user
+                // wants to confirm liveness — harmless because
+                // apply_workflow_detail merges idempotently.
+                if let Some(detail) = self.workflow_detail.as_ref() {
+                    self.pending_scheduler_actions
+                        .push(ControlRequest::Detail {
+                            name: detail.name.clone(),
+                        });
+                }
             }
             (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
                 self.detail_scroll = self.detail_scroll.saturating_add(1);
@@ -1191,13 +1199,52 @@ impl App {
             SchedulerEvent::WorkflowUpdated { summary } => {
                 self.apply_workflow_summary_update(summary);
             }
-            // Detail events ride on a separate subscription in 5.3.2;
+            // Detail events arrive on the dedicated SubscribeDetail
+            // stream and are routed through `apply_detail_event` —
             // they never reach this code path through the summary
-            // Subscribe stream the orchestrator drives. Tolerate them
-            // for forward-compat in case the wire ever multiplexes.
+            // Subscribe stream. Tolerate them silently for
+            // forward-compat in case the wire ever multiplexes.
             SchedulerEvent::DetailSnapshot { .. }
             | SchedulerEvent::DetailUpdated { .. } => {}
         }
+    }
+
+    /// Dispatch a [`SchedulerEvent`] received on the per-workflow
+    /// `SubscribeDetail` stream. Handles `DetailSnapshot` (initial
+    /// frame, also re-sent after a broadcast lag) and `DetailUpdated`
+    /// (every orchestrator state shift) by upserting through
+    /// [`Self::apply_workflow_detail`]. Summary-stream events
+    /// (`Snapshot`/`WorkflowUpdated`) shouldn't reach here — they're
+    /// filtered server-side away from this connection — so we
+    /// silently ignore them rather than panic on a forward-compat
+    /// scheduler that happens to multiplex.
+    pub fn apply_detail_event(&mut self, event: SchedulerEvent) {
+        match event {
+            SchedulerEvent::DetailSnapshot { detail }
+            | SchedulerEvent::DetailUpdated { detail } => {
+                // Drop frames that don't match the open overlay — they
+                // can arrive briefly after the user navigates between
+                // workflows and the previous subscription is still
+                // tearing down on the orchestrator side.
+                let target_matches = self
+                    .workflow_detail
+                    .as_ref()
+                    .is_some_and(|d| d.name == detail.name);
+                if target_matches {
+                    self.apply_workflow_detail(detail);
+                }
+            }
+            SchedulerEvent::Snapshot { .. } | SchedulerEvent::WorkflowUpdated { .. } => {}
+        }
+    }
+
+    /// Name of the workflow whose detail overlay is currently open, or
+    /// `None` if no overlay is showing. Drives the detail-subscription
+    /// lifecycle in `main.rs`: when the value changes, the run loop
+    /// drops the old `SubscribeDetail` connection and spawns a fresh
+    /// one for the new target.
+    pub fn detail_subscription_target(&self) -> Option<String> {
+        self.workflow_detail.as_ref().map(|d| d.name.clone())
     }
 
     /// Upsert one [`WorkflowSummary`] into the local lists. The
@@ -1271,11 +1318,9 @@ impl App {
         if ok {
             // Force the next tick to refetch state.
             self.scheduler_last_poll = None;
-            // If the detail overlay is open, also refetch its content
-            // so the user sees the result of their action immediately.
-            if self.workflow_detail.is_some() {
-                self.detail_last_poll = None;
-            }
+            // The DetailUpdated push from the orchestrator's emit_diff
+            // lands within ms of the mutation committing, so we no
+            // longer force a manual detail refetch here (5.3.2).
         }
     }
 
@@ -1322,22 +1367,6 @@ impl App {
     pub fn detail_last_refresh_age_secs(&self) -> Option<u64> {
         let t = self.detail_last_poll?;
         Some(Instant::now().duration_since(t).as_secs())
-    }
-
-    /// Returns the next workflow name we should re-fetch detail for, if
-    /// any. Empty when no overlay is open or the throttle hasn't
-    /// elapsed.
-    pub fn detail_refresh_target(&self, refresh_after: std::time::Duration) -> Option<String> {
-        let detail = self.workflow_detail.as_ref()?;
-        let due = match self.detail_last_poll {
-            None => true,
-            Some(t) => Instant::now().duration_since(t) >= refresh_after,
-        };
-        if due {
-            Some(detail.name.clone())
-        } else {
-            None
-        }
     }
 
     // ── Key handling ──
@@ -4162,12 +4191,23 @@ mod tests {
     }
 
     #[test]
-    fn r_inside_detail_clears_poll_timer() {
+    fn r_inside_detail_queues_explicit_detail_request() {
+        // After 5.3.2 the overlay receives DetailUpdated pushes
+        // automatically — `r` is now an explicit "fetch once now"
+        // hook rather than a force-refetch idiom. It queues a
+        // ControlRequest::Detail for the open workflow which
+        // main.rs dispatches as a one-shot.
         let (mut app, _rx) = workflows_app();
         app.workflow_detail = Some(empty_detail("running"));
-        app.detail_last_poll = Some(Instant::now());
         app.handle_key(key_press(KeyCode::Char('r')));
-        assert!(app.detail_last_poll.is_none());
+        let queued = app.take_pending_scheduler_actions();
+        assert_eq!(queued.len(), 1);
+        match &queued[0] {
+            clhorde_core::control::ControlRequest::Detail { name } => {
+                assert_eq!(name, "running");
+            }
+            other => panic!("expected Detail, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4210,24 +4250,100 @@ mod tests {
     }
 
     #[test]
-    fn detail_refresh_target_throttled() {
+    fn detail_subscription_target_reflects_overlay_state() {
+        // The main loop reconciles the SubscribeDetail connection
+        // against this getter — closed overlay means no subscription
+        // should be alive; open overlay carries the workflow name.
         let (mut app, _rx) = new_test_app();
-        // No overlay → no refresh.
-        assert!(app
-            .detail_refresh_target(std::time::Duration::from_secs(2))
-            .is_none());
+        assert!(app.detail_subscription_target().is_none());
         app.workflow_detail = Some(empty_detail("running"));
-        app.detail_last_poll = Some(Instant::now());
-        // Just polled — within throttle.
-        assert!(app
-            .detail_refresh_target(std::time::Duration::from_secs(2))
-            .is_none());
-        // Pretend the poll happened a long time ago.
-        app.detail_last_poll = Some(Instant::now() - std::time::Duration::from_secs(5));
+        assert_eq!(app.detail_subscription_target().as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn apply_detail_event_routes_snapshot_and_update_through_detail() {
+        // Both DetailSnapshot and DetailUpdated upsert through
+        // apply_workflow_detail (the same merge path as the one-shot
+        // Detail RPC). Same name → scroll preserved; different name →
+        // ignored when the overlay is on something else (race during
+        // navigation between workflows).
+        let (mut app, _rx) = new_test_app();
+        app.workflow_detail = Some(empty_detail("running"));
+        app.detail_scroll = 5;
+
+        app.apply_detail_event(SchedulerEvent::DetailSnapshot {
+            detail: empty_detail("running"),
+        });
+        assert_eq!(app.detail_scroll, 5);
+
+        // DetailUpdated for the same workflow lands.
+        app.apply_detail_event(SchedulerEvent::DetailUpdated {
+            detail: empty_detail("running"),
+        });
         assert_eq!(
-            app.detail_refresh_target(std::time::Duration::from_secs(2)),
-            Some("running".into())
+            app.workflow_detail.as_ref().map(|d| d.name.as_str()),
+            Some("running")
         );
+
+        // A late frame for a different workflow (race during overlay
+        // switch) is dropped, not applied.
+        app.apply_detail_event(SchedulerEvent::DetailUpdated {
+            detail: empty_detail("other"),
+        });
+        assert_eq!(
+            app.workflow_detail.as_ref().map(|d| d.name.as_str()),
+            Some("running")
+        );
+    }
+
+    #[test]
+    fn apply_detail_event_ignores_summary_variants() {
+        // The detail subscription only emits Detail* variants in
+        // production, but if a forward-compat scheduler ever
+        // multiplexes onto the same channel the App must not
+        // misroute Snapshot/WorkflowUpdated through the detail
+        // overlay state.
+        let (mut app, _rx) = new_test_app();
+        app.workflow_detail = Some(empty_detail("running"));
+        let scroll_before = app.detail_scroll;
+        app.apply_detail_event(SchedulerEvent::Snapshot {
+            workflows: vec![],
+            root: None,
+        });
+        app.apply_detail_event(SchedulerEvent::WorkflowUpdated {
+            summary: WorkflowSummary {
+                name: "running".into(),
+                status: "implementing".into(),
+                failure_reason: None,
+                priority: 0,
+                queued_at: None,
+                started_at: None,
+                finished_at: None,
+                prompt_ids: vec![],
+            },
+        });
+        // Detail unchanged (empty_detail's default status is
+        // "implementing"), scroll unchanged.
+        assert_eq!(
+            app.workflow_detail.as_ref().map(|d| d.status.as_str()),
+            Some("implementing")
+        );
+        assert_eq!(app.detail_scroll, scroll_before);
+    }
+
+    #[test]
+    fn note_scheduler_action_result_no_longer_resets_detail_poll() {
+        // Pre-5.3.2 a successful action would force an immediate
+        // detail re-fetch by clearing detail_last_poll. After 5.3.2
+        // the orchestrator's emit_diff pushes DetailUpdated within
+        // ms of the commit, so we leave the timer alone — the
+        // freshness badge advances when the push lands.
+        let (mut app, _rx) = new_test_app();
+        app.workflow_detail = Some(empty_detail("running"));
+        let stamp = Instant::now() - std::time::Duration::from_secs(1);
+        app.detail_last_poll = Some(stamp);
+        app.note_scheduler_action_result(true, "queued: running".into());
+        assert_eq!(app.detail_last_poll, Some(stamp));
     }
 
     #[test]

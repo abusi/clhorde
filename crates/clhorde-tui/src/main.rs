@@ -9,7 +9,7 @@ mod scheduler_client;
 mod ui;
 
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -60,9 +60,20 @@ enum SchedulerPollOutcome {
     DetailError(String),
 }
 
-/// How often we re-fetch the open detail overlay. Same cadence as the
-/// list-status poll so the user sees consistent freshness.
-const DETAIL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Per-workflow detail subscription state. Held on the main task and
+/// torn down whenever the open detail target changes.
+///
+/// `snapshot_seen` differentiates "the very first DetailSnapshot
+/// hasn't landed yet" from "we got a snapshot, then mid-stream the
+/// connection dropped." The first case triggers an unreachable toast
+/// (the workflow likely doesn't exist or the scheduler is down); the
+/// second case keeps the overlay open with stale data while the
+/// reconnect tick re-spawns the subscription.
+struct DetailSubscription {
+    target: String,
+    rx: mpsc::UnboundedReceiver<SubscriptionMessage>,
+    snapshot_seen: bool,
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -164,6 +175,13 @@ async fn run_app(
         .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut sched_subscription_alive = true;
 
+    // Per-workflow detail subscription, scoped to whatever workflow the
+    // detail overlay is open on. Reconciled each tick against
+    // `app.detail_subscription_target()` so opening / closing the
+    // overlay or navigating between workflows transparently swaps the
+    // underlying SubscribeDetail connection.
+    let mut detail_sub: Option<DetailSubscription> = None;
+
     loop {
         terminal.draw(|f| ui::render(f, &mut app))?;
 
@@ -231,19 +249,21 @@ async fn run_app(
                     });
                 }
 
-                // Auto-refresh the detail overlay every 2s while open,
-                // so the user sees state advance without a keystroke.
-                if let Some(name) = app.detail_refresh_target(DETAIL_REFRESH_INTERVAL) {
-                    // Stamp the timer optimistically so we don't fire a
-                    // second request before this one returns.
-                    app.detail_last_poll = Some(Instant::now());
-                    let tx = sched_tx.clone();
-                    tokio::spawn(async move {
-                        dispatch_scheduler_action(
-                            ControlRequest::Detail { name },
-                            tx,
-                        )
-                        .await;
+                // Reconcile the detail subscription against the open
+                // overlay: if the user opened/closed/switched the
+                // overlay since the previous tick, drop the stale
+                // SubscribeDetail connection and spawn a fresh one
+                // for the new target. Also covers the reconnect case:
+                // a Disconnected message clears `detail_sub` while
+                // leaving the overlay open, and the next tick re-spawns
+                // the subscription against the same name.
+                let desired = app.detail_subscription_target();
+                let current = detail_sub.as_ref().map(|s| s.target.clone());
+                if desired != current || (desired.is_some() && detail_sub.is_none()) {
+                    detail_sub = desired.map(|name| DetailSubscription {
+                        rx: scheduler_client::subscribe_detail(name.clone()),
+                        target: name,
+                        snapshot_seen: false,
                     });
                 }
             }
@@ -264,6 +284,44 @@ async fn run_app(
                         // clutter the UI during normal scheduler
                         // restarts.
                         let _ = err;
+                    }
+                }
+            }
+            // Per-workflow detail stream. The future yields `pending`
+            // when no overlay is open so this arm contributes nothing
+            // to wakeups in the common case. When an overlay opens,
+            // the next tick installs `detail_sub` and this arm drives
+            // the apply path.
+            Some(msg) = async {
+                match detail_sub.as_mut() {
+                    Some(s) => s.rx.recv().await,
+                    None => std::future::pending::<Option<SubscriptionMessage>>().await,
+                }
+            } => {
+                match msg {
+                    SubscriptionMessage::Event(event) => {
+                        if matches!(event, clhorde_core::control::SchedulerEvent::DetailSnapshot { .. }) {
+                            if let Some(sub) = detail_sub.as_mut() {
+                                sub.snapshot_seen = true;
+                            }
+                        }
+                        app.apply_detail_event(event);
+                    }
+                    SubscriptionMessage::Disconnected(err) => {
+                        // Distinguish "the very first frame failed"
+                        // (workflow doesn't exist, scheduler down) from
+                        // "we had a stream and it dropped mid-way"
+                        // (transient — preserve the overlay's last
+                        // known state and let the reconcile pass spin
+                        // up a fresh subscription).
+                        let saw_snapshot = detail_sub
+                            .as_ref()
+                            .map(|s| s.snapshot_seen)
+                            .unwrap_or(false);
+                        detail_sub = None;
+                        if !saw_snapshot {
+                            app.note_detail_unreachable(err.to_string());
+                        }
                     }
                 }
             }

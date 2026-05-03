@@ -588,12 +588,22 @@ Sliced into three independently-shippable sub-phases:
 - **Orchestrator emission**: add a second `broadcast::Sender<SchedulerEvent>` dedicated to detail events (capacity 256). The mutating-method wrapper pattern from 5.1 grows a `snapshot_details()` / `emit_detail_diff()` pair that mirrors the existing summary diff. We always compute details before+after the inner body and emit one `DetailUpdated` per workflow whose `WorkflowDetail` actually changed — this catches per-node state shifts (e.g. `WorkerFinished` for one apply node) that don't move the surrounding `WorkflowSummary`. A new `Orchestrator::detail_events_subscribe()` exposes a fresh `broadcast::Receiver`.
 - **Control server**: new `run_subscribe_detail_stream` branch in `run_with_streams`. Same shape as `run_subscribe_stream` but: (a) takes `name` from the request, (b) on missing workflow writes one `Error` response and returns, (c) filters every event from the broadcast by `detail.name == name` so a per-workflow subscriber only ever sees its own workflow.
 
-#### 5.3.2 TUI integration — drop polling
+#### 5.3.2 TUI integration — drop polling — ✅ shipped
 
-- New `scheduler_client::subscribe_detail(name)` helper, mirroring `subscribe()`. Returns an `mpsc::UnboundedReceiver` of `DetailSubscriptionMessage { Event(SchedulerEvent), Disconnected(SchedulerError) }`.
-- Main loop: spawn the detail subscription when `App` opens the overlay, abort it when the overlay closes. Reconnect with the same backoff strategy as the summary subscription.
-- Remove `DETAIL_REFRESH_INTERVAL`, `App::detail_refresh_target`, and `App::detail_last_poll`. Remove the periodic `ControlRequest::Detail` poll path. The initial open still does one `Detail` RPC for the optimistic synchronous render so we don't blank the screen for the round-trip.
-- New `App::apply_detail_event` dispatches `DetailSnapshot` and `DetailUpdated` through the existing `apply_workflow_detail` (treating both as authoritative replacements, since they always carry the full detail).
+Delivered:
+
+- **`scheduler_client::subscribe_detail(name)`** mirrors `subscribe()`. Reuses the same `SubscriptionMessage` enum (Event carries `SchedulerEvent::DetailSnapshot`/`DetailUpdated`; Disconnected carries the underlying `SchedulerError`). The shared `drive_subscribe` helper now takes the request as a parameter and adds an explicit branch for `ControlResponse::Error` → `Disconnected(BadResponse(message))` so a SubscribeDetail against an unknown workflow surfaces the server's error verbatim instead of a generic "unexpected non-event frame". 2 new tests in `scheduler_client.rs` (assert the wire frame the client sends + assert the BadResponse path).
+- **Main loop**: new `DetailSubscription { target, rx, snapshot_seen }` held on the run-loop task. Each tick reconciles `app.detail_subscription_target()` against `detail_sub.target` — opening / closing / switching the overlay drops or spawns the underlying SubscribeDetail connection automatically. The dedicated select arm uses `std::future::pending()` as the no-overlay sentinel so it contributes no wakeups when nothing is open. On Disconnected: if `snapshot_seen=false`, surface `note_detail_unreachable` (the workflow likely doesn't exist or the scheduler is down); if true, drop the receiver but keep the overlay — the next reconcile pass re-spawns the subscription.
+- **Polling removed**: the `DETAIL_REFRESH_INTERVAL` branch, the optimistic `app.detail_last_poll = Some(Instant::now())` stamp before each one-shot, and `App::detail_refresh_target` are gone. `App::detail_last_poll` itself stays — repurposed to track "last DetailSnapshot/DetailUpdated received Ns ago" for the freshness badge in the overlay title (the `apply_workflow_detail` stamper already does the right thing under push semantics).
+- **Forced refresh**: the `r` keybinding inside the detail overlay no longer clears the poll timer — it now queues an explicit `ControlRequest::Detail` through `pending_scheduler_actions`, which `main.rs` dispatches as a one-shot. Push events keep the overlay live on their own; `r` is the escape hatch for a user who wants to confirm liveness manually.
+- **Action-result fix-up dropped**: `App::note_scheduler_action_result` no longer clears `detail_last_poll` on success, since the orchestrator's `emit_diff` pushes `DetailUpdated` within ms of the mutation committing.
+- **`App::apply_detail_event`**: dispatches `DetailSnapshot`/`DetailUpdated` through the existing `apply_workflow_detail` and drops events whose `detail.name` doesn't match the open overlay (race during overlay-switch when the prior subscription is still tearing down on the orchestrator side). Summary-stream variants (`Snapshot`/`WorkflowUpdated`) reach the no-op arm — they shouldn't arrive here in production but the App stays robust under a forward-compat scheduler that multiplexes.
+
+5 net new tests in `clhorde-tui` (workspace 750 → 755):
+- 2 in `scheduler_client` (subscribe_detail wire round-trip; unknown workflow → `BadResponse`).
+- 4 in `app` (`detail_subscription_target` reflects overlay state; `apply_detail_event` routes Snapshot+Update + drops mismatched-name frames; `apply_detail_event` ignores summary variants; `note_scheduler_action_result` no longer touches `detail_last_poll`).
+- −1 obsolete test (`detail_refresh_target_throttled` — function removed).
+- 1 test rewritten (`r_inside_detail_clears_poll_timer` → `r_inside_detail_queues_explicit_detail_request` since `r`'s semantics changed).
 
 #### 5.3.3 Web bridge + SPA push
 
@@ -651,8 +661,8 @@ Open questions (to resolve during 5.3.1):
 | **4.3** | ✅ shipped | Workflow detail view + freshness badges (push subscribe deferred) | Per-section DAG zoom + 2s auto-refresh — 18 new tests. |
 | **5.1** | ✅ shipped | Push-based scheduler `Subscribe` + broadcast-backed event stream | Replaces 2s status polling — 20 new tests. |
 | **5.2** | ✅ shipped | Web routes + Drafts/Workflows SPA tabs | Browser dashboard reaches feature parity with TUI tabs — 14 new tests. |
-| **5.3.1** | ⏳ in progress | `SubscribeDetail` wire + orchestrator detail broadcast + control-server stream branch | Server-side push surface for one workflow's `WorkflowDetail`. |
-| **5.3.2** | ⏳ pending | TUI: spawn/abort detail subscription with overlay; drop 2s polling | Removes the last polling path inside the TUI. |
+| **5.3.1** | ✅ shipped | `SubscribeDetail` wire + orchestrator detail broadcast + control-server stream branch | Server-side push surface for one workflow's `WorkflowDetail` — 12 new tests. |
+| **5.3.2** | ✅ shipped | TUI: spawn/abort detail subscription with overlay; drop 2s polling | Removes the last polling path inside the TUI — 5 net new tests. |
 | **5.3.3** | ⏳ pending | Web: forward DetailSnapshot/DetailUpdated through the existing WS envelope; SPA replaces expanded card on push | SPA reaches push parity with the TUI. |
 | **5.x** | ⏳ pending | Advanced (parallel safety, inter-workflow deps, hooks, multi-repo) | Polish. |
 

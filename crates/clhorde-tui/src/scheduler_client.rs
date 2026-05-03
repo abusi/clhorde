@@ -110,9 +110,45 @@ pub fn subscribe() -> mpsc::UnboundedReceiver<SubscriptionMessage> {
 /// Variant of [`subscribe`] that targets an explicit socket path.
 /// Used by tests against an in-memory `UnixListener`.
 pub fn subscribe_at(path: PathBuf) -> mpsc::UnboundedReceiver<SubscriptionMessage> {
+    spawn_subscribe(path, ControlRequest::Subscribe)
+}
+
+/// Spawn a long-lived subscribe-detail task scoped to one workflow's
+/// [`clhorde_core::control::WorkflowDetail`].
+///
+/// Sends one [`ControlRequest::SubscribeDetail`] frame, then forwards
+/// every [`ControlResponse::Event`] frame the server produces — those
+/// are filtered server-side to events for `name`, so the receiver only
+/// ever sees [`SchedulerEvent::DetailSnapshot`] /
+/// [`SchedulerEvent::DetailUpdated`] for the requested workflow.
+///
+/// On unknown workflow the server replies with a single
+/// [`ControlResponse::Error`] and closes; that surfaces here as a
+/// [`SubscriptionMessage::Disconnected`] carrying a
+/// [`SchedulerError::BadResponse`] with the server's message —
+/// callers can distinguish "scheduler unreachable" from "no such
+/// workflow" by inspecting the variant.
+pub fn subscribe_detail(name: String) -> mpsc::UnboundedReceiver<SubscriptionMessage> {
+    subscribe_detail_at(scheduler_socket_path(), name)
+}
+
+/// Variant of [`subscribe_detail`] that targets an explicit socket path.
+pub fn subscribe_detail_at(
+    path: PathBuf,
+    name: String,
+) -> mpsc::UnboundedReceiver<SubscriptionMessage> {
+    spawn_subscribe(path, ControlRequest::SubscribeDetail { name })
+}
+
+/// Shared spawn helper for [`subscribe_at`] and [`subscribe_detail_at`].
+/// Differs only in the request frame written before the read loop.
+fn spawn_subscribe(
+    path: PathBuf,
+    req: ControlRequest,
+) -> mpsc::UnboundedReceiver<SubscriptionMessage> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let err = match drive_subscribe(path, tx.clone()).await {
+        let err = match drive_subscribe(path, req, tx.clone()).await {
             Ok(()) => SchedulerError::Io(io::Error::other("connection closed")),
             Err(e) => e,
         };
@@ -123,6 +159,7 @@ pub fn subscribe_at(path: PathBuf) -> mpsc::UnboundedReceiver<SubscriptionMessag
 
 async fn drive_subscribe(
     path: PathBuf,
+    req: ControlRequest,
     tx: mpsc::UnboundedSender<SubscriptionMessage>,
 ) -> Result<(), SchedulerError> {
     let stream = UnixStream::connect(&path)
@@ -130,8 +167,7 @@ async fn drive_subscribe(
         .map_err(SchedulerError::Unreachable)?;
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    // Send one Subscribe frame.
-    let json = serde_json::to_vec(&ControlRequest::Subscribe)
+    let json = serde_json::to_vec(&req)
         .map_err(|e| SchedulerError::BadResponse(format!("encode: {e}")))?;
     let frame = ipc::encode_frame(&json);
     writer.write_all(&frame).await.map_err(SchedulerError::Io)?;
@@ -161,6 +197,13 @@ async fn drive_subscribe(
                     // Owner dropped the receiver — nothing more to do.
                     return Ok(());
                 }
+            }
+            ControlResponse::Error { message } => {
+                // SubscribeDetail against an unknown workflow surfaces
+                // a single Error frame, then EOF. Carry the server's
+                // message so callers can show "no such workflow" vs.
+                // "scheduler unreachable" distinctly.
+                return Err(SchedulerError::BadResponse(message));
             }
             other => {
                 // The server shouldn't speak any other variant on a
@@ -385,6 +428,125 @@ mod tests {
             other => panic!("expected Unreachable disconnect, got {other:?}"),
         }
         // Channel closes after the disconnect frame.
+        assert!(rx.recv().await.is_none());
+    }
+
+    /// Helper: read the request frame into a [`ControlRequest`] so the
+    /// detail-subscribe tests can assert the wire frame the client
+    /// actually sent.
+    async fn read_one_request<R>(reader: &mut R) -> ControlRequest
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await.unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        reader.read_exact(&mut payload).await.unwrap();
+        serde_json::from_slice(&payload).unwrap()
+    }
+
+    fn detail_with_status(name: &str, status: &str) -> clhorde_core::control::WorkflowDetail {
+        clhorde_core::control::WorkflowDetail {
+            name: name.into(),
+            status: status.into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            apply: vec![],
+            verify: None,
+            archive: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_detail_sends_request_and_forwards_events() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("sched.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let snap_detail = detail_with_status("alpha", "queued");
+        let upd_detail = detail_with_status("alpha", "implementing");
+
+        let snap_for_server = snap_detail.clone();
+        let upd_for_server = upd_detail.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = tokio::io::split(stream);
+
+            // Verify the client sent a SubscribeDetail with the right name.
+            let req = read_one_request(&mut r).await;
+            assert!(matches!(
+                req,
+                ControlRequest::SubscribeDetail { ref name } if name == "alpha"
+            ));
+
+            for event in [
+                SchedulerEvent::DetailSnapshot {
+                    detail: snap_for_server,
+                },
+                SchedulerEvent::DetailUpdated {
+                    detail: upd_for_server,
+                },
+            ] {
+                let resp = ControlResponse::Event { event };
+                let body = serde_json::to_vec(&resp).unwrap();
+                let frame = ipc::encode_frame(&body);
+                w.write_all(&frame).await.unwrap();
+            }
+            w.flush().await.unwrap();
+        });
+
+        let mut rx = subscribe_detail_at(path, "alpha".into());
+        match rx.recv().await.expect("snapshot") {
+            SubscriptionMessage::Event(SchedulerEvent::DetailSnapshot { detail }) => {
+                assert_eq!(detail, snap_detail);
+            }
+            other => panic!("expected DetailSnapshot, got {other:?}"),
+        }
+        match rx.recv().await.expect("update") {
+            SubscriptionMessage::Event(SchedulerEvent::DetailUpdated { detail }) => {
+                assert_eq!(detail, upd_detail);
+            }
+            other => panic!("expected DetailUpdated, got {other:?}"),
+        }
+        // Server closed the socket → Disconnected closes out the channel.
+        match rx.recv().await.expect("disconnect") {
+            SubscriptionMessage::Disconnected(_) => {}
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_detail_unknown_workflow_surfaces_bad_response() {
+        // Server responds with a single ControlResponse::Error and
+        // closes — the client should turn that into a
+        // Disconnected(BadResponse(message)) so the owner can show a
+        // "no such workflow" toast distinct from "scheduler down".
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("sched.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = tokio::io::split(stream);
+            let _ = read_one_request(&mut r).await;
+            let resp = ControlResponse::Error {
+                message: "no such workflow: missing".into(),
+            };
+            let body = serde_json::to_vec(&resp).unwrap();
+            let frame = ipc::encode_frame(&body);
+            w.write_all(&frame).await.unwrap();
+            w.flush().await.unwrap();
+        });
+
+        let mut rx = subscribe_detail_at(path, "missing".into());
+        match rx.recv().await.expect("error frame") {
+            SubscriptionMessage::Disconnected(SchedulerError::BadResponse(msg)) => {
+                assert!(msg.contains("missing"), "unexpected error message: {msg}");
+            }
+            other => panic!("expected Disconnected(BadResponse), got {other:?}"),
+        }
         assert!(rx.recv().await.is_none());
     }
 }
