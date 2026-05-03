@@ -164,6 +164,12 @@ pub fn dispatch_request(
                 Err(e) => map_err_to_response(e),
             }
         }
+        ControlRequest::Detail { name } => match orch.detail(&name) {
+            Some(detail) => ControlResponse::Detail { detail },
+            None => ControlResponse::Error {
+                message: format!("no such workflow: {name}"),
+            },
+        },
     }
 }
 
@@ -443,6 +449,50 @@ mod tests {
         match resp {
             ControlResponse::Error { message } => assert!(message.contains("ghost")),
             other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_detail_unknown_workflow_errors() {
+        let (_tmp, orch, _rx) = fixture();
+        let mut g = orch.lock().unwrap();
+        let resp = dispatch_request(
+            &mut g,
+            ControlRequest::Detail {
+                name: "ghost".into(),
+            },
+        );
+        match resp {
+            ControlResponse::Error { message } => assert!(message.contains("ghost")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_detail_returns_workflow_with_empty_apply_before_parse() {
+        // A Drafted workflow has no DAG yet. The Detail response should
+        // still come back successfully — apply just empty — so the TUI
+        // can render the placeholder body.
+        let (tmp, orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        {
+            let mut g = orch.lock().unwrap();
+            g.reconcile().unwrap();
+        }
+        let mut g = orch.lock().unwrap();
+        let resp = dispatch_request(
+            &mut g,
+            ControlRequest::Detail { name: "x".into() },
+        );
+        match resp {
+            ControlResponse::Detail { detail } => {
+                assert_eq!(detail.name, "x");
+                assert_eq!(detail.status, "drafted");
+                assert!(detail.apply.is_empty());
+                assert!(detail.verify.is_none());
+                assert!(detail.archive.is_none());
+            }
+            other => panic!("expected Detail, got {other:?}"),
         }
     }
 

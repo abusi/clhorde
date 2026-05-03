@@ -38,6 +38,7 @@ const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Result fed back from a spawned scheduler poll. The main loop
 /// consumes these and updates `App` state accordingly.
+#[allow(clippy::large_enum_variant)]
 enum SchedulerPollOutcome {
     Status {
         workflows: Vec<clhorde_core::control::WorkflowSummary>,
@@ -52,7 +53,16 @@ enum SchedulerPollOutcome {
     /// `false` for `Error`/network failure. The message is shown verbatim
     /// in the status line.
     ActionResult { ok: bool, message: String },
+    /// A `Detail` response arrived; populate the detail overlay.
+    Detail(clhorde_core::control::WorkflowDetail),
+    /// A `Detail` request failed (scheduler unreachable, workflow
+    /// disappeared, etc.). Carries the error message.
+    DetailError(String),
 }
+
+/// How often we re-fetch the open detail overlay. Same cadence as the
+/// list-status poll so the user sees consistent freshness.
+const DETAIL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -231,41 +241,29 @@ async fn run_app(
                     });
                 }
 
-                // Drain Q/X/T action requests the user composed since
-                // the previous tick. One spawn per request — tiny cost,
-                // results land on the same `sched_rx` channel as polls.
+                // Drain Q/X/T/Detail action requests the user composed
+                // since the previous tick. One spawn per request — tiny
+                // cost, results land on the same `sched_rx` channel.
                 for req in app.take_pending_scheduler_actions() {
                     let tx = sched_tx.clone();
                     tokio::spawn(async move {
-                        let outcome = match scheduler_client::request(req).await {
-                            Ok(ControlResponse::Ok { message }) => {
-                                SchedulerPollOutcome::ActionResult {
-                                    ok: true,
-                                    message,
-                                }
-                            }
-                            Ok(ControlResponse::Error { message }) => {
-                                SchedulerPollOutcome::ActionResult {
-                                    ok: false,
-                                    message,
-                                }
-                            }
-                            Ok(_) => SchedulerPollOutcome::ActionResult {
-                                ok: false,
-                                message: "unexpected response".into(),
-                            },
-                            Err(SchedulerError::Unreachable(_)) => {
-                                SchedulerPollOutcome::ActionResult {
-                                    ok: false,
-                                    message: "not reachable".into(),
-                                }
-                            }
-                            Err(e) => SchedulerPollOutcome::ActionResult {
-                                ok: false,
-                                message: e.to_string(),
-                            },
-                        };
-                        let _ = tx.send(outcome);
+                        dispatch_scheduler_action(req, tx).await;
+                    });
+                }
+
+                // Auto-refresh the detail overlay every 2s while open,
+                // so the user sees state advance without a keystroke.
+                if let Some(name) = app.detail_refresh_target(DETAIL_REFRESH_INTERVAL) {
+                    // Stamp the timer optimistically so we don't fire a
+                    // second request before this one returns.
+                    app.detail_last_poll = Some(Instant::now());
+                    let tx = sched_tx.clone();
+                    tokio::spawn(async move {
+                        dispatch_scheduler_action(
+                            ControlRequest::Detail { name },
+                            tx,
+                        )
+                        .await;
                     });
                 }
             }
@@ -284,6 +282,12 @@ async fn run_app(
                         // Action results aren't polls — don't touch the
                         // in-flight flag.
                         app.note_scheduler_action_result(ok, message);
+                    }
+                    SchedulerPollOutcome::Detail(detail) => {
+                        app.apply_workflow_detail(detail);
+                    }
+                    SchedulerPollOutcome::DetailError(msg) => {
+                        app.note_detail_unreachable(msg);
                     }
                 }
             }
@@ -321,6 +325,67 @@ async fn run_app(
             return Ok(());
         }
     }
+}
+
+/// Dispatch a single [`ControlRequest`] over the scheduler control
+/// socket and forward the result back through `tx`. Knows about
+/// `Detail` (returns a [`SchedulerPollOutcome::Detail`] /
+/// [`SchedulerPollOutcome::DetailError`]) and falls back to the
+/// generic Ok/Error toast for every other request type.
+async fn dispatch_scheduler_action(
+    req: ControlRequest,
+    tx: mpsc::UnboundedSender<SchedulerPollOutcome>,
+) {
+    let is_detail = matches!(req, ControlRequest::Detail { .. });
+    let outcome = match scheduler_client::request(req).await {
+        Ok(ControlResponse::Detail { detail }) => SchedulerPollOutcome::Detail(detail),
+        Ok(ControlResponse::Ok { message }) => SchedulerPollOutcome::ActionResult {
+            ok: true,
+            message,
+        },
+        Ok(ControlResponse::Error { message }) => {
+            if is_detail {
+                SchedulerPollOutcome::DetailError(message)
+            } else {
+                SchedulerPollOutcome::ActionResult {
+                    ok: false,
+                    message,
+                }
+            }
+        }
+        Ok(_) => {
+            if is_detail {
+                SchedulerPollOutcome::DetailError("unexpected response".into())
+            } else {
+                SchedulerPollOutcome::ActionResult {
+                    ok: false,
+                    message: "unexpected response".into(),
+                }
+            }
+        }
+        Err(SchedulerError::Unreachable(_)) => {
+            if is_detail {
+                SchedulerPollOutcome::DetailError("not reachable".into())
+            } else {
+                SchedulerPollOutcome::ActionResult {
+                    ok: false,
+                    message: "not reachable".into(),
+                }
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if is_detail {
+                SchedulerPollOutcome::DetailError(msg)
+            } else {
+                SchedulerPollOutcome::ActionResult {
+                    ok: false,
+                    message: msg,
+                }
+            }
+        }
+    };
+    let _ = tx.send(outcome);
 }
 
 /// Returns true if the next tick should kick off a scheduler poll.

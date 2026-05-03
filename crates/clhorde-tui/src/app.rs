@@ -11,7 +11,7 @@ use crate::editor::TextBuffer;
 use crate::key_encoding;
 use crate::keymap::{FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction};
 use crate::pty_renderer::PtyRenderer;
-use clhorde_core::control::{ControlRequest, WorkflowSummary};
+use clhorde_core::control::{ControlRequest, WorkflowDetail, WorkflowSummary};
 use clhorde_core::prompt::{PromptMode, PromptStatus};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent, DaemonState, PromptInfo};
 
@@ -165,6 +165,15 @@ pub struct App {
     /// When `Some`, main.rs should suspend the terminal and run
     /// `$PAGER <path>` on this file before resuming.
     pub pending_pager_path: Option<PathBuf>,
+    /// When `Some`, the user has zoomed into a single workflow on the
+    /// Workflows tab — the main area renders [`WorkflowDetail`]
+    /// instead of the list. `Esc` clears it.
+    pub workflow_detail: Option<WorkflowDetail>,
+    /// Scroll offset inside the detail view (in lines).
+    pub detail_scroll: u16,
+    /// Last time we re-fetched the open detail. Used to throttle the
+    /// auto-refresh while the overlay is open.
+    pub detail_last_poll: Option<Instant>,
 }
 
 /// Buffered state for the "press T to retry section" inline prompt.
@@ -243,6 +252,9 @@ impl App {
             pending_scheduler_actions: Vec::new(),
             retry_section_input: None,
             pending_pager_path: None,
+            workflow_detail: None,
+            detail_scroll: 0,
+            detail_last_poll: None,
         }
     }
 
@@ -630,16 +642,33 @@ impl App {
     /// Handle a key while the active tab is Drafts or Workflows.
     /// Phase 4.1 added navigation + refresh + tab switching + quit.
     /// Phase 4.2 layers Q/X/T/E/R action keys on top.
+    /// Phase 4.3 adds the detail overlay (Enter on Workflows).
     fn handle_root_view_key(&mut self, key: KeyEvent) {
         // The retry-section inline prompt steals all keys while open.
         if self.retry_section_input.is_some() {
             self.handle_retry_section_input_key(key);
             return;
         }
+        // The workflow detail overlay also intercepts most keys —
+        // navigation (j/k), refresh (r), close (Esc/Enter), and the
+        // workflow-scoped action keys (Shift-X / Shift-T / Shift-R).
+        if self.workflow_detail.is_some() {
+            self.handle_workflow_detail_key(key);
+            return;
+        }
         // Esc returns to the Prompts tab so the user can always bail
         // back to the familiar view with one keystroke.
         if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
             self.set_root_view(RootView::Prompts);
+            return;
+        }
+        // Enter on Workflows tab opens the detail overlay for the
+        // selected workflow.
+        if key.code == KeyCode::Enter
+            && key.modifiers == KeyModifiers::NONE
+            && self.root_view == RootView::Workflows
+        {
+            self.open_selected_workflow_detail();
             return;
         }
         // q quits (same semantics as the Prompts tab).
@@ -696,6 +725,150 @@ impl App {
             KeyCode::Char('G') => self.root_view_select_last(),
             _ => {}
         }
+    }
+
+    /// Key handling while the [`workflow_detail`] overlay is open.
+    /// Esc closes; j/k scrolls; r forces a refresh; gg/G jump to top
+    /// or bottom; the action keys (Shift-X/T/R) still work and target
+    /// the open workflow.
+    fn handle_workflow_detail_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {
+                self.close_workflow_detail();
+            }
+            (KeyCode::Char('q'), KeyModifiers::NONE) => {
+                if self.active_workers > 0 {
+                    self.confirm_quit = true;
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                // Force the next tick to refetch — same idiom as the
+                // status poll on the list views.
+                self.detail_last_poll = None;
+            }
+            (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
+                self.detail_scroll = self.detail_scroll.saturating_add(1);
+            }
+            (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, KeyModifiers::NONE) => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+            }
+            (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                self.detail_scroll = 0;
+            }
+            (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
+                self.detail_scroll = u16::MAX;
+            }
+            (KeyCode::Char('?'), KeyModifiers::NONE) => {
+                self.show_help_overlay = true;
+            }
+            (KeyCode::Char('X'), KeyModifiers::SHIFT) => {
+                self.cancel_open_detail_workflow();
+            }
+            (KeyCode::Char('T'), KeyModifiers::SHIFT) => {
+                self.start_retry_section_prompt_for_open_detail();
+            }
+            (KeyCode::Char('R'), KeyModifiers::SHIFT) => {
+                self.start_pager_for_open_detail();
+            }
+            _ => {}
+        }
+    }
+
+    fn open_selected_workflow_detail(&mut self) {
+        if !self.scheduler_reachable {
+            self.set_status_message("scheduler not reachable");
+            return;
+        }
+        let Some(wf) = self.workflows.get(self.workflows_selected) else {
+            return;
+        };
+        // Optimistic shell so the UI flips immediately and the user
+        // sees the workflow name; the real content arrives when the
+        // Detail response lands. We synthesize an empty detail from
+        // the existing summary to avoid a blank flash.
+        let optimistic = WorkflowDetail {
+            name: wf.name.clone(),
+            status: wf.status.clone(),
+            failure_reason: wf.failure_reason.clone(),
+            priority: wf.priority,
+            queued_at: wf.queued_at,
+            started_at: wf.started_at,
+            finished_at: wf.finished_at,
+            apply: Vec::new(),
+            verify: None,
+            archive: None,
+        };
+        self.workflow_detail = Some(optimistic);
+        self.detail_scroll = 0;
+        self.detail_last_poll = None;
+        // Queue the fetch — main.rs drains pending actions next tick.
+        self.pending_scheduler_actions
+            .push(ControlRequest::Detail {
+                name: wf.name.clone(),
+            });
+    }
+
+    fn close_workflow_detail(&mut self) {
+        self.workflow_detail = None;
+        self.detail_scroll = 0;
+        self.detail_last_poll = None;
+    }
+
+    fn cancel_open_detail_workflow(&mut self) {
+        let Some(detail) = self.workflow_detail.as_ref() else {
+            return;
+        };
+        if !self.scheduler_reachable {
+            self.set_status_message("scheduler not reachable");
+            return;
+        }
+        let name = detail.name.clone();
+        self.pending_scheduler_actions
+            .push(ControlRequest::Cancel { name: name.clone() });
+        self.set_status_message(format!("cancelling {name}…"));
+    }
+
+    fn start_retry_section_prompt_for_open_detail(&mut self) {
+        let Some(detail) = self.workflow_detail.as_ref() else {
+            return;
+        };
+        if !self.scheduler_reachable {
+            self.set_status_message("scheduler not reachable");
+            return;
+        }
+        self.retry_section_input = Some(RetrySectionInput {
+            workflow: detail.name.clone(),
+            buffer: String::new(),
+        });
+    }
+
+    fn start_pager_for_open_detail(&mut self) {
+        let Some(detail) = self.workflow_detail.as_ref() else {
+            return;
+        };
+        let Some(root) = self.scheduler_root.as_ref() else {
+            self.set_status_message(
+                "scheduler root unknown (waiting for first poll)",
+            );
+            return;
+        };
+        let dir = root.join("openspec").join("changes").join(&detail.name);
+        let proposal = dir.join("proposal.md");
+        let design = dir.join("design.md");
+        let path = if proposal.is_file() {
+            proposal
+        } else if design.is_file() {
+            design
+        } else {
+            self.set_status_message(format!(
+                "no proposal.md or design.md in {}",
+                dir.display()
+            ));
+            return;
+        };
+        self.pending_pager_path = Some(path);
     }
 
     fn handle_retry_section_input_key(&mut self, key: KeyEvent) {
@@ -1008,6 +1181,72 @@ impl App {
         if ok {
             // Force the next tick to refetch state.
             self.scheduler_last_poll = None;
+            // If the detail overlay is open, also refetch its content
+            // so the user sees the result of their action immediately.
+            if self.workflow_detail.is_some() {
+                self.detail_last_poll = None;
+            }
+        }
+    }
+
+    /// Apply a [`WorkflowDetail`] received from the scheduler. Always
+    /// updates the cached detail (including scroll offset reset on the
+    /// first open) but only stamps the poll timer once a request is in
+    /// flight.
+    pub fn apply_workflow_detail(&mut self, detail: WorkflowDetail) {
+        // Resetting scroll on every refresh would be jarring while the
+        // user is reading; only reset when we open a new workflow.
+        let same = self
+            .workflow_detail
+            .as_ref()
+            .is_some_and(|d| d.name == detail.name);
+        self.workflow_detail = Some(detail);
+        if !same {
+            self.detail_scroll = 0;
+        }
+        self.detail_last_poll = Some(Instant::now());
+    }
+
+    /// Note that a `Detail` request failed (workflow disappeared, etc).
+    /// Closes the overlay and surfaces the error.
+    pub fn note_detail_unreachable(&mut self, message: String) {
+        self.workflow_detail = None;
+        self.detail_last_poll = Some(Instant::now());
+        self.set_status_message(format!("detail: {message}"));
+    }
+
+    /// Age (in whole seconds) of the most recent successful scheduler
+    /// poll, for the staleness indicator. Returns `None` when no poll
+    /// has ever succeeded — the UI can then show the unreachable hint
+    /// instead of a "0s" badge.
+    pub fn scheduler_last_refresh_age_secs(&self) -> Option<u64> {
+        let t = self.scheduler_last_poll?;
+        if !self.scheduler_reachable {
+            return None;
+        }
+        Some(Instant::now().duration_since(t).as_secs())
+    }
+
+    /// Same idea for the detail overlay — drives the per-detail
+    /// "updated Ns ago" badge in the title.
+    pub fn detail_last_refresh_age_secs(&self) -> Option<u64> {
+        let t = self.detail_last_poll?;
+        Some(Instant::now().duration_since(t).as_secs())
+    }
+
+    /// Returns the next workflow name we should re-fetch detail for, if
+    /// any. Empty when no overlay is open or the throttle hasn't
+    /// elapsed.
+    pub fn detail_refresh_target(&self, refresh_after: std::time::Duration) -> Option<String> {
+        let detail = self.workflow_detail.as_ref()?;
+        let due = match self.detail_last_poll {
+            None => true,
+            Some(t) => Instant::now().duration_since(t) >= refresh_after,
+        };
+        if due {
+            Some(detail.name.clone())
+        } else {
+            None
         }
     }
 
@@ -2487,6 +2726,9 @@ mod tests {
             pending_scheduler_actions: Vec::new(),
             retry_section_input: None,
             pending_pager_path: None,
+            workflow_detail: None,
+            detail_scroll: 0,
+            detail_last_poll: None,
         };
         app.list_state.select(None);
         (app, daemon_rx)
@@ -3651,5 +3893,185 @@ mod tests {
         let before = app.scheduler_last_poll;
         app.note_scheduler_action_result(false, "boom".into());
         assert_eq!(app.scheduler_last_poll, before);
+    }
+
+    // ── Phase 4.3: workflow detail overlay ──
+
+    fn empty_detail(name: &str) -> WorkflowDetail {
+        WorkflowDetail {
+            name: name.into(),
+            status: "implementing".into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            apply: vec![],
+            verify: None,
+            archive: None,
+        }
+    }
+
+    #[test]
+    fn enter_on_workflows_opens_detail_and_queues_request() {
+        let (mut app, _rx) = workflows_app();
+        app.workflows_selected = 0; // running
+        app.handle_key(key_press(KeyCode::Enter));
+        // Optimistic shell already set so the UI flips immediately.
+        let d = app.workflow_detail.as_ref().unwrap();
+        assert_eq!(d.name, "running");
+        // The Detail request is queued for the main loop.
+        let actions = app.take_pending_scheduler_actions();
+        match &actions[..] {
+            [ControlRequest::Detail { name }] => assert_eq!(name, "running"),
+            other => panic!("expected one Detail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_workflows_when_unreachable_does_not_open() {
+        let (mut app, _rx) = workflows_app();
+        app.scheduler_reachable = false;
+        app.handle_key(key_press(KeyCode::Enter));
+        assert!(app.workflow_detail.is_none());
+        assert!(app.take_pending_scheduler_actions().is_empty());
+    }
+
+    #[test]
+    fn esc_closes_detail_overlay_without_leaving_tab() {
+        let (mut app, _rx) = workflows_app();
+        app.workflow_detail = Some(empty_detail("running"));
+        app.handle_key(key_press(KeyCode::Esc));
+        assert!(app.workflow_detail.is_none());
+        // Stays on Workflows — Esc inside the detail closes the
+        // overlay, not the tab.
+        assert_eq!(app.root_view, RootView::Workflows);
+    }
+
+    #[test]
+    fn jk_scrolls_inside_detail() {
+        let (mut app, _rx) = workflows_app();
+        app.workflow_detail = Some(empty_detail("running"));
+        app.handle_key(key_press(KeyCode::Char('j')));
+        app.handle_key(key_press(KeyCode::Char('j')));
+        assert_eq!(app.detail_scroll, 2);
+        app.handle_key(key_press(KeyCode::Char('k')));
+        assert_eq!(app.detail_scroll, 1);
+    }
+
+    #[test]
+    fn r_inside_detail_clears_poll_timer() {
+        let (mut app, _rx) = workflows_app();
+        app.workflow_detail = Some(empty_detail("running"));
+        app.detail_last_poll = Some(Instant::now());
+        app.handle_key(key_press(KeyCode::Char('r')));
+        assert!(app.detail_last_poll.is_none());
+    }
+
+    #[test]
+    fn shift_x_in_detail_targets_open_workflow() {
+        let (mut app, _rx) = workflows_app();
+        app.workflow_detail = Some(empty_detail("running"));
+        // Move selection so the list-side workflow doesn't match —
+        // ensures Shift-X resolves the *detail's* name, not the list
+        // selection.
+        app.workflows_selected = 1; // waiting
+        app.handle_key(key_shift(KeyCode::Char('X')));
+        let actions = app.take_pending_scheduler_actions();
+        match &actions[..] {
+            [ControlRequest::Cancel { name }] => assert_eq!(name, "running"),
+            other => panic!("expected one Cancel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shift_t_in_detail_targets_open_workflow() {
+        let (mut app, _rx) = workflows_app();
+        app.workflow_detail = Some(empty_detail("running"));
+        app.workflows_selected = 1; // waiting
+        app.handle_key(key_shift(KeyCode::Char('T')));
+        let inp = app.retry_section_input.as_ref().unwrap();
+        assert_eq!(inp.workflow, "running");
+    }
+
+    #[test]
+    fn apply_workflow_detail_resets_scroll_only_on_workflow_change() {
+        let (mut app, _rx) = new_test_app();
+        app.detail_scroll = 12;
+        // Same name → keep the user's scroll position.
+        app.workflow_detail = Some(empty_detail("running"));
+        app.apply_workflow_detail(empty_detail("running"));
+        assert_eq!(app.detail_scroll, 12);
+        // Different name → fresh scroll.
+        app.apply_workflow_detail(empty_detail("waiting"));
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn detail_refresh_target_throttled() {
+        let (mut app, _rx) = new_test_app();
+        // No overlay → no refresh.
+        assert!(app
+            .detail_refresh_target(std::time::Duration::from_secs(2))
+            .is_none());
+        app.workflow_detail = Some(empty_detail("running"));
+        app.detail_last_poll = Some(Instant::now());
+        // Just polled — within throttle.
+        assert!(app
+            .detail_refresh_target(std::time::Duration::from_secs(2))
+            .is_none());
+        // Pretend the poll happened a long time ago.
+        app.detail_last_poll = Some(Instant::now() - std::time::Duration::from_secs(5));
+        assert_eq!(
+            app.detail_refresh_target(std::time::Duration::from_secs(2)),
+            Some("running".into())
+        );
+    }
+
+    #[test]
+    fn last_refresh_age_none_when_never_polled() {
+        let (app, _rx) = new_test_app();
+        assert!(app.scheduler_last_refresh_age_secs().is_none());
+    }
+
+    #[test]
+    fn last_refresh_age_none_when_unreachable() {
+        // The badge is meaningless when the scheduler is down — the
+        // unreachable banner already covers that case.
+        let (mut app, _rx) = new_test_app();
+        app.scheduler_last_poll = Some(Instant::now());
+        app.scheduler_reachable = false;
+        assert!(app.scheduler_last_refresh_age_secs().is_none());
+    }
+
+    #[test]
+    fn last_refresh_age_returns_seconds_since_poll() {
+        let (mut app, _rx) = new_test_app();
+        app.scheduler_reachable = true;
+        app.scheduler_last_poll =
+            Some(Instant::now() - std::time::Duration::from_secs(7));
+        let age = app.scheduler_last_refresh_age_secs().unwrap();
+        // ~7s — allow a tick of slack so a slow runner doesn't flake.
+        assert!((6..=8).contains(&age), "got {age}");
+    }
+
+    #[test]
+    fn detail_last_refresh_age_independent_of_reachability() {
+        let (mut app, _rx) = new_test_app();
+        app.scheduler_reachable = false; // shouldn't affect detail age
+        app.detail_last_poll =
+            Some(Instant::now() - std::time::Duration::from_secs(3));
+        let age = app.detail_last_refresh_age_secs().unwrap();
+        assert!((2..=4).contains(&age), "got {age}");
+    }
+
+    #[test]
+    fn detail_unreachable_closes_overlay_with_message() {
+        let (mut app, _rx) = workflows_app();
+        app.workflow_detail = Some(empty_detail("running"));
+        app.note_detail_unreachable("workflow disappeared".into());
+        assert!(app.workflow_detail.is_none());
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("workflow disappeared"));
     }
 }

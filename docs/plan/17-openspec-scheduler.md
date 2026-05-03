@@ -25,10 +25,10 @@ Tracked on branch `feat/prompt-dependencies`.
 | 3   `clhorde-cli flow` wrappers + scheduler control socket | ✅ shipped | `~/.local/share/clhorde/scheduler.sock`, live remote-control; 25 new tests |
 | 4.1 TUI tabs (foundation, read-only) | ✅ shipped | `RootView`, tab bar, scheduler-control client, polled Drafts/Workflows panes; 13 new tests |
 | 4.2 TUI tabs (actions: Q/X/T/E/R) | ✅ shipped | `Queue` control variant + `root` on `Status`; pager suspend/restore; retry-section inline prompt; 24 new tests |
-| 4.3 TUI workflow detail view + auto-refresh polish | ⏳ pending | |
-| 5   Advanced / web | ⏳ pending | |
+| 4.3 TUI workflow detail view + freshness badges | ✅ shipped | `Detail` control variant + `Orchestrator::detail`; Enter zoom + auto-refresh; staleness suffix on titles; 22 new tests. Push-based subscribe deferred to Phase 5. |
+| 5   Advanced / web | ⏳ pending | Includes push-based subscribe. |
 
-Workspace tests: **682 passing**, none ignored.
+Workspace tests: **704 passing**, none ignored.
 
 ## Vision
 
@@ -448,7 +448,21 @@ Sub-sliced like Phase 2:
 
 - **4.1 — Foundation** (✅ shipped). Tab bar, `RootView { Prompts, Drafts, Workflows }`, scheduler-control client in the TUI, read-only Drafts/Workflows panes that poll the scheduler control socket every 2s while active. The Prompts tab is unchanged.
 - **4.2 — Actions** (✅ shipped). `Q` queues the selected draft, `X` cancels the selected workflow, `T` opens an inline section prompt and dispatches a retry, `R` opens `proposal.md` (falling back to `design.md`) in `$PAGER`, `E` jumps back to Prompts in Insert mode with the scheduler root pre-filled as the cwd prefix.
-- **4.3 — Detail view** (⏳ pending). On Enter against a workflow, show the DAG and per-section prompt status. Auto-refresh polish (push-based subscribe rather than poll, backpressure, staleness indicator).
+- **4.3 — Detail view + freshness badges** (✅ shipped). Enter on a workflow zooms into a per-section DAG view with phase-by-phase dispatch state (running/completed/failed/pending + prompt id, exit code, deps). Esc closes; the same X/T/R action keys work in the overlay and target the open workflow. Title bars carry a "·  Ns" staleness suffix on the lists and the detail. Auto-refresh polls the open detail every 2s; push-based subscribe is deferred to Phase 5 because it needs a broadcast surface inside the scheduler that's larger than the rest of 4.3 combined.
+
+### 4.3 Delivered
+
+- **Protocol:** new `ControlRequest::Detail { name }` and `ControlResponse::Detail { detail: WorkflowDetail }`. `WorkflowDetail` carries the same top-level shape as `WorkflowSummary` plus three phase slots — `apply: Vec<DetailNode>`, `verify: Option<DetailNode>`, `archive: Option<DetailNode>`. Each `DetailNode` exposes `id`, `label`, `state` (`pending`/`running`/`completed`/`failed`), optional `prompt_id` / `prompt_uuid` / `exit_code`, and `depends_on` for apply nodes. All optionals serde-default for forward compat.
+- **Scheduler:** `Orchestrator::detail(name)` merges the persisted `Workflow` with the in-memory `WorkflowRuntime` (DAG + per-node `NodeDispatch`). State labels come from a single `node_state_label` helper that mirrors the orchestrator's own state-machine, so the wire view never disagrees with reconcile decisions. `dispatch_request` plumbs the new variant; unknown workflows return `Error`.
+- **TUI overlay:** new `App` fields `workflow_detail` / `detail_scroll` / `detail_last_poll`. Enter on Workflows queues a `Detail` request and synthesises an optimistic shell from the existing summary so the screen flips without a blank flash. Inside the overlay: j/k scroll, gg/G jump, r forces a refetch, Esc/Enter close, and Shift-X/T/R re-target the open workflow rather than the list selection. Action results that succeed force both `scheduler_last_poll` and `detail_last_poll` to `None` so the next 100ms tick re-renders fresh state.
+- **Auto-refresh:** main.rs runs `dispatch_scheduler_action` for every drained pending request and additionally re-fetches the open detail every `DETAIL_REFRESH_INTERVAL` (2s). Detail responses route through `apply_workflow_detail`, which preserves the user's scroll position when only the same workflow is updated and resets it on workflow change. Detail errors close the overlay with a status-bar toast.
+- **Freshness badges:** `App::scheduler_last_refresh_age_secs` / `detail_last_refresh_age_secs` drive a `freshness_suffix` formatter (`fresh` / `12s` / `3m` / `1h`) that the Drafts, Workflows and Detail title bars append. Returns `None` while the scheduler is unreachable so the unreachable banner remains the single source of truth.
+- **Push-based subscribe deferred:** the original 4.3 also called for a long-lived `Subscribe` connection. That needs a broadcast channel inside the orchestrator and a stream-mode branch in the control server — a larger surface than the rest of 4.3. The 2s detail polling is good enough in practice; push moves to Phase 5.
+
+22 new tests (workspace 682 → 704):
+- 3 in `clhorde-core` (Detail request round-trip; Detail response round-trip; minimal `DetailNode` decode for back-compat).
+- 5 in `clhorde-scheduler` (2 dispatch cases for Detail unknown/empty-apply; 3 orchestrator cases for `detail()` on Drafted, in-flight DAG with predecessors, and unknown workflow).
+- 14 in `clhorde-tui`: 10 detail-overlay (Enter opens + queues Detail, Enter no-ops while unreachable, Esc closes without leaving tab, j/k scroll, r clears poll timer, Shift-X/T retarget the open workflow regardless of list selection, `apply_workflow_detail` keeps scroll on same-name updates / resets on rename, `detail_refresh_target` throttling, `note_detail_unreachable` closes + toasts) plus 4 freshness-badge cases (no-poll → `None`, unreachable → `None`, list age in seconds, detail age independent of reachability).
 
 ### 4.2 Delivered
 
@@ -549,8 +563,8 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 | **3**   | ✅ shipped | `clhorde-cli flow` wrappers + scheduler control socket | Single CLI entrypoint; live remote-control of a long-lived scheduler; 25 new tests. |
 | **4.1** | ✅ shipped | TUI tabs foundation (read-only Drafts/Workflows) | First-class UX, no actions yet; 13 new tests. |
 | **4.2** | ✅ shipped | Tab actions: Q/E/R/X/T (+ scheduler `Queue` + `Status.root`) | Queue, explore, review, cancel, retry — 24 new tests. |
-| **4.3** | ⏳ pending | Workflow detail view + auto-refresh polish | Per-section DAG, push-based updates. |
-| **5**   | ⏳ pending | Web routes + advanced (parallel safety, hooks, multi-repo) | Polish. |
+| **4.3** | ✅ shipped | Workflow detail view + freshness badges (push subscribe deferred) | Per-section DAG zoom + 2s auto-refresh — 18 new tests. |
+| **5**   | ⏳ pending | Web routes + push subscribe + advanced (parallel safety, hooks, multi-repo) | Polish. |
 
 Each phase is independently shippable. Phase 0 alone is already a feature win; Phase 2.4 already produces value for users who want a scriptable workflow runner.
 

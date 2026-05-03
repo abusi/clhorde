@@ -5,4 +5,6 @@
 //! tera/notify pull-in). Server and client behaviour stays in this
 //! crate; only the data lives elsewhere.
 
-pub use clhorde_core::control::{ControlRequest, ControlResponse, WorkflowSummary};
+pub use clhorde_core::control::{
+    ControlRequest, ControlResponse, DetailNode, WorkflowDetail, WorkflowSummary,
+};

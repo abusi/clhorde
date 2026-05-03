@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent, PromptInfo};
 use tokio::sync::mpsc;
 
-use crate::control::WorkflowSummary;
+use crate::control::{DetailNode, WorkflowDetail, WorkflowSummary};
 use crate::dispatch::{is_node_done, next_runnable_nodes};
 use crate::openspec::affected_changes::{self, ChangesSnapshot};
 use crate::openspec::annotations::{annotate, AnnotatedSection};
@@ -233,6 +233,47 @@ impl Orchestrator {
     /// does not exist.
     pub fn summary(&self, name: &str) -> Option<WorkflowSummary> {
         self.workflows.get(name).map(workflow_summary)
+    }
+
+    /// Assemble a [`WorkflowDetail`] for `name`, or `None` if no
+    /// workflow with that name exists. The detail merges the persisted
+    /// `Workflow` (status + timestamps) with the in-memory runtime
+    /// (per-node dispatch state + DAG ordering). Workflows without a
+    /// runtime (Drafted, or Queued before tasks.md was first parsed)
+    /// surface an empty `apply` list — that matches the wire contract
+    /// described on `WorkflowDetail::apply`.
+    pub fn detail(&self, name: &str) -> Option<WorkflowDetail> {
+        let wf = self.workflows.get(name)?;
+        let summary = workflow_summary(wf);
+        let runtime = self.runtimes.get(name);
+        let apply = runtime
+            .and_then(|r| r.dag.as_ref().map(|d| (r, d)))
+            .map(|(runtime, dag)| {
+                dag.nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, node)| build_apply_detail(node, idx, dag, runtime))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let verify = runtime
+            .and_then(|r| r.verify.as_ref())
+            .map(|d| build_phase_detail("verify", "Verify phase", d));
+        let archive = runtime
+            .and_then(|r| r.archive.as_ref())
+            .map(|d| build_phase_detail("archive", "Archive phase", d));
+        Some(WorkflowDetail {
+            name: summary.name,
+            status: summary.status,
+            failure_reason: summary.failure_reason,
+            priority: summary.priority,
+            queued_at: summary.queued_at,
+            started_at: summary.started_at,
+            finished_at: summary.finished_at,
+            apply,
+            verify,
+            archive,
+        })
     }
 
     /// Remove the `.clhorde-ready` marker on disk (if present) and
@@ -1181,6 +1222,56 @@ fn workflow_summary(wf: &Workflow) -> WorkflowSummary {
     }
 }
 
+fn build_apply_detail(
+    node: &dag::DagNode,
+    idx: usize,
+    dag: &Dag,
+    runtime: &WorkflowRuntime,
+) -> DetailNode {
+    let dispatch = runtime.apply.get(&idx);
+    let state = node_state_label(dispatch);
+    let depends_on: Vec<String> = node
+        .deps
+        .iter()
+        .filter_map(|d| dag.nodes.get(*d).map(|n| n.id.clone()))
+        .collect();
+    DetailNode {
+        id: node.id.clone(),
+        label: node.label.clone(),
+        state,
+        prompt_id: dispatch.and_then(|d| d.prompt_id),
+        prompt_uuid: dispatch.and_then(|d| d.uuid.clone()),
+        exit_code: dispatch.and_then(|d| d.exit_code),
+        depends_on,
+    }
+}
+
+fn build_phase_detail(id: &str, label: &str, dispatch: &NodeDispatch) -> DetailNode {
+    DetailNode {
+        id: id.to_string(),
+        label: label.to_string(),
+        state: node_state_label(Some(dispatch)),
+        prompt_id: dispatch.prompt_id,
+        prompt_uuid: dispatch.uuid.clone(),
+        exit_code: dispatch.exit_code,
+        depends_on: Vec::new(),
+    }
+}
+
+/// Map a [`NodeDispatch`] to the wire-format lifecycle label. Mirrors
+/// the orchestrator's own state machine: a node we never dispatched is
+/// `pending`; a dispatched node with no `WorkerFinished` is `running`;
+/// a finished worker that ticked the boxes is `completed`; everything
+/// else (non-zero exit code, or finished without ticking) is `failed`.
+fn node_state_label(d: Option<&NodeDispatch>) -> String {
+    match d {
+        None => "pending".into(),
+        Some(d) if !d.finished => "running".into(),
+        Some(d) if d.completed && d.exit_code.unwrap_or(0) == 0 => "completed".into(),
+        Some(_) => "failed".into(),
+    }
+}
+
 fn all_apply_complete(runtime: &WorkflowRuntime, dag: &Dag) -> bool {
     if dag.nodes.is_empty() {
         return false;
@@ -2062,6 +2153,63 @@ mod tests {
         let (_tmp, mut orch, _rx) = fixture();
         let err = orch.queue_workflow("ghost", None).unwrap_err();
         assert!(matches!(err, OrchestratorError::NotFound(_)));
+    }
+
+    #[test]
+    fn detail_for_drafted_workflow_has_empty_apply() {
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        orch.reconcile().unwrap();
+        let d = orch.detail("x").unwrap();
+        assert_eq!(d.name, "x");
+        assert_eq!(d.status, "drafted");
+        assert!(d.apply.is_empty());
+    }
+
+    #[test]
+    fn detail_for_in_flight_workflow_lists_dag_nodes() {
+        // After a marker + tasks.md land, the orchestrator parses the DAG
+        // and dispatches the first apply node. The detail should expose
+        // both nodes — node 1 dispatched (running, has prompt info) and
+        // node 2 still pending (no dispatch yet because of the
+        // sequential default).
+        let (tmp, mut orch, mut rx) = fixture();
+        write_marker(&tmp, "x", "");
+        write_tasks(
+            &tmp,
+            "x",
+            "## 1. Theme\n- [ ] 1.1 a\n## 2. UI\n- [ ] 2.1 b\n",
+        );
+        orch.handle_event(FsEvent::TasksModified { name: "x".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::MarkerCreated { name: "x".into() })
+            .unwrap();
+        // Pick up the dispatched prompt's tag and feed PromptAdded back.
+        let req = drain_requests(&mut rx).into_iter().next().unwrap();
+        let tag = match req {
+            ClientRequest::SubmitPrompt { tags, .. } => tags[0].clone(),
+            _ => panic!("expected SubmitPrompt"),
+        };
+        orch.handle_daemon_event(&fake_prompt_added(42, &tag)).unwrap();
+
+        let d = orch.detail("x").unwrap();
+        assert_eq!(d.apply.len(), 2);
+        assert_eq!(d.apply[0].id, "1");
+        assert_eq!(d.apply[0].label, "Theme");
+        assert_eq!(d.apply[0].state, "running");
+        assert_eq!(d.apply[0].prompt_id, Some(42));
+        assert!(d.apply[0].depends_on.is_empty());
+        // Node 2 is sequential after node 1 — pending and depends on "1".
+        assert_eq!(d.apply[1].id, "2");
+        assert_eq!(d.apply[1].state, "pending");
+        assert!(d.apply[1].prompt_id.is_none());
+        assert_eq!(d.apply[1].depends_on, vec!["1".to_string()]);
+    }
+
+    #[test]
+    fn detail_unknown_workflow_returns_none() {
+        let (_tmp, orch, _rx) = fixture();
+        assert!(orch.detail("ghost").is_none());
     }
 
     #[test]
