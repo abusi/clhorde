@@ -13,7 +13,21 @@ use clhorde_core::protocol::{DaemonEvent, DaemonState, PromptInfo};
 
 use crate::pty_worker::{self, PtyHandle};
 use crate::session::SessionManager;
-use crate::worker::{self, SpawnResult, WorkerInput, WorkerMessage};
+use crate::worker::{self, SpawnResult, WorkerInput, WorkerMessage, WorkerSpawn};
+
+/// Parameters for adding a new prompt to the orchestrator.
+///
+/// Mirrors the shape of `ClientRequest::SubmitPrompt` after deps have been
+/// resolved from numeric IDs to UUIDs.
+pub struct AddPrompt {
+    pub text: String,
+    pub cwd: Option<String>,
+    pub mode: PromptMode,
+    pub worktree: bool,
+    pub tags: Vec<String>,
+    pub depends_on: Vec<String>,
+    pub worktree_id: Option<String>,
+}
 
 /// Daemon orchestrator: manages prompts, workers, and broadcasts events to clients.
 pub struct Orchestrator {
@@ -322,16 +336,16 @@ impl Orchestrator {
         to_unblock
     }
 
-    pub fn add_prompt(
-        &mut self,
-        text: String,
-        cwd: Option<String>,
-        mode: PromptMode,
-        worktree: bool,
-        tags: Vec<String>,
-        depends_on: Vec<String>,
-        worktree_id: Option<String>,
-    ) {
+    pub fn add_prompt(&mut self, params: AddPrompt) {
+        let AddPrompt {
+            text,
+            cwd,
+            mode,
+            worktree,
+            tags,
+            depends_on,
+            worktree_id,
+        } = params;
         let mut prompt = Prompt::new(self.next_id, text, cwd, mode);
         prompt.worktree = worktree;
         prompt.tags = tags;
@@ -504,15 +518,17 @@ impl Orchestrator {
             });
 
             let result = worker::spawn_worker(
-                prompt_id,
-                prompt_text,
-                cwd,
+                WorkerSpawn {
+                    prompt_id,
+                    prompt_text,
+                    cwd,
+                    tx: self.worker_tx.clone(),
+                    resume_session_id,
+                    session_id,
+                    pty_byte_tx: self.pty_byte_tx.clone(),
+                },
                 mode,
-                self.worker_tx.clone(),
                 Some((80, 24)), // Default PTY size; clients can resize
-                resume_session_id,
-                session_id,
-                self.pty_byte_tx.clone(),
             );
 
             match result {
@@ -858,15 +874,15 @@ impl Orchestrator {
                 let prompt_mode = PromptMode::from_mode_str(&mode);
                 match self.resolve_dep_ids(&depends_on) {
                     Ok(dep_uuids) => {
-                        self.add_prompt(
+                        self.add_prompt(AddPrompt {
                             text,
                             cwd,
-                            prompt_mode,
+                            mode: prompt_mode,
                             worktree,
                             tags,
-                            dep_uuids,
+                            depends_on: dep_uuids,
                             worktree_id,
-                        );
+                        });
                         self.dispatch_workers();
                     }
                     Err(message) => {
@@ -936,7 +952,15 @@ impl Orchestrator {
                     // by design, the user re-links manually if desired.
                     // worktree_id is preserved so the retry joins the same
                     // shared worktree as the original.
-                    self.add_prompt(text, cwd, mode, wt, tags, Vec::new(), wt_id);
+                    self.add_prompt(AddPrompt {
+                        text,
+                        cwd,
+                        mode,
+                        worktree: wt,
+                        tags,
+                        depends_on: Vec::new(),
+                        worktree_id: wt_id,
+                    });
                     self.dispatch_workers();
                 }
             }
@@ -1867,15 +1891,15 @@ mod tests {
         insert_prompt(&mut orch, 1, PromptStatus::Pending);
         let dep_uuid = orch.prompts[0].uuid.clone();
 
-        orch.add_prompt(
-            "child".into(),
-            None,
-            PromptMode::Interactive,
-            false,
-            vec![],
-            vec![dep_uuid],
-            None,
-        );
+        orch.add_prompt(AddPrompt {
+            text: "child".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![dep_uuid],
+            worktree_id: None,
+        });
         let child = orch.prompts.iter().find(|p| p.id == 2).unwrap();
         assert_eq!(child.status, PromptStatus::Blocked);
     }
@@ -1886,15 +1910,15 @@ mod tests {
         insert_prompt(&mut orch, 1, PromptStatus::Completed);
         let dep_uuid = orch.prompts[0].uuid.clone();
 
-        orch.add_prompt(
-            "child".into(),
-            None,
-            PromptMode::Interactive,
-            false,
-            vec![],
-            vec![dep_uuid],
-            None,
-        );
+        orch.add_prompt(AddPrompt {
+            text: "child".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![dep_uuid],
+            worktree_id: None,
+        });
         let child = orch.prompts.iter().find(|p| p.id == 2).unwrap();
         assert_eq!(child.status, PromptStatus::Pending);
     }
@@ -1904,15 +1928,15 @@ mod tests {
         let mut orch = Orchestrator::new_for_test();
         insert_prompt(&mut orch, 1, PromptStatus::Pending);
         let dep_uuid = orch.prompts[0].uuid.clone();
-        orch.add_prompt(
-            "child".into(),
-            None,
-            PromptMode::Interactive,
-            false,
-            vec![],
-            vec![dep_uuid],
-            None,
-        );
+        orch.add_prompt(AddPrompt {
+            text: "child".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![dep_uuid],
+            worktree_id: None,
+        });
         // The pending parent at idx 0 should be picked first; the blocked
         // child at idx 1 must not appear.
         let idx = orch.next_pending_prompt_index();
@@ -1927,15 +1951,15 @@ mod tests {
         let mut orch = Orchestrator::new_for_test();
         insert_prompt(&mut orch, 1, PromptStatus::Running);
         let dep_uuid = orch.prompts[0].uuid.clone();
-        orch.add_prompt(
-            "child".into(),
-            None,
-            PromptMode::Interactive,
-            false,
-            vec![],
-            vec![dep_uuid],
-            None,
-        );
+        orch.add_prompt(AddPrompt {
+            text: "child".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![dep_uuid],
+            worktree_id: None,
+        });
         assert_eq!(orch.prompts[1].status, PromptStatus::Blocked);
         // Mark the parent Completed; unblock_dependents should run.
         orch.prompts[0].status = PromptStatus::Completed;
@@ -1949,15 +1973,15 @@ mod tests {
         let mut orch = Orchestrator::new_for_test();
         insert_prompt(&mut orch, 1, PromptStatus::Failed);
         let dep_uuid = orch.prompts[0].uuid.clone();
-        orch.add_prompt(
-            "child".into(),
-            None,
-            PromptMode::Interactive,
-            false,
-            vec![],
-            vec![dep_uuid],
-            None,
-        );
+        orch.add_prompt(AddPrompt {
+            text: "child".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![dep_uuid],
+            worktree_id: None,
+        });
         assert_eq!(orch.prompts[1].status, PromptStatus::Blocked);
         // unblock_dependents must not free dependents of Failed prompts.
         let unblocked = orch.unblock_dependents();
@@ -1999,15 +2023,15 @@ mod tests {
         let mut orch = Orchestrator::new_for_test();
         insert_prompt(&mut orch, 1, PromptStatus::Pending);
         let dep_uuid = orch.prompts[0].uuid.clone();
-        orch.add_prompt(
-            "child".into(),
-            None,
-            PromptMode::Interactive,
-            false,
-            vec![],
-            vec![dep_uuid.clone()],
-            None,
-        );
+        orch.add_prompt(AddPrompt {
+            text: "child".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![dep_uuid.clone()],
+            worktree_id: None,
+        });
         assert_eq!(orch.prompts[1].status, PromptStatus::Blocked);
 
         orch.delete_prompt(1);
@@ -2180,15 +2204,15 @@ mod tests {
     #[tokio::test]
     async fn add_prompt_persists_worktree_id() {
         let mut orch = Orchestrator::new_for_test();
-        orch.add_prompt(
-            "task".into(),
-            None,
-            PromptMode::Interactive,
-            true,
-            vec![],
-            vec![],
-            Some("flow-42".to_string()),
-        );
+        orch.add_prompt(AddPrompt {
+            text: "task".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: true,
+            tags: vec![],
+            depends_on: vec![],
+            worktree_id: Some("flow-42".to_string()),
+        });
         let p = &orch.prompts[0];
         assert_eq!(p.worktree_id.as_deref(), Some("flow-42"));
         assert!(p.worktree);
@@ -2201,28 +2225,28 @@ mod tests {
         let mut orch = Orchestrator::new_for_test();
         assert_eq!(orch.next_id, 1);
 
-        orch.add_prompt(
-            "hello".into(),
-            None,
-            PromptMode::Interactive,
-            false,
-            vec![],
-            vec![],
-            None,
-        );
+        orch.add_prompt(AddPrompt {
+            text: "hello".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![],
+            worktree_id: None,
+        });
         assert_eq!(orch.prompts.len(), 1);
         assert_eq!(orch.prompts[0].id, 1);
         assert_eq!(orch.next_id, 2);
 
-        orch.add_prompt(
-            "world".into(),
-            None,
-            PromptMode::OneShot,
-            false,
-            vec![],
-            vec![],
-            None,
-        );
+        orch.add_prompt(AddPrompt {
+            text: "world".into(),
+            cwd: None,
+            mode: PromptMode::OneShot,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![],
+            worktree_id: None,
+        });
         assert_eq!(orch.prompts.len(), 2);
         assert_eq!(orch.prompts[1].id, 2);
         assert_eq!(orch.next_id, 3);
@@ -2235,15 +2259,15 @@ mod tests {
         orch.sessions.add_session_with_id(1, tx);
         orch.sessions.set_subscribed(1, true);
 
-        orch.add_prompt(
-            "test".into(),
-            None,
-            PromptMode::Interactive,
-            false,
-            vec![],
-            vec![],
-            None,
-        );
+        orch.add_prompt(AddPrompt {
+            text: "test".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![],
+            worktree_id: None,
+        });
 
         let event = rx.try_recv().expect("should receive PromptAdded");
         assert!(matches!(event, DaemonEvent::PromptAdded(_)));
@@ -2582,15 +2606,15 @@ mod tests {
 
         // Add 5 prompts — only 3 should remain on disk
         for _ in 0..5 {
-            orch.add_prompt(
-                "test".to_string(),
-                None,
-                PromptMode::Interactive,
-                false,
-                Vec::new(),
-                Vec::new(),
-                None,
-            );
+            orch.add_prompt(AddPrompt {
+                text: "test".to_string(),
+                cwd: None,
+                mode: PromptMode::Interactive,
+                worktree: false,
+                tags: Vec::new(),
+                depends_on: Vec::new(),
+                worktree_id: None,
+            });
             // Small sleep to ensure UUID v7 ordering
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
