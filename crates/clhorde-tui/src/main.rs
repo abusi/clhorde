@@ -38,6 +38,11 @@ const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Result fed back from a spawned scheduler poll. The main loop
 /// consumes these and updates `App` state accordingly.
+//
+// `Status` and `Detail` carry sizable payloads (Vec + nested struct) while
+// `Unreachable`/`Other` are unit variants — boxing the heavy variants would
+// cost an extra allocation per poll for no real benefit, since each value is
+// produced and consumed once on the main task and never stored in a Vec.
 #[allow(clippy::large_enum_variant)]
 enum SchedulerPollOutcome {
     Status {

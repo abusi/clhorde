@@ -60,7 +60,8 @@ pub enum ControlRequest {
 ///
 /// `Detail` carries a [`WorkflowDetail`] inline rather than boxed —
 /// the size difference matters for stack-allocated enums but not for a
-/// wire type that's deserialized in one shot per response.
+/// wire type that's deserialized in one shot per response. Boxing would
+/// also complicate the `Serialize`/`Deserialize` JSON shape for clients.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

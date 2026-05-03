@@ -124,6 +124,11 @@ impl DaemonBridge {
     }
 
     /// Whether the bridge is currently connected to the daemon.
+    //
+    // Kept as part of the `DaemonBridge` API surface even though no caller
+    // currently probes it — the bridge auto-reconnects in the background so
+    // most code paths don't need to check, but a future health endpoint or
+    // status indicator should use this rather than poking at internals.
     #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
