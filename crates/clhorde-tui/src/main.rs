@@ -23,37 +23,32 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use app::{App, RootView};
+use app::App;
 use clhorde_core::control::{ControlRequest, ControlResponse};
 use clhorde_core::protocol::ClientRequest;
 use cli::{CliAction, LaunchOptions};
 use ipc_client::DaemonMessage;
-use scheduler_client::SchedulerError;
+use scheduler_client::{SchedulerError, SubscriptionMessage};
 
-/// How often the TUI polls the scheduler when sitting on a Drafts /
-/// Workflows tab. Fast enough that newly-queued workflows show up
-/// without conscious effort, slow enough that the scheduler isn't
-/// hammered.
-const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Backoff used when the scheduler subscribe stream drops. Long
+/// enough that a stopped scheduler doesn't get hammered, short enough
+/// that the user sees the lists fill back in within a couple seconds
+/// of restarting `clhorde-scheduler daemon`.
+const SCHEDULER_RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Result fed back from a spawned scheduler poll. The main loop
-/// consumes these and updates `App` state accordingly.
+/// Result fed back from a spawned scheduler request. The main loop
+/// consumes these and updates `App` state accordingly. With Phase 5.1
+/// the periodic Status poll is gone — push events now arrive via a
+/// dedicated `sched_event_rx` channel from the long-lived
+/// subscription. This enum still routes the one-shot Q/X/T action
+/// results and Detail responses.
 //
-// `Status` and `Detail` carry sizable payloads (Vec + nested struct) while
-// `Unreachable`/`Other` are unit variants — boxing the heavy variants would
-// cost an extra allocation per poll for no real benefit, since each value is
-// produced and consumed once on the main task and never stored in a Vec.
+// `Detail` carries a sizable payload (Vec + nested struct) while
+// `ActionResult`/`DetailError` are small. Boxing the heavy variant would
+// cost an extra allocation per request for no real benefit, since each value
+// is produced and consumed once on the main task and never stored in a Vec.
 #[allow(clippy::large_enum_variant)]
 enum SchedulerPollOutcome {
-    Status {
-        workflows: Vec<clhorde_core::control::WorkflowSummary>,
-        root: Option<std::path::PathBuf>,
-    },
-    Unreachable,
-    /// Anything else (timeout, decode error, …). Treated identically to
-    /// Unreachable for the user-visible hint, but logged separately
-    /// in the future if we add tracing.
-    Other,
     /// Result of a Q/X/T mutation. `ok = true` for `ControlResponse::Ok`,
     /// `false` for `Error`/network failure. The message is shown verbatim
     /// in the status line.
@@ -153,12 +148,21 @@ async fn run_app(
     let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
     let mut reconnect_interval = tokio::time::interval(Duration::from_secs(2));
 
-    // Channel + flag for scheduler polling. We only ever have one poll
-    // in flight at a time; the flag prevents a slow scheduler from
-    // being hit again on the next tick.
+    // Channel for scheduler one-shot results (Q/X/T action results
+    // and Detail responses).
     let (sched_tx, mut sched_rx) =
         mpsc::unbounded_channel::<SchedulerPollOutcome>();
-    let mut sched_in_flight = false;
+
+    // Long-lived push subscription to the scheduler control socket.
+    // The receiver feeds Snapshot + WorkflowUpdated events directly
+    // into App. On disconnect we receive one Disconnected message and
+    // then need to re-spawn the subscription after a backoff.
+    let mut sched_event_rx = scheduler_client::subscribe();
+    let mut sched_reconnect_interval =
+        tokio::time::interval(SCHEDULER_RECONNECT_INTERVAL);
+    sched_reconnect_interval
+        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sched_subscription_alive = true;
 
     loop {
         terminal.draw(|f| ui::render(f, &mut app))?;
@@ -217,35 +221,6 @@ async fn run_app(
                 app.tick = app.tick.wrapping_add(1);
                 app.clear_expired_status();
 
-                // Phase 4: when the user is on Drafts/Workflows, poll
-                // the scheduler periodically (or immediately, if the
-                // user just switched in). Fire-and-forget — the result
-                // arrives on `sched_rx`.
-                if !sched_in_flight && needs_scheduler_poll(&app) {
-                    sched_in_flight = true;
-                    let tx = sched_tx.clone();
-                    tokio::spawn(async move {
-                        let outcome = match scheduler_client::request(
-                            ControlRequest::Status { name: None },
-                        )
-                        .await
-                        {
-                            Ok(ControlResponse::Status { workflows, root }) => {
-                                SchedulerPollOutcome::Status {
-                                    workflows,
-                                    root: root.map(std::path::PathBuf::from),
-                                }
-                            }
-                            Ok(_) => SchedulerPollOutcome::Other,
-                            Err(SchedulerError::Unreachable(_)) => {
-                                SchedulerPollOutcome::Unreachable
-                            }
-                            Err(_) => SchedulerPollOutcome::Other,
-                        };
-                        let _ = tx.send(outcome);
-                    });
-                }
-
                 // Drain Q/X/T/Detail action requests the user composed
                 // since the previous tick. One spawn per request — tiny
                 // cost, results land on the same `sched_rx` channel.
@@ -272,20 +247,29 @@ async fn run_app(
                     });
                 }
             }
+            Some(msg) = sched_event_rx.recv() => {
+                match msg {
+                    SubscriptionMessage::Event(event) => {
+                        app.apply_scheduler_event(event);
+                    }
+                    SubscriptionMessage::Disconnected(err) => {
+                        // The subscription channel will keep returning
+                        // None now until we replace it. Mark the
+                        // scheduler unreachable so the UI shows the
+                        // hint, and let the reconnect tick re-spawn it.
+                        sched_subscription_alive = false;
+                        app.note_scheduler_unreachable();
+                        // Held for future diagnostics — logging into
+                        // the status bar on every reconnect would
+                        // clutter the UI during normal scheduler
+                        // restarts.
+                        let _ = err;
+                    }
+                }
+            }
             Some(outcome) = sched_rx.recv() => {
                 match outcome {
-                    SchedulerPollOutcome::Status { workflows, root } => {
-                        sched_in_flight = false;
-                        app.apply_scheduler_status(workflows, root);
-                    }
-                    SchedulerPollOutcome::Unreachable
-                    | SchedulerPollOutcome::Other => {
-                        sched_in_flight = false;
-                        app.note_scheduler_unreachable();
-                    }
                     SchedulerPollOutcome::ActionResult { ok, message } => {
-                        // Action results aren't polls — don't touch the
-                        // in-flight flag.
                         app.note_scheduler_action_result(ok, message);
                     }
                     SchedulerPollOutcome::Detail(detail) => {
@@ -295,6 +279,10 @@ async fn run_app(
                         app.note_detail_unreachable(msg);
                     }
                 }
+            }
+            _ = sched_reconnect_interval.tick(), if !sched_subscription_alive => {
+                sched_event_rx = scheduler_client::subscribe();
+                sched_subscription_alive = true;
             }
             _ = reconnect_interval.tick(), if !app.connected => {
                 if let Ok((new_tx, new_rx)) = ipc_client::connect().await {
@@ -391,21 +379,6 @@ async fn dispatch_scheduler_action(
         }
     };
     let _ = tx.send(outcome);
-}
-
-/// Returns true if the next tick should kick off a scheduler poll.
-/// Conditions: user is on a scheduler-backed tab, AND either we've
-/// never polled or enough time has elapsed since the last poll. The
-/// app sets `scheduler_last_poll = None` when the user switches into a
-/// scheduler tab so the first poll fires immediately.
-fn needs_scheduler_poll(app: &App) -> bool {
-    if !matches!(app.root_view, RootView::Drafts | RootView::Workflows) {
-        return false;
-    }
-    match app.scheduler_last_poll {
-        None => true,
-        Some(t) => Instant::now().duration_since(t) >= SCHEDULER_POLL_INTERVAL,
-    }
 }
 
 /// Suspend the TUI, run `$PAGER <path>` (falling back to `less`/`more`),

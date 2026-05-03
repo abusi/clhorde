@@ -19,5 +19,6 @@ pub mod protocol;
 pub mod server;
 
 pub use protocol::{
-    ControlRequest, ControlResponse, DetailNode, WorkflowDetail, WorkflowSummary,
+    ControlRequest, ControlResponse, DetailNode, SchedulerEvent, WorkflowDetail,
+    WorkflowSummary,
 };

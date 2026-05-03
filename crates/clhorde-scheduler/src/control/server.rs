@@ -22,9 +22,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
 use clhorde_core::ipc::{self, MAX_FRAME_SIZE};
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use super::protocol::{ControlRequest, ControlResponse};
+use super::protocol::{ControlRequest, ControlResponse, SchedulerEvent};
 use crate::orchestrator::{Orchestrator, OrchestratorError};
 
 /// Spawn the control-socket accept loop. Removes any stale socket file
@@ -73,6 +74,13 @@ async fn serve_unix_stream(
 /// so tests can plumb both halves of a `tokio::io::duplex` and still
 /// exercise the framing path. Returns when the client closes the read
 /// half or sends an unrecoverable framing error.
+///
+/// On [`ControlRequest::Subscribe`], the connection switches into
+/// stream mode: an initial [`SchedulerEvent::Snapshot`] is written,
+/// then orchestrator events are forwarded until the client closes the
+/// read half. No further requests are accepted on a subscribe
+/// connection — clients open a separate one-shot connection for
+/// follow-up actions (Q/X/T/Detail/…).
 pub async fn run_with_streams<R, W>(
     mut reader: R,
     mut writer: W,
@@ -97,26 +105,287 @@ where
         let mut payload = vec![0u8; len];
         reader.read_exact(&mut payload).await?;
 
-        let response = match serde_json::from_slice::<ControlRequest>(&payload) {
-            Ok(req) => {
-                let mut guard = orch
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                dispatch_request(&mut guard, req)
+        match serde_json::from_slice::<ControlRequest>(&payload) {
+            Ok(ControlRequest::Subscribe) => {
+                // Hand off to the streaming branch and never come back —
+                // this connection is one-way after Subscribe.
+                return run_subscribe_stream(reader, writer, orch).await;
             }
-            Err(e) => ControlResponse::Error {
-                message: format!("malformed request: {e}"),
-            },
-        };
+            Ok(ControlRequest::SubscribeDetail { name }) => {
+                // Same one-way handoff as Subscribe, but scoped to one
+                // workflow's detail.
+                return run_subscribe_detail_stream(reader, writer, orch, name).await;
+            }
+            Ok(req) => {
+                let response = {
+                    let mut guard = orch
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    dispatch_request(&mut guard, req)
+                };
+                write_response(&mut writer, &response).await?;
+            }
+            Err(e) => {
+                let response = ControlResponse::Error {
+                    message: format!("malformed request: {e}"),
+                };
+                write_response(&mut writer, &response).await?;
+            }
+        }
+    }
+}
 
-        let json = serde_json::to_vec(&response).unwrap_or_else(|e| {
-            // serde_json on our owned types should never fail; if it
-            // does, send a minimal error to avoid hanging the client.
-            format!(r#"{{"type":"error","message":"serialize: {e}"}}"#).into_bytes()
-        });
-        let frame = ipc::encode_frame(&json);
-        writer.write_all(&frame).await?;
-        writer.flush().await?;
+/// Encode + write one [`ControlResponse`] on `writer`. Small helper so
+/// the request branch and the subscribe branch share one frame-writing
+/// path (and one fallback for the unreachable serde failure mode).
+async fn write_response<W>(
+    writer: &mut W,
+    response: &ControlResponse,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let json = serde_json::to_vec(response).unwrap_or_else(|e| {
+        // serde_json on our owned types should never fail; if it does,
+        // send a minimal error to avoid hanging the client.
+        format!(r#"{{"type":"error","message":"serialize: {e}"}}"#).into_bytes()
+    });
+    let frame = ipc::encode_frame(&json);
+    writer.write_all(&frame).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Stream-mode handler for a Subscribe connection.
+///
+/// 1. Take a fresh `broadcast::Receiver` from the orchestrator
+///    *before* snapshotting state, so any event fired between the
+///    snapshot and the first `recv` is queued for delivery (no race).
+/// 2. Snapshot every workflow + the watched root and write one
+///    [`SchedulerEvent::Snapshot`] frame.
+/// 3. Loop forwarding [`SchedulerEvent::WorkflowUpdated`] frames as
+///    they arrive on the broadcast channel. On `RecvError::Lagged`,
+///    re-emit a fresh Snapshot so a slow client always converges back
+///    to consistent state instead of staying out of sync.
+/// 4. Keep reading from `reader` only to detect when the client
+///    closes the socket; any further data on a Subscribe connection
+///    is ignored (it can't be honoured here without breaking the
+///    one-way contract).
+async fn run_subscribe_stream<R, W>(
+    mut reader: R,
+    mut writer: W,
+    orch: Arc<Mutex<Orchestrator>>,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // Subscribe BEFORE the snapshot so we don't drop events that fire
+    // between the snapshot and the first `recv`. The receiver will
+    // hold those events in the broadcast buffer until we read them.
+    let mut events = {
+        let guard = orch.lock().unwrap_or_else(|poison| poison.into_inner());
+        guard.events_subscribe()
+    };
+
+    let snapshot = {
+        let guard = orch.lock().unwrap_or_else(|poison| poison.into_inner());
+        SchedulerEvent::Snapshot {
+            workflows: guard.summaries(),
+            root: Some(guard.root().to_string_lossy().into_owned()),
+        }
+    };
+    write_response(
+        &mut writer,
+        &ControlResponse::Event { event: snapshot },
+    )
+    .await?;
+
+    // Drain any garbage the client sends on this connection — we just
+    // need to detect EOF so we can shut the writer down cleanly.
+    let mut sink = [0u8; 1024];
+
+    loop {
+        tokio::select! {
+            event_res = events.recv() => {
+                match event_res {
+                    Ok(event) => {
+                        if let Err(e) = write_response(
+                            &mut writer,
+                            &ControlResponse::Event { event },
+                        )
+                        .await
+                        {
+                            debug!(error = %e, "subscribe write failed");
+                            return Ok(());
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Slow subscriber lost messages. Re-send a
+                        // fresh snapshot so the client converges back
+                        // to a consistent baseline.
+                        let snap = {
+                            let guard = orch
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner());
+                            SchedulerEvent::Snapshot {
+                                workflows: guard.summaries(),
+                                root: Some(
+                                    guard.root().to_string_lossy().into_owned(),
+                                ),
+                            }
+                        };
+                        if let Err(e) = write_response(
+                            &mut writer,
+                            &ControlResponse::Event { event: snap },
+                        )
+                        .await
+                        {
+                            debug!(error = %e, "subscribe lag-snapshot write failed");
+                            return Ok(());
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Orchestrator was dropped. End the stream.
+                        return Ok(());
+                    }
+                }
+            }
+            read_res = reader.read(&mut sink) => {
+                match read_res {
+                    Ok(0) => return Ok(()), // EOF — client gone.
+                    Ok(_) => {} // ignore extra bytes on a subscribe socket
+                    Err(_) => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+/// Stream-mode handler for a [`ControlRequest::SubscribeDetail`]
+/// connection.
+///
+/// 1. Subscribe to the orchestrator's detail-event broadcast *before*
+///    snapshotting state (same race-avoidance trick as
+///    [`run_subscribe_stream`]).
+/// 2. Look up the workflow's [`WorkflowDetail`]. On miss, write one
+///    [`ControlResponse::Error`] frame and return — the connection
+///    never enters stream mode and emits no events.
+/// 3. On hit, write one [`SchedulerEvent::DetailSnapshot`] frame.
+/// 4. Loop forwarding [`SchedulerEvent::DetailUpdated`] frames as
+///    they arrive on the broadcast, filtered to events whose
+///    `detail.name == name`. On `RecvError::Lagged`, re-emit a fresh
+///    `DetailSnapshot` so a slow client converges back to consistent
+///    state. If the workflow goes away after subscribing, the next
+///    re-snapshot returns `None` and we close the stream — same shape
+///    a missing workflow would take at subscription time.
+/// 5. Keep reading from `reader` only to detect EOF; extra bytes on a
+///    detail-subscribe connection are dropped (one-way contract).
+async fn run_subscribe_detail_stream<R, W>(
+    mut reader: R,
+    mut writer: W,
+    orch: Arc<Mutex<Orchestrator>>,
+    name: String,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut events = {
+        let guard = orch.lock().unwrap_or_else(|poison| poison.into_inner());
+        guard.detail_events_subscribe()
+    };
+
+    let initial = {
+        let guard = orch.lock().unwrap_or_else(|poison| poison.into_inner());
+        guard.detail(&name)
+    };
+    let detail = match initial {
+        Some(d) => d,
+        None => {
+            let resp = ControlResponse::Error {
+                message: format!("no such workflow: {name}"),
+            };
+            write_response(&mut writer, &resp).await?;
+            return Ok(());
+        }
+    };
+
+    write_response(
+        &mut writer,
+        &ControlResponse::Event {
+            event: SchedulerEvent::DetailSnapshot { detail },
+        },
+    )
+    .await?;
+
+    let mut sink = [0u8; 1024];
+
+    loop {
+        tokio::select! {
+            event_res = events.recv() => {
+                match event_res {
+                    Ok(SchedulerEvent::DetailUpdated { detail }) if detail.name == name => {
+                        if let Err(e) = write_response(
+                            &mut writer,
+                            &ControlResponse::Event {
+                                event: SchedulerEvent::DetailUpdated { detail },
+                            },
+                        )
+                        .await
+                        {
+                            debug!(error = %e, "subscribe_detail write failed");
+                            return Ok(());
+                        }
+                    }
+                    // Detail-broadcast events for other workflows or
+                    // unrelated kinds: silently drop — this connection
+                    // only forwards `name`'s detail.
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Slow subscriber lost messages. Re-send a
+                        // fresh snapshot so the client reconverges.
+                        let snap = {
+                            let guard = orch
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner());
+                            guard.detail(&name)
+                        };
+                        match snap {
+                            Some(detail) => {
+                                if let Err(e) = write_response(
+                                    &mut writer,
+                                    &ControlResponse::Event {
+                                        event: SchedulerEvent::DetailSnapshot { detail },
+                                    },
+                                )
+                                .await
+                                {
+                                    debug!(error = %e, "subscribe_detail lag-snapshot write failed");
+                                    return Ok(());
+                                }
+                            }
+                            None => {
+                                // Workflow disappeared while we were
+                                // lagging. End the stream — there's
+                                // nothing left to track.
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Ok(());
+                    }
+                }
+            }
+            read_res = reader.read(&mut sink) => {
+                match read_res {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => {} // ignore stray bytes on a one-way socket
+                    Err(_) => return Ok(()),
+                }
+            }
+        }
     }
 }
 
@@ -169,6 +438,16 @@ pub fn dispatch_request(
             None => ControlResponse::Error {
                 message: format!("no such workflow: {name}"),
             },
+        },
+        // Subscribe never reaches dispatch_request in production — the
+        // run_with_streams loop branches on it and switches into
+        // stream-mode before re-entering this function. We surface a
+        // clear error in case a future code path forgets that.
+        ControlRequest::Subscribe => ControlResponse::Error {
+            message: "subscribe not supported on a one-shot connection".into(),
+        },
+        ControlRequest::SubscribeDetail { .. } => ControlResponse::Error {
+            message: "subscribe_detail not supported on a one-shot connection".into(),
         },
     }
 }
@@ -605,6 +884,388 @@ mod tests {
                 assert_eq!(workflows.len(), 1);
             }
             other => panic!("expected Status, got {other:?}"),
+        }
+
+        drop(client);
+        let _ = server_task.await;
+    }
+
+    // ── Phase 5.1: subscribe stream ──
+
+    /// Read one Event frame off `reader`. Panics on framing errors so
+    /// failures surface as test failures, not hangs.
+    async fn read_event<R>(reader: &mut R) -> SchedulerEvent
+    where
+        R: AsyncRead + Unpin,
+    {
+        match read_response(reader).await {
+            ControlResponse::Event { event } => event,
+            other => panic!("expected Event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_emits_initial_snapshot_then_updates() {
+        let (tmp, orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        // Pre-existing workflow so the initial snapshot has content.
+        {
+            let mut g = orch.lock().unwrap();
+            g.queue_workflow("x", Some(2)).unwrap();
+        }
+
+        let (mut client, server) = duplex(8192);
+        let (sr, sw) = tokio::io::split(server);
+        let orch_for_server = orch.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = run_with_streams(sr, sw, orch_for_server).await;
+        });
+
+        // Subscribe → initial Snapshot frame must arrive first.
+        client
+            .write_all(&encode_request(&ControlRequest::Subscribe))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        match read_event(&mut client).await {
+            SchedulerEvent::Snapshot { workflows, root } => {
+                assert_eq!(workflows.len(), 1);
+                assert_eq!(workflows[0].name, "x");
+                assert_eq!(workflows[0].priority, 2);
+                let r = root.expect("snapshot must carry root");
+                assert_eq!(std::path::PathBuf::from(r), tmp.path());
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        // Mutate the orchestrator → expect a WorkflowUpdated event.
+        // Cancel transitions Queued → Drafted.
+        {
+            let mut g = orch.lock().unwrap();
+            g.cancel_workflow("x").unwrap();
+        }
+
+        match read_event(&mut client).await {
+            SchedulerEvent::WorkflowUpdated { summary } => {
+                assert_eq!(summary.name, "x");
+                assert_eq!(summary.status, "drafted");
+            }
+            other => panic!("expected WorkflowUpdated, got {other:?}"),
+        }
+
+        drop(client); // EOF the server.
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_works_with_multiple_clients() {
+        // Two subscribers must each receive the same WorkflowUpdated
+        // frame after a single mutation. Confirms the broadcast
+        // channel really fans out from the server side.
+        let (tmp, orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+
+        let (mut a, sa) = duplex(8192);
+        let (mut b, sb) = duplex(8192);
+        let (sa_r, sa_w) = tokio::io::split(sa);
+        let (sb_r, sb_w) = tokio::io::split(sb);
+        let orch_a = orch.clone();
+        let orch_b = orch.clone();
+        let task_a = tokio::spawn(async move {
+            let _ = run_with_streams(sa_r, sa_w, orch_a).await;
+        });
+        let task_b = tokio::spawn(async move {
+            let _ = run_with_streams(sb_r, sb_w, orch_b).await;
+        });
+
+        a.write_all(&encode_request(&ControlRequest::Subscribe))
+            .await
+            .unwrap();
+        b.write_all(&encode_request(&ControlRequest::Subscribe))
+            .await
+            .unwrap();
+        a.flush().await.unwrap();
+        b.flush().await.unwrap();
+
+        // Drain initial Snapshot on both.
+        let _ = read_event(&mut a).await;
+        let _ = read_event(&mut b).await;
+
+        // Mutate.
+        {
+            let mut g = orch.lock().unwrap();
+            g.queue_workflow("x", None).unwrap();
+        }
+
+        // Both subscribers must observe the Updated event.
+        match read_event(&mut a).await {
+            SchedulerEvent::WorkflowUpdated { summary } => {
+                assert_eq!(summary.status, "queued");
+            }
+            other => panic!("expected WorkflowUpdated on a, got {other:?}"),
+        }
+        match read_event(&mut b).await {
+            SchedulerEvent::WorkflowUpdated { summary } => {
+                assert_eq!(summary.status, "queued");
+            }
+            other => panic!("expected WorkflowUpdated on b, got {other:?}"),
+        }
+
+        drop(a);
+        drop(b);
+        let _ = task_a.await;
+        let _ = task_b.await;
+    }
+
+    // ── Phase 5.3: subscribe_detail stream ──
+
+    #[tokio::test]
+    async fn subscribe_detail_emits_initial_snapshot_then_updates() {
+        let (tmp, orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        // Pre-existing workflow so the initial detail has content.
+        {
+            let mut g = orch.lock().unwrap();
+            g.queue_workflow("x", Some(3)).unwrap();
+        }
+
+        let (mut client, server) = duplex(8192);
+        let (sr, sw) = tokio::io::split(server);
+        let orch_for_server = orch.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = run_with_streams(sr, sw, orch_for_server).await;
+        });
+
+        client
+            .write_all(&encode_request(&ControlRequest::SubscribeDetail {
+                name: "x".into(),
+            }))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        match read_event(&mut client).await {
+            SchedulerEvent::DetailSnapshot { detail } => {
+                assert_eq!(detail.name, "x");
+                assert_eq!(detail.status, "queued");
+                assert_eq!(detail.priority, 3);
+            }
+            other => panic!("expected DetailSnapshot, got {other:?}"),
+        }
+
+        // Mutate — Cancel transitions Queued → Drafted, which alters
+        // the detail's status field. Expect a single DetailUpdated.
+        {
+            let mut g = orch.lock().unwrap();
+            g.cancel_workflow("x").unwrap();
+        }
+
+        match read_event(&mut client).await {
+            SchedulerEvent::DetailUpdated { detail } => {
+                assert_eq!(detail.name, "x");
+                assert_eq!(detail.status, "drafted");
+            }
+            other => panic!("expected DetailUpdated, got {other:?}"),
+        }
+
+        drop(client);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_detail_filters_other_workflows() {
+        // A subscriber on workflow `x` must never see DetailUpdated
+        // frames for workflow `y`. Critical for keeping a
+        // workflow-specific viewer quiet when unrelated workflows
+        // churn.
+        let (tmp, orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        change_dir(&tmp, "y");
+        {
+            let mut g = orch.lock().unwrap();
+            g.queue_workflow("x", None).unwrap();
+        }
+
+        let (mut client, server) = duplex(8192);
+        let (sr, sw) = tokio::io::split(server);
+        let orch_for_server = orch.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = run_with_streams(sr, sw, orch_for_server).await;
+        });
+
+        client
+            .write_all(&encode_request(&ControlRequest::SubscribeDetail {
+                name: "x".into(),
+            }))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        // Drain initial DetailSnapshot.
+        match read_event(&mut client).await {
+            SchedulerEvent::DetailSnapshot { detail } => {
+                assert_eq!(detail.name, "x");
+            }
+            other => panic!("expected DetailSnapshot, got {other:?}"),
+        }
+
+        // Mutate y first (filter must drop this), then x (must surface).
+        {
+            let mut g = orch.lock().unwrap();
+            g.queue_workflow("y", None).unwrap();
+            g.cancel_workflow("x").unwrap();
+        }
+
+        match read_event(&mut client).await {
+            SchedulerEvent::DetailUpdated { detail } => {
+                assert_eq!(detail.name, "x");
+                assert_eq!(detail.status, "drafted");
+            }
+            other => panic!("expected DetailUpdated for x, got {other:?}"),
+        }
+
+        drop(client);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_detail_unknown_workflow_returns_error_then_eof() {
+        // A SubscribeDetail against a name the orchestrator doesn't
+        // know must yield exactly one Error frame and then close.
+        // Otherwise a buggy client that subscribes optimistically
+        // would never know the connection is dead.
+        let (tmp, orch, _rx) = fixture();
+        change_dir(&tmp, "exists");
+
+        let (mut client, server) = duplex(8192);
+        let (sr, sw) = tokio::io::split(server);
+        let server_task = tokio::spawn(async move {
+            let _ = run_with_streams(sr, sw, orch).await;
+        });
+
+        client
+            .write_all(&encode_request(&ControlRequest::SubscribeDetail {
+                name: "missing".into(),
+            }))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        match read_response(&mut client).await {
+            ControlResponse::Error { message } => {
+                assert!(message.contains("missing"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // Server must have closed by now — any further read returns EOF.
+        let mut buf = [0u8; 4];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "expected EOF after Error frame, got {n} bytes");
+
+        drop(client);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_detail_ignores_extra_frames() {
+        // Same one-way contract as Subscribe: stray frames after
+        // SubscribeDetail are dropped, the server keeps streaming
+        // detail events.
+        let (tmp, orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        // SubscribeDetail looks up an existing workflow — reconcile so
+        // the FS-discovered change lands in the orchestrator's map
+        // (otherwise SubscribeDetail returns Error before any stream).
+        {
+            let mut g = orch.lock().unwrap();
+            g.reconcile().unwrap();
+        }
+
+        let (mut client, server) = duplex(8192);
+        let (sr, sw) = tokio::io::split(server);
+        let orch_for_server = orch.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = run_with_streams(sr, sw, orch_for_server).await;
+        });
+
+        client
+            .write_all(&encode_request(&ControlRequest::SubscribeDetail {
+                name: "x".into(),
+            }))
+            .await
+            .unwrap();
+        let _ = read_event(&mut client).await; // initial snapshot
+
+        // Stray Ping — must be silently dropped.
+        client
+            .write_all(&encode_request(&ControlRequest::Ping))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        {
+            let mut g = orch.lock().unwrap();
+            g.queue_workflow("x", None).unwrap();
+        }
+
+        match read_event(&mut client).await {
+            SchedulerEvent::DetailUpdated { detail } => {
+                assert_eq!(detail.name, "x");
+                assert_eq!(detail.status, "queued");
+            }
+            other => panic!("expected DetailUpdated, got {other:?}"),
+        }
+
+        drop(client);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_ignores_extra_frames_after_subscribe() {
+        // The wire contract on Subscribe is one-way: a client that
+        // accidentally sends another request after Subscribe must not
+        // get a one-shot reply (which would race with the event
+        // stream). We just continue streaming events and never speak
+        // a Pong.
+        let (tmp, orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+
+        let (mut client, server) = duplex(8192);
+        let (sr, sw) = tokio::io::split(server);
+        let orch_for_server = orch.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = run_with_streams(sr, sw, orch_for_server).await;
+        });
+
+        client
+            .write_all(&encode_request(&ControlRequest::Subscribe))
+            .await
+            .unwrap();
+        // Drain initial Snapshot.
+        let _ = read_event(&mut client).await;
+
+        // Send a stray Ping. The server should swallow it and keep
+        // streaming events instead of replying with Pong.
+        client
+            .write_all(&encode_request(&ControlRequest::Ping))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        // Now mutate — the next frame the server emits must be the
+        // WorkflowUpdated, not a Pong.
+        {
+            let mut g = orch.lock().unwrap();
+            g.queue_workflow("x", None).unwrap();
+        }
+
+        match read_event(&mut client).await {
+            SchedulerEvent::WorkflowUpdated { summary } => {
+                assert_eq!(summary.status, "queued");
+            }
+            other => panic!("expected WorkflowUpdated, got {other:?}"),
         }
 
         drop(client);

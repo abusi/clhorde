@@ -26,9 +26,11 @@ Tracked on branch `feat/prompt-dependencies`.
 | 4.1 TUI tabs (foundation, read-only) | ✅ shipped | `RootView`, tab bar, scheduler-control client, polled Drafts/Workflows panes; 13 new tests |
 | 4.2 TUI tabs (actions: Q/X/T/E/R) | ✅ shipped | `Queue` control variant + `root` on `Status`; pager suspend/restore; retry-section inline prompt; 24 new tests |
 | 4.3 TUI workflow detail view + freshness badges | ✅ shipped | `Detail` control variant + `Orchestrator::detail`; Enter zoom + auto-refresh; staleness suffix on titles; 22 new tests. Push-based subscribe deferred to Phase 5. |
-| 5   Advanced / web | ⏳ pending | Includes push-based subscribe. |
+| 5.1 Push-based scheduler Subscribe | ✅ shipped | Broadcast-backed `Subscribe` request + `SchedulerEvent` stream replaces TUI 2s Status polling; 20 new tests |
+| 5.2 Web routes + dashboard tabs | ✅ shipped | `SchedulerBridge` + 5 REST routes + WS fan-out + Drafts/Workflows SPA tabs; 14 new tests |
+| 5.x Advanced (parallel safety, inter-workflow deps, hooks, multi-repo, …) | ⏳ pending | Polish. |
 
-Workspace tests: **704 passing**, none ignored.
+Workspace tests: **738 passing**, none ignored.
 
 ## Vision
 
@@ -521,7 +523,90 @@ Implementation:
 
 The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied through the scheduler.
 
-## Phase 5 — Advanced (deferred)
+## Phase 5 — Advanced
+
+### 5.1 Push-based scheduler Subscribe — ✅ shipped
+
+Delivered:
+
+- **Wire protocol** (`clhorde_core::control`): new `ControlRequest::Subscribe` variant and a tagged `SchedulerEvent { Snapshot { workflows, root }, WorkflowUpdated { summary } }` carried as `ControlResponse::Event { event }`. `Snapshot.root` is `#[serde(default, skip_serializing_if = "Option::is_none")]` for forward compat with older scheduler builds. `SchedulerEvent` decodes strictly — unknown event kinds are an error so a future scheduler doesn't silently corrupt an old client's view.
+- **Orchestrator emission**: `Orchestrator` now owns a `tokio::sync::broadcast::Sender<SchedulerEvent>` (capacity 256). Each public mutating method (`reconcile`, `cancel_workflow`, `queue_workflow`, `retry_section`, `handle_event`, `handle_daemon_event`, `try_advance`) is split into a public wrapper + a private `_inner` body. The wrapper snapshots `WorkflowSummary`s before, runs the body, then emits one `WorkflowUpdated` per workflow whose summary actually changed. Idempotent calls (no state change) emit nothing — important for keeping a Subscribe stream quiet when the user isn't doing anything. Internal call sites of `try_advance` switched to `try_advance_inner` to avoid double-emission. `Orchestrator::events_subscribe()` exposes a fresh `broadcast::Receiver` to the control server. `Orchestrator::new` signature is unchanged — the `Sender` is constructed internally.
+- **Control server stream branch**: `run_with_streams` now branches on the first frame: if it's `Subscribe`, the connection switches to `run_subscribe_stream`. The handler subscribes to `events_subscribe()` *before* taking the snapshot (so events fired between snapshot and first `recv` aren't lost), writes one initial `SchedulerEvent::Snapshot`, then forwards every `WorkflowUpdated` over the same connection. `RecvError::Lagged` re-emits a fresh Snapshot so a slow subscriber converges back to a consistent baseline. Reads on the subscribe socket only detect EOF — extra frames sent by the client after Subscribe are silently dropped to preserve the one-way contract. `dispatch_request` rejects Subscribe with a clear error, since it should never reach the one-shot path in production. The non-Subscribe one-shot path was factored through a small `write_response` helper so both branches share one frame-writing path.
+- **TUI subscribe client**: new `scheduler_client::subscribe()` returning `mpsc::UnboundedReceiver<SubscriptionMessage { Event, Disconnected }>`. The task connects, sends one `Subscribe` frame, then forwards every `Event` until the socket closes; emits one `Disconnected(SchedulerError)` frame on the way out so the owner can drive reconnect. The receiver hangup also tears the task down cleanly.
+- **TUI main loop**: removed the periodic `ControlRequest::Status` poll and the `needs_scheduler_poll`/`SCHEDULER_POLL_INTERVAL` plumbing. The new `select!` arms are (a) `sched_event_rx.recv()` routing `Event` → `app.apply_scheduler_event` and `Disconnected` → `note_scheduler_unreachable + sched_subscription_alive = false`, and (b) `sched_reconnect_interval.tick()` re-spawning `subscribe()` when the subscription is down. Detail polling and Q/X/T action one-shots are unchanged.
+- **`App::apply_scheduler_event`**: dispatches `Snapshot` through the existing `apply_scheduler_status` so the initial state lands the same way a poll did (selection preservation + freshness timer). `WorkflowUpdated` upserts a single summary into the right list — drafts vs workflows — by name. A workflow that transitions between `drafted` and any other status migrates between the two lists in one event without duplicating across them. Selection by name is preserved on each list across the upsert.
+
+20 new tests (workspace 704 → 724):
+- 5 in `clhorde-core` (Subscribe round-trip, Snapshot/WorkflowUpdated event round-trips, Snapshot back-compat without `root`, unknown-event-kind decode error).
+- 6 in `clhorde-scheduler` orchestrator (Queue emits, Cancel emits, idempotent call emits nothing, reconcile emits one per discovered change, FS marker round-trip emits Drafted→Queued, multiple subscribers each receive every event).
+- 3 in `clhorde-scheduler` control server (Subscribe end-to-end via `tokio::io::duplex` — initial Snapshot then WorkflowUpdated; multiple-client fan-out; extra frames after Subscribe ignored).
+- 2 in `clhorde-tui` `scheduler_client` (subscribe forwards events until disconnect against a real `UnixListener`; missing socket reports `Disconnected(Unreachable)` and closes the channel).
+- 6 in `clhorde-tui` `App` (Snapshot populates lists; WorkflowUpdated inserts new draft / new active; drafted→queued migration removes from drafts and inserts into workflows; in-place replacement keeps a single entry; insertions stay alphabetically sorted).
+
+The detail overlay still uses 2s polling — a Detail subscription needs a per-workflow event surface, broken out into Phase 5.3.
+
+### 5.2 Web routes + dashboard tabs — ✅ shipped
+
+Delivered:
+
+- **`clhorde-web::scheduler_bridge`** — long-lived bridge to the scheduler control socket. Mirrors `DaemonBridge`'s shape but adapts to the lighter wire protocol: a single Subscribe connection feeds a `tokio::sync::broadcast::Sender<SchedulerEvent>`, while one-shot `request()` opens a fresh connection per RPC for status/detail/queue/cancel/retry. Critical property: **`SchedulerBridge::start` does not block startup** — `clhorde-web` happily serves the daemon-only views (Prompts/Store) when `clhorde-scheduler daemon` isn't running, and reconnects in the background with capped exponential backoff (250ms → 15s). `request(Subscribe)` is rejected with a clear error to avoid deadlocking callers.
+- **REST surface** (5 routes, all under `/api/scheduler/`):
+  - `GET status` → `{ workflows, root, connected }`. Same payload as the TUI's `ControlRequest::Status { name: None }` plus a `connected` flag the SPA uses for the unreachable banner.
+  - `GET workflow/{name}` → `WorkflowDetail` (DAG nodes + per-phase dispatch state). 404 when the workflow is unknown — distinct from 503 ("scheduler not running").
+  - `POST workflow/{name}/queue` (body: `{ priority? }`) → writes the `.clhorde-ready` marker.
+  - `POST workflow/{name}/cancel` → removes marker + transitions.
+  - `POST workflow/{name}/retry` (body: `{ section }`) → re-dispatches one apply node.
+  - Error mapping: `Unreachable` → 503, `Timeout` → 504, `Io`/`BadResponse` → 502, `ControlResponse::Error` → 400 (mutations) / 404 (Detail).
+- **WebSocket fan-out** — `handle_ws` now subscribes to `scheduler.subscribe_events()` alongside the daemon broadcasts. Every WS client receives `{type: "SchedulerEvent", event: <SchedulerEvent>}` frames as the scheduler emits them. On connect, if the scheduler bridge is `is_connected()`, the handler issues a one-shot `Status` and forwards it as a Snapshot frame so the SPA bootstraps without a separate REST call. Lag handling: scheduler-side already re-emits Snapshots on `RecvError::Lagged`, so the WS arm just logs and skips.
+- **Auth + CORS unchanged** — both layers wrap the new routes via the same middleware as the daemon routes; the auth token also gates the WS upgrade.
+- **SPA frontend** (`static/index.html`, `app.js`, `style.css`):
+  - Two new top-nav tabs: **Drafts** + **Workflows**. The existing Dashboard/Store tabs are untouched.
+  - `AppState` learned `drafts: string[]`, `workflows: WorkflowSummary[]`, `schedulerRoot`, and `schedulerSeen` (true once any SchedulerEvent arrived). `update()` dispatches `SchedulerEvent` envelopes, and `_applySchedulerEvent` mirrors the TUI's `apply_scheduler_event`: Snapshot rebuilds both lists from scratch, WorkflowUpdated upserts by name and migrates entries between Drafts and Workflows when `status` crosses the `drafted` boundary. `appState.onChange` triggers a re-render of whichever scheduler tab is currently open, so push events land without a manual refresh.
+  - Drafts pane: list of names with a `[Queue]` button per row. Empty state distinguishes "no drafts yet" from "scheduler not reachable" using `schedulerSeen`.
+  - Workflows pane: status-coloured rows (`badge-workflow-{drafted,queued,implementing,verifying,archiving,archived,failed,cancelled}`). `[Open]` zooms into a detail block fetched on demand via `GET workflow/{name}`; `[Cancel]` runs the REST cancel with a `confirm()` gate. Detail block renders apply DAG nodes (id, label, state badge, prompt id, exit code, deps), then verify/archive singletons. Inline section-id input + `[Retry section]` button targets the open workflow.
+  - CSS: scheduler-views reuse the `store-view` layout (full-width, scroll, padded). New badge classes for workflow + node states matching the existing pending/running/completed/failed palette. Workflow nodes use a left border colour-coded by state.
+
+14 new tests (workspace 724 → 738):
+- 5 in `clhorde-web::scheduler_bridge` (start does not block when scheduler offline; subscribe loop forwards events to subscribers; request returns Unreachable when scheduler offline; one-shot request round-trip; Subscribe rejected on `request()`).
+- 7 in `clhorde-web::routes` (Queue body defaults + with priority; Retry body requires section + rejects empty; error mapping for Unreachable→503, Timeout→504, Io→502).
+- 2 in `clhorde-web::ws` (`scheduler_message` envelope wraps Snapshot + WorkflowUpdated with the right `type` discriminants).
+
+The web dashboard keeps the existing 1495-line vanilla-JS SPA approach — no build step, no framework. The new tabs add ~290 lines of JS and ~90 lines of CSS.
+
+### 5.3 Detail subscription — ⏳ in progress
+
+Goal: kill the 2s polling that powers the workflow detail overlay (TUI) and the expanded workflow card (web SPA). Replace it with push-based detail events delivered over the same Subscribe-style stream Phase 5.1 introduced for summaries. Mirrors 5.1 but scoped to one workflow at a time, since `WorkflowDetail` is heavier than `WorkflowSummary` and most viewers only care about one workflow.
+
+Sliced into three independently-shippable sub-phases:
+
+#### 5.3.1 Wire protocol + orchestrator + control server
+
+- **Wire protocol** (`clhorde_core::control`):
+  - New `ControlRequest::SubscribeDetail { name }` — switches the connection into a per-workflow stream. Symmetric with `Subscribe` (one-way after the request, separate connection for follow-up RPCs).
+  - Two new `SchedulerEvent` variants: `DetailSnapshot { detail }` (initial frame on a SubscribeDetail connection, also re-sent on broadcast lag) and `DetailUpdated { detail }` (per orchestrator state change). Both carry a full `WorkflowDetail` rather than a diff — payloads are small (≤ a few dozen nodes) and full-snapshot semantics keep the client logic trivial.
+  - `SubscribeDetail` against an unknown workflow returns `ControlResponse::Error { message }` and closes the connection (no frame stream, no event ever fired).
+- **Orchestrator emission**: add a second `broadcast::Sender<SchedulerEvent>` dedicated to detail events (capacity 256). The mutating-method wrapper pattern from 5.1 grows a `snapshot_details()` / `emit_detail_diff()` pair that mirrors the existing summary diff. We always compute details before+after the inner body and emit one `DetailUpdated` per workflow whose `WorkflowDetail` actually changed — this catches per-node state shifts (e.g. `WorkerFinished` for one apply node) that don't move the surrounding `WorkflowSummary`. A new `Orchestrator::detail_events_subscribe()` exposes a fresh `broadcast::Receiver`.
+- **Control server**: new `run_subscribe_detail_stream` branch in `run_with_streams`. Same shape as `run_subscribe_stream` but: (a) takes `name` from the request, (b) on missing workflow writes one `Error` response and returns, (c) filters every event from the broadcast by `detail.name == name` so a per-workflow subscriber only ever sees its own workflow.
+
+#### 5.3.2 TUI integration — drop polling
+
+- New `scheduler_client::subscribe_detail(name)` helper, mirroring `subscribe()`. Returns an `mpsc::UnboundedReceiver` of `DetailSubscriptionMessage { Event(SchedulerEvent), Disconnected(SchedulerError) }`.
+- Main loop: spawn the detail subscription when `App` opens the overlay, abort it when the overlay closes. Reconnect with the same backoff strategy as the summary subscription.
+- Remove `DETAIL_REFRESH_INTERVAL`, `App::detail_refresh_target`, and `App::detail_last_poll`. Remove the periodic `ControlRequest::Detail` poll path. The initial open still does one `Detail` RPC for the optimistic synchronous render so we don't blank the screen for the round-trip.
+- New `App::apply_detail_event` dispatches `DetailSnapshot` and `DetailUpdated` through the existing `apply_workflow_detail` (treating both as authoritative replacements, since they always carry the full detail).
+
+#### 5.3.3 Web bridge + SPA push
+
+- `SchedulerBridge` already feeds every `SchedulerEvent` it receives into a single broadcast surface — `DetailSnapshot` / `DetailUpdated` ride that channel for free. The bridge stays one-Subscribe-connection wide; per-workflow subscriptions are not introduced (every WS client filters on the SPA side, payloads are small).
+- The bridge gains a one-shot `request_subscribe_detail(name)` only if needed for the explicit "I just opened this card" bootstrap; first pass: rely on the existing `GET /api/scheduler/workflow/{name}` for the initial render, then let push events take over.
+- WS frames: re-use the existing `{type: "SchedulerEvent", event: ...}` envelope; the new variants flow through unchanged.
+- SPA: when a `DetailUpdated` arrives whose `name` matches the currently expanded card, replace `expandedWorkflowDetail` and re-render. Drop the post-action `fetchWorkflowDetail` re-fetches (Cancel/Retry) — those events now arrive via the push stream within ms of the orchestrator state change.
+
+Open questions (to resolve during 5.3.1):
+- Does the orchestrator need a `WorkflowRemoved` event too, paired with detail teardown? Decision deferred — workflows don't currently disappear from `workflows`, same as 5.1.
+- Should SubscribeDetail accept multiple names? Decision: no, one workflow per connection. Two viewers = two connections; the orchestrator broadcast fans them out.
+
+### 5.x Remaining (deferred)
 
 - **Disjoint-files analysis**: refuse `parallel-with` annotations when sections touch overlapping files (cheap heuristic via grep over `proposal.md` / `design.md`).
 - **Inter-workflow deps**: `depends_on: [other-change-name]` in `.clhorde-ready` defers pickup until the other change is `Archived`.
@@ -564,7 +649,12 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 | **4.1** | ✅ shipped | TUI tabs foundation (read-only Drafts/Workflows) | First-class UX, no actions yet; 13 new tests. |
 | **4.2** | ✅ shipped | Tab actions: Q/E/R/X/T (+ scheduler `Queue` + `Status.root`) | Queue, explore, review, cancel, retry — 24 new tests. |
 | **4.3** | ✅ shipped | Workflow detail view + freshness badges (push subscribe deferred) | Per-section DAG zoom + 2s auto-refresh — 18 new tests. |
-| **5**   | ⏳ pending | Web routes + push subscribe + advanced (parallel safety, hooks, multi-repo) | Polish. |
+| **5.1** | ✅ shipped | Push-based scheduler `Subscribe` + broadcast-backed event stream | Replaces 2s status polling — 20 new tests. |
+| **5.2** | ✅ shipped | Web routes + Drafts/Workflows SPA tabs | Browser dashboard reaches feature parity with TUI tabs — 14 new tests. |
+| **5.3.1** | ⏳ in progress | `SubscribeDetail` wire + orchestrator detail broadcast + control-server stream branch | Server-side push surface for one workflow's `WorkflowDetail`. |
+| **5.3.2** | ⏳ pending | TUI: spawn/abort detail subscription with overlay; drop 2s polling | Removes the last polling path inside the TUI. |
+| **5.3.3** | ⏳ pending | Web: forward DetailSnapshot/DetailUpdated through the existing WS envelope; SPA replaces expanded card on push | SPA reaches push parity with the TUI. |
+| **5.x** | ⏳ pending | Advanced (parallel safety, inter-workflow deps, hooks, multi-repo) | Polish. |
 
 Each phase is independently shippable. Phase 0 alone is already a feature win; Phase 2.4 already produces value for users who want a scriptable workflow runner.
 

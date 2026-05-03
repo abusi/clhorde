@@ -6,5 +6,6 @@
 //! crate; only the data lives elsewhere.
 
 pub use clhorde_core::control::{
-    ControlRequest, ControlResponse, DetailNode, WorkflowDetail, WorkflowSummary,
+    ControlRequest, ControlResponse, DetailNode, SchedulerEvent, WorkflowDetail,
+    WorkflowSummary,
 };

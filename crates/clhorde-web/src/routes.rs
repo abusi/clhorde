@@ -9,9 +9,11 @@ use serde::Deserialize;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
 
+use clhorde_core::control::{ControlRequest, ControlResponse};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent};
 
 use crate::auth::{self, AuthToken};
+use crate::scheduler_bridge::SchedulerBridgeError;
 use crate::state::AppState;
 use crate::static_files::{self, StaticSource};
 use crate::ws;
@@ -52,6 +54,23 @@ pub fn router(
         .route("/api/store/drop", post(store_drop))
         .route("/api/store/keep", post(store_keep))
         .route("/api/store/clean-worktrees", post(store_clean_worktrees))
+        // Scheduler (Phase 5.2). Surface the same operations as
+        // `clhorde-cli flow` and the TUI's Drafts/Workflows tabs.
+        // `is_connected` drives the unreachable banner client-side.
+        .route("/api/scheduler/status", get(scheduler_status))
+        .route("/api/scheduler/workflow/{name}", get(scheduler_workflow_detail))
+        .route(
+            "/api/scheduler/workflow/{name}/queue",
+            post(scheduler_queue),
+        )
+        .route(
+            "/api/scheduler/workflow/{name}/cancel",
+            post(scheduler_cancel),
+        )
+        .route(
+            "/api/scheduler/workflow/{name}/retry",
+            post(scheduler_retry),
+        )
         .with_state(state)
         .fallback(move |req| static_files::serve_static(fallback_source.clone(), req));
 
@@ -796,6 +815,189 @@ async fn dispatch_action(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scheduler routes (Phase 5.2)
+// ---------------------------------------------------------------------------
+
+/// Body for `POST /api/scheduler/workflow/{name}/queue`. Both fields
+/// optional — an empty body is valid and writes a marker without a
+/// priority hint, matching the CLI's `clhorde-cli flow queue <name>`.
+#[derive(Debug, Deserialize, Default)]
+struct ScheduleQueueBody {
+    #[serde(default)]
+    priority: Option<i32>,
+}
+
+/// Body for `POST /api/scheduler/workflow/{name}/retry`. The section
+/// id matches the dotted decimal in `tasks.md` (`"1"`, `"3.2"`).
+#[derive(Debug, Deserialize)]
+struct ScheduleRetryBody {
+    section: String,
+}
+
+/// Map a [`SchedulerBridgeError`] to a (status, json) tuple. Mirrors
+/// the `daemon_unavailable` helper used by the daemon routes:
+/// - `Unreachable` → 503 (the scheduler isn't running).
+/// - `Timeout`     → 504 (it's running but stuck).
+/// - everything else → 502 with the message body for debugging.
+fn scheduler_error_response(
+    e: &SchedulerBridgeError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match e {
+        SchedulerBridgeError::Unreachable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "scheduler not reachable" })),
+        ),
+        SchedulerBridgeError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({ "error": "scheduler did not respond in time" })),
+        ),
+        SchedulerBridgeError::Io(msg) | SchedulerBridgeError::BadResponse(msg) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("scheduler bridge: {msg}") })),
+        ),
+    }
+}
+
+/// `GET /api/scheduler/status` — list every known workflow plus the
+/// scheduler's watched root. The same payload the TUI gets from
+/// `ControlRequest::Status { name: None }`.
+async fn scheduler_status(State(state): State<AppState>) -> impl IntoResponse {
+    match state
+        .scheduler
+        .request(ControlRequest::Status { name: None })
+        .await
+    {
+        Ok(ControlResponse::Status { workflows, root }) => (
+            StatusCode::OK,
+            Json(json!({
+                "workflows": workflows,
+                "root": root,
+                "connected": state.scheduler.is_connected(),
+            })),
+        )
+            .into_response(),
+        Ok(ControlResponse::Error { message }) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": message })),
+        )
+            .into_response(),
+        Ok(other) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("unexpected scheduler response: {other:?}") })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::debug!("scheduler_status failed: {e}");
+            scheduler_error_response(&e).into_response()
+        }
+    }
+}
+
+/// `GET /api/scheduler/workflow/{name}` — per-workflow detail
+/// (DAG + per-node dispatch state). Same payload as
+/// `ControlRequest::Detail`. Returns 404 when the workflow is
+/// unknown — distinct from 503 ("scheduler not running").
+async fn scheduler_workflow_detail(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .scheduler
+        .request(ControlRequest::Detail { name: name.clone() })
+        .await
+    {
+        Ok(ControlResponse::Detail { detail }) => {
+            (StatusCode::OK, Json(json!(detail))).into_response()
+        }
+        Ok(ControlResponse::Error { message }) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": message })),
+        )
+            .into_response(),
+        Ok(other) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("unexpected scheduler response: {other:?}") })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::debug!(name = %name, "scheduler_detail failed: {e}");
+            scheduler_error_response(&e).into_response()
+        }
+    }
+}
+
+/// `POST /api/scheduler/workflow/{name}/queue` — write the
+/// `.clhorde-ready` marker. Body: optional `priority`. Returns 400
+/// when the change directory is missing, 503 when the scheduler is
+/// offline.
+async fn scheduler_queue(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<ScheduleQueueBody>>,
+) -> impl IntoResponse {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let req = ControlRequest::Queue {
+        name: name.clone(),
+        priority: body.priority,
+    };
+    scheduler_mutation(&state, req, "queue").await
+}
+
+/// `POST /api/scheduler/workflow/{name}/cancel` — remove the
+/// marker and transition the workflow.
+async fn scheduler_cancel(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    scheduler_mutation(&state, ControlRequest::Cancel { name }, "cancel").await
+}
+
+/// `POST /api/scheduler/workflow/{name}/retry` — re-dispatch one
+/// apply-phase section. Body: `{ "section": "<dotted-id>" }`.
+async fn scheduler_retry(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<ScheduleRetryBody>,
+) -> impl IntoResponse {
+    let req = ControlRequest::Retry {
+        name,
+        section: body.section,
+    };
+    scheduler_mutation(&state, req, "retry").await
+}
+
+/// Common dispatch path for Q/X/T mutations. Maps `Ok` to 200 with
+/// the scheduler's own message, `Error` to 400 with the same body
+/// (the user mistyped a name, etc.), and bridge errors to 503/504.
+async fn scheduler_mutation(
+    state: &AppState,
+    req: ControlRequest,
+    label: &str,
+) -> axum::response::Response {
+    match state.scheduler.request(req).await {
+        Ok(ControlResponse::Ok { message }) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "message": message })),
+        )
+            .into_response(),
+        Ok(ControlResponse::Error { message }) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": message })),
+        )
+            .into_response(),
+        Ok(other) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("unexpected scheduler response: {other:?}") })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::debug!("scheduler {label} failed: {e}");
+            scheduler_error_response(&e).into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -976,5 +1178,64 @@ mod tests {
         let json = r#"{"text":"continue"}"#;
         let body: SendInputBody = serde_json::from_str(json).unwrap();
         assert_eq!(body.text, "continue");
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheduler request bodies + error mapping (Phase 5.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn schedule_queue_body_defaults() {
+        // Empty object decodes as "no priority". Mirrors the CLI
+        // `clhorde-cli flow queue <name>` (no flags) behaviour.
+        let json = r#"{}"#;
+        let body: ScheduleQueueBody = serde_json::from_str(json).unwrap();
+        assert!(body.priority.is_none());
+    }
+
+    #[test]
+    fn schedule_queue_body_with_priority() {
+        let json = r#"{"priority":7}"#;
+        let body: ScheduleQueueBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.priority, Some(7));
+    }
+
+    #[test]
+    fn schedule_retry_body_requires_section() {
+        let json = r#"{"section":"3.2"}"#;
+        let body: ScheduleRetryBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.section, "3.2");
+    }
+
+    #[test]
+    fn schedule_retry_body_rejects_missing_section() {
+        let json = r#"{}"#;
+        assert!(serde_json::from_str::<ScheduleRetryBody>(json).is_err());
+    }
+
+    #[test]
+    fn scheduler_error_unreachable_maps_to_503() {
+        let (status, body) =
+            scheduler_error_response(&SchedulerBridgeError::Unreachable);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.0["error"].as_str().unwrap().contains("not reachable"));
+    }
+
+    #[test]
+    fn scheduler_error_timeout_maps_to_504() {
+        let (status, _) = scheduler_error_response(&SchedulerBridgeError::Timeout);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[test]
+    fn scheduler_error_io_maps_to_502() {
+        // I/O and BadResponse both surface as 502 Bad Gateway: the
+        // scheduler is reachable but spoke a frame we couldn't make
+        // sense of, which is a server-side problem from the client's
+        // perspective.
+        let (status, _) = scheduler_error_response(
+            &SchedulerBridgeError::Io("broken pipe".into()),
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
 }

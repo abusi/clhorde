@@ -24,9 +24,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clhorde_core::protocol::{ClientRequest, DaemonEvent, PromptInfo};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
-use crate::control::{DetailNode, WorkflowDetail, WorkflowSummary};
+use crate::control::{DetailNode, SchedulerEvent, WorkflowDetail, WorkflowSummary};
 use crate::dispatch::{is_node_done, next_runnable_nodes};
 use crate::openspec::affected_changes::{self, ChangesSnapshot};
 use crate::openspec::annotations::{annotate, AnnotatedSection};
@@ -53,6 +53,13 @@ const PROMPT_MODE: &str = "oneshot";
 /// [`DaemonEvent::WorkerFinished`]. Always written when a baseline was
 /// captured — an empty list signals "we watched, nothing changed".
 const AFFECTED_CHANGES_KEY: &str = "openspec.affected_changes";
+
+/// Broadcast capacity for [`SchedulerEvent`]s pushed to subscribed
+/// control-socket clients. Big enough that a transiently slow client
+/// (e.g. terminal repaints during a `tasks.md` storm) can catch up
+/// without taking a `RecvError::Lagged`; small enough that a
+/// permanently-stuck client doesn't pin unbounded memory.
+const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Errors surfaced from the orchestrator. We deliberately keep this small —
 /// most callers want to log-and-continue, not to branch on the cause.
@@ -101,6 +108,16 @@ impl From<std::io::Error> for OrchestratorError {
     fn from(e: std::io::Error) -> Self {
         OrchestratorError::Io(e)
     }
+}
+
+/// Captured state used by [`Orchestrator::emit_diff`] to detect
+/// genuine state shifts. Pairing the summary and detail snapshots
+/// keeps the cost of detail diffing on the same code path as the
+/// existing summary diffing — both are rebuilt once before each
+/// public mutating method runs and compared once after.
+struct StateSnapshot {
+    summaries: HashMap<String, WorkflowSummary>,
+    details: HashMap<String, WorkflowDetail>,
 }
 
 /// Per-prompt dispatch bookkeeping.
@@ -155,6 +172,17 @@ pub struct Orchestrator {
     /// Baseline snapshot captured at `WorkerStarted`. Cleared on
     /// `WorkerFinished` after the diff is emitted (or on `PromptRemoved`).
     prompt_baselines: HashMap<usize, ChangesSnapshot>,
+    /// Broadcast surface for push-based [`SchedulerEvent`]s.
+    /// Subscribers get a fresh receiver via [`Orchestrator::events_subscribe`];
+    /// `send` is a no-op when nobody's listening (cheap by design).
+    events: broadcast::Sender<SchedulerEvent>,
+    /// Detail-event broadcast (`DetailUpdated`). Separate channel from
+    /// `events` so a subscriber that only cares about summaries
+    /// doesn't take a `Lagged` from a workflow whose nodes flip state
+    /// rapidly. Carries every workflow's detail; the control server
+    /// filters by name on `SubscribeDetail` connections. `send` is a
+    /// no-op when nobody's listening.
+    detail_events: broadcast::Sender<SchedulerEvent>,
 }
 
 impl Orchestrator {
@@ -165,6 +193,8 @@ impl Orchestrator {
     ) -> Self {
         let root = root.into();
         let templates = TemplateEngine::new(&root);
+        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (detail_events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             root,
             store,
@@ -175,6 +205,79 @@ impl Orchestrator {
             outbound,
             prompt_cwds: HashMap::new(),
             prompt_baselines: HashMap::new(),
+            events,
+            detail_events,
+        }
+    }
+
+    /// Subscribe to push-based summary-level [`SchedulerEvent`]s
+    /// (`Snapshot` / `WorkflowUpdated`). Returns a fresh
+    /// [`broadcast::Receiver`] that observes events emitted *after*
+    /// the call. Callers that need an initial snapshot should pair
+    /// this with [`Orchestrator::summaries`] before the first `recv`.
+    pub fn events_subscribe(&self) -> broadcast::Receiver<SchedulerEvent> {
+        self.events.subscribe()
+    }
+
+    /// Subscribe to push-based detail-level [`SchedulerEvent`]s
+    /// (`DetailUpdated`). Returns a fresh [`broadcast::Receiver`].
+    /// Carries detail events for *every* workflow — callers that
+    /// only want one workflow filter by `detail.name`. Pair with
+    /// [`Orchestrator::detail`] for the initial snapshot.
+    pub fn detail_events_subscribe(&self) -> broadcast::Receiver<SchedulerEvent> {
+        self.detail_events.subscribe()
+    }
+
+    /// Snapshot the orchestrator's externally-visible state, paired
+    /// across the two broadcast surfaces. Used by the emit-diff
+    /// helpers below to detect which workflows actually changed
+    /// across a public method call so we only emit one
+    /// [`SchedulerEvent::WorkflowUpdated`] / [`SchedulerEvent::DetailUpdated`]
+    /// per genuine state shift.
+    fn snapshot_state(&self) -> StateSnapshot {
+        let summaries = self
+            .workflows
+            .iter()
+            .map(|(name, wf)| (name.clone(), workflow_summary(wf)))
+            .collect();
+        let details = self
+            .workflows
+            .keys()
+            .filter_map(|name| self.detail(name).map(|d| (name.clone(), d)))
+            .collect();
+        StateSnapshot { summaries, details }
+    }
+
+    /// Emit one [`SchedulerEvent::WorkflowUpdated`] per workflow
+    /// whose [`WorkflowSummary`] differs from `before`, and one
+    /// [`SchedulerEvent::DetailUpdated`] (on the dedicated detail
+    /// channel) per workflow whose [`WorkflowDetail`] differs.
+    /// New workflows (absent from `before`) emit too on both
+    /// channels. Removed workflows are not signalled — workflows
+    /// currently never disappear from the orchestrator's
+    /// `workflows` map (terminal states stay around for the user
+    /// to inspect). If that ever changes we'll add explicit
+    /// `WorkflowRemoved` / `DetailRemoved` events.
+    ///
+    /// The two diffs are independent: a `WorkerFinished` on one apply
+    /// node can shift `WorkflowDetail` (per-node `state` / `exit_code`)
+    /// without changing `WorkflowSummary` (status still
+    /// `implementing`, `prompt_ids` unchanged).
+    fn emit_diff(&self, before: &StateSnapshot) {
+        for wf in self.workflows.values() {
+            let summary = workflow_summary(wf);
+            if before.summaries.get(&wf.name) != Some(&summary) {
+                let _ = self
+                    .events
+                    .send(SchedulerEvent::WorkflowUpdated { summary });
+            }
+            if let Some(detail) = self.detail(&wf.name) {
+                if before.details.get(&wf.name) != Some(&detail) {
+                    let _ = self
+                        .detail_events
+                        .send(SchedulerEvent::DetailUpdated { detail });
+                }
+            }
         }
     }
 
@@ -185,6 +288,13 @@ impl Orchestrator {
     /// Reconcile in-memory state with what's on disk. Idempotent — call at
     /// startup *and* whenever the FS or the store may have drifted.
     pub fn reconcile(&mut self) -> Result<(), OrchestratorError> {
+        let before = self.snapshot_state();
+        let result = self.reconcile_inner();
+        self.emit_diff(&before);
+        result
+    }
+
+    fn reconcile_inner(&mut self) -> Result<(), OrchestratorError> {
         for wf in self.store.list()? {
             self.workflows.insert(wf.name.clone(), wf);
         }
@@ -199,7 +309,7 @@ impl Orchestrator {
         // running workflow so prompts get dispatched if the daemon is up.
         let names: Vec<String> = self.workflows.keys().cloned().collect();
         for n in names {
-            if let Err(e) = self.try_advance(&n) {
+            if let Err(e) = self.try_advance_inner(&n) {
                 tracing::warn!(name = %n, error = %e, "reconcile try_advance");
             }
         }
@@ -291,6 +401,16 @@ impl Orchestrator {
         &mut self,
         name: &str,
     ) -> Result<&'static str, OrchestratorError> {
+        let before = self.snapshot_state();
+        let result = self.cancel_workflow_inner(name);
+        self.emit_diff(&before);
+        result
+    }
+
+    fn cancel_workflow_inner(
+        &mut self,
+        name: &str,
+    ) -> Result<&'static str, OrchestratorError> {
         let marker = self
             .root
             .join("openspec")
@@ -330,6 +450,17 @@ impl Orchestrator {
         name: &str,
         priority: Option<i32>,
     ) -> Result<(), OrchestratorError> {
+        let before = self.snapshot_state();
+        let result = self.queue_workflow_inner(name, priority);
+        self.emit_diff(&before);
+        result
+    }
+
+    fn queue_workflow_inner(
+        &mut self,
+        name: &str,
+        priority: Option<i32>,
+    ) -> Result<(), OrchestratorError> {
         let change_dir = self
             .root
             .join("openspec")
@@ -355,6 +486,17 @@ impl Orchestrator {
     /// outbound channel — i.e. it lands in the daemon as if the
     /// orchestrator had decided to dispatch it.
     pub fn retry_section(
+        &mut self,
+        name: &str,
+        section_id: &str,
+    ) -> Result<(), OrchestratorError> {
+        let before = self.snapshot_state();
+        let result = self.retry_section_inner(name, section_id);
+        self.emit_diff(&before);
+        result
+    }
+
+    fn retry_section_inner(
         &mut self,
         name: &str,
         section_id: &str,
@@ -466,6 +608,16 @@ impl Orchestrator {
 
     /// Process one [`FsEvent`].
     pub fn handle_event(&mut self, event: FsEvent) -> Result<(), OrchestratorError> {
+        let before = self.snapshot_state();
+        let result = self.handle_event_inner(event);
+        self.emit_diff(&before);
+        result
+    }
+
+    fn handle_event_inner(
+        &mut self,
+        event: FsEvent,
+    ) -> Result<(), OrchestratorError> {
         let name = match &event {
             FsEvent::MarkerCreated { name } => name.clone(),
             FsEvent::MarkerRemoved { name } => name.clone(),
@@ -478,13 +630,23 @@ impl Orchestrator {
                 self.refresh_tasks(&name);
             }
         }
-        self.try_advance(&name)
+        self.try_advance_inner(&name)
     }
 
     /// Process one [`DaemonEvent`] from the upstream daemon. Only the
     /// events the scheduler cares about are handled — everything else is a
     /// no-op so unrelated traffic doesn't pollute the workflow state.
     pub fn handle_daemon_event(
+        &mut self,
+        event: &DaemonEvent,
+    ) -> Result<(), OrchestratorError> {
+        let before = self.snapshot_state();
+        let result = self.handle_daemon_event_inner(event);
+        self.emit_diff(&before);
+        result
+    }
+
+    fn handle_daemon_event_inner(
         &mut self,
         event: &DaemonEvent,
     ) -> Result<(), OrchestratorError> {
@@ -514,7 +676,7 @@ impl Orchestrator {
                 self.emit_affected_changes(*prompt_id);
                 if let Some(name) = self.workflow_owning_prompt(*prompt_id) {
                     self.note_worker_finished(&name, *prompt_id, *exit_code);
-                    self.try_advance(&name)?;
+                    self.try_advance_inner(&name)?;
                 }
             }
             DaemonEvent::PromptRemoved { prompt_id } => {
@@ -527,8 +689,18 @@ impl Orchestrator {
     }
 
     /// Idempotent kick on a single workflow's state machine. Safe to call
-    /// from any external trigger.
+    /// from any external trigger. Internal callers in this file use
+    /// [`Orchestrator::try_advance_inner`] directly to avoid emitting
+    /// duplicate [`SchedulerEvent`]s when the surrounding public method
+    /// already wraps the change with [`Orchestrator::emit_diff`].
     pub fn try_advance(&mut self, name: &str) -> Result<(), OrchestratorError> {
+        let before = self.snapshot_state();
+        let result = self.try_advance_inner(name);
+        self.emit_diff(&before);
+        result
+    }
+
+    fn try_advance_inner(&mut self, name: &str) -> Result<(), OrchestratorError> {
         let Some(mut wf) = self.workflows.remove(name) else {
             return Ok(());
         };
@@ -2229,5 +2401,277 @@ mod tests {
             orch.workflow("x").unwrap().status,
             WorkflowStatus::Drafted
         );
+    }
+
+    // ── Phase 5.1: SchedulerEvent broadcast emission ──
+    //
+    // The orchestrator emits a [`SchedulerEvent::WorkflowUpdated`] for
+    // every workflow whose [`WorkflowSummary`] changed across a public
+    // method call. Idempotent calls (no state change) emit nothing —
+    // that's important for keeping a Subscribe stream quiet when the
+    // user isn't doing anything.
+
+    fn drain_events(
+        rx: &mut broadcast::Receiver<SchedulerEvent>,
+    ) -> Vec<SchedulerEvent> {
+        let mut out = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => out.push(ev),
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Closed) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    // The capacity is large enough that test workloads
+                    // never lag in practice. If they ever do, we want
+                    // the test to fail loudly rather than silently
+                    // drop events.
+                    panic!("event broadcast lagged in test")
+                }
+            }
+        }
+        out
+    }
+
+    fn updated_summary(ev: &SchedulerEvent) -> &WorkflowSummary {
+        match ev {
+            SchedulerEvent::WorkflowUpdated { summary } => summary,
+            other => panic!("expected WorkflowUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queue_workflow_emits_workflow_updated_event() {
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        let mut events = orch.events_subscribe();
+
+        orch.queue_workflow("x", Some(5)).unwrap();
+
+        let evs = drain_events(&mut events);
+        assert_eq!(evs.len(), 1, "expected exactly one event, got {evs:?}");
+        let s = updated_summary(&evs[0]);
+        assert_eq!(s.name, "x");
+        assert_eq!(s.status, "queued");
+        assert_eq!(s.priority, 5);
+    }
+
+    #[test]
+    fn cancel_workflow_emits_workflow_updated_event() {
+        // Setup: queue → confirm one event → drain → cancel → expect a
+        // second event reflecting the Drafted transition.
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        let mut events = orch.events_subscribe();
+        orch.queue_workflow("x", None).unwrap();
+        drain_events(&mut events); // discard the queue event
+
+        orch.cancel_workflow("x").unwrap();
+
+        let evs = drain_events(&mut events);
+        assert_eq!(evs.len(), 1);
+        let s = updated_summary(&evs[0]);
+        assert_eq!(s.name, "x");
+        assert_eq!(s.status, "drafted");
+    }
+
+    #[test]
+    fn idempotent_calls_emit_no_events() {
+        // try_advance on a Drafted workflow does nothing — no event
+        // should fire. Ditto cancel on an already-Drafted workflow.
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        let mut events = orch.events_subscribe();
+        orch.reconcile().unwrap();
+        // Discard the reconcile event that turned the FS-discovered
+        // change into a Drafted workflow.
+        drain_events(&mut events);
+
+        orch.try_advance("x").unwrap();
+        assert!(drain_events(&mut events).is_empty());
+
+        // cancel on Drafted reports "noop" and emits no event.
+        let kind = orch.cancel_workflow("x").unwrap();
+        assert_eq!(kind, "noop");
+        assert!(drain_events(&mut events).is_empty());
+    }
+
+    #[test]
+    fn reconcile_emits_one_event_per_discovered_change() {
+        // Two changes on disk → reconcile inserts both → exactly two
+        // WorkflowUpdated events surface.
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        change_dir(&tmp, "y");
+        let mut events = orch.events_subscribe();
+
+        orch.reconcile().unwrap();
+
+        let evs = drain_events(&mut events);
+        assert_eq!(evs.len(), 2);
+        let mut names: Vec<&str> = evs.iter().map(|e| updated_summary(e).name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn handle_event_emits_on_marker_creation() {
+        // FS event → MarkerCreated → state transitions Drafted→Queued
+        // → one WorkflowUpdated.
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        write_marker(&tmp, "x", "");
+        // First reconcile inserts the workflow as Queued (since the
+        // marker is already on disk). We want to drive a state change
+        // *after* subscription, so set up the subscribe AFTER the
+        // initial reconcile and then simulate marker re-creation.
+        orch.reconcile().unwrap();
+
+        let mut events = orch.events_subscribe();
+        // Removing then re-creating the marker round-trips through
+        // Drafted and back to Queued — two events.
+        remove_marker(&tmp, "x");
+        orch
+            .handle_event(FsEvent::MarkerRemoved { name: "x".into() })
+            .unwrap();
+        write_marker(&tmp, "x", "priority = 1\n");
+        orch
+            .handle_event(FsEvent::MarkerCreated { name: "x".into() })
+            .unwrap();
+
+        let evs = drain_events(&mut events);
+        assert_eq!(evs.len(), 2);
+        assert_eq!(updated_summary(&evs[0]).status, "drafted");
+        assert_eq!(updated_summary(&evs[1]).status, "queued");
+        assert_eq!(updated_summary(&evs[1]).priority, 1);
+    }
+
+    #[test]
+    fn events_subscribe_can_have_multiple_subscribers() {
+        // Each Subscribe connection grabs its own broadcast::Receiver.
+        // The same event must reach every subscriber (i.e. the
+        // broadcast really is fan-out, not pick-one).
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        let mut a = orch.events_subscribe();
+        let mut b = orch.events_subscribe();
+
+        orch.queue_workflow("x", None).unwrap();
+
+        let from_a = drain_events(&mut a);
+        let from_b = drain_events(&mut b);
+        assert_eq!(from_a.len(), 1);
+        assert_eq!(from_b.len(), 1);
+        assert_eq!(from_a[0], from_b[0]);
+    }
+
+    // ── Phase 5.3: detail-event broadcast emission ──
+    //
+    // The dedicated `detail_events` channel emits one
+    // `SchedulerEvent::DetailUpdated` per workflow whose
+    // `WorkflowDetail` differs across a public mutating call.
+
+    fn updated_detail(ev: &SchedulerEvent) -> &WorkflowDetail {
+        match ev {
+            SchedulerEvent::DetailUpdated { detail } => detail,
+            other => panic!("expected DetailUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queue_workflow_emits_detail_updated_event() {
+        // Same shape as the summary diff — queueing a fresh draft
+        // shifts both the summary and the detail (status flips
+        // drafted→queued; the detail mirrors that on its `status`
+        // field). Both channels emit exactly once.
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        let mut summary_rx = orch.events_subscribe();
+        let mut detail_rx = orch.detail_events_subscribe();
+
+        orch.queue_workflow("x", Some(2)).unwrap();
+
+        let summaries = drain_events(&mut summary_rx);
+        assert_eq!(summaries.len(), 1);
+        let details = drain_events(&mut detail_rx);
+        assert_eq!(details.len(), 1, "expected exactly one detail event, got {details:?}");
+        let d = updated_detail(&details[0]);
+        assert_eq!(d.name, "x");
+        assert_eq!(d.status, "queued");
+        assert_eq!(d.priority, 2);
+    }
+
+    #[test]
+    fn idempotent_calls_emit_no_detail_events() {
+        // Mirrors `idempotent_calls_emit_no_events` for the detail
+        // channel: try_advance on a Drafted workflow is a no-op, no
+        // event on either channel.
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        let mut detail_rx = orch.detail_events_subscribe();
+        orch.reconcile().unwrap();
+        drain_events(&mut detail_rx); // discard the reconcile event
+
+        orch.try_advance("x").unwrap();
+        assert!(drain_events(&mut detail_rx).is_empty());
+    }
+
+    #[test]
+    fn detail_subscribers_independent_from_summary_subscribers() {
+        // A subscriber that only takes detail_events_subscribe doesn't
+        // get summary events, and vice versa. Important for the
+        // SubscribeDetail wire: per-workflow viewers should never see
+        // unrelated WorkflowUpdated frames.
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        let mut detail_rx = orch.detail_events_subscribe();
+        let mut summary_rx = orch.events_subscribe();
+
+        orch.queue_workflow("x", None).unwrap();
+
+        let summaries = drain_events(&mut summary_rx);
+        let details = drain_events(&mut detail_rx);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(details.len(), 1);
+        assert!(matches!(summaries[0], SchedulerEvent::WorkflowUpdated { .. }));
+        assert!(matches!(details[0], SchedulerEvent::DetailUpdated { .. }));
+    }
+
+    #[test]
+    fn detail_events_fan_out_to_multiple_subscribers() {
+        // Two SubscribeDetail connections on the same workflow each
+        // receive the broadcast (after server-side filter, but the
+        // broadcast itself fans out unfiltered).
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        let mut a = orch.detail_events_subscribe();
+        let mut b = orch.detail_events_subscribe();
+
+        orch.queue_workflow("x", None).unwrap();
+
+        let from_a = drain_events(&mut a);
+        let from_b = drain_events(&mut b);
+        assert_eq!(from_a.len(), 1);
+        assert_eq!(from_b.len(), 1);
+        assert_eq!(from_a[0], from_b[0]);
+    }
+
+    #[test]
+    fn detail_events_carry_per_workflow_payload() {
+        // Two workflows, two queues — each workflow's DetailUpdated
+        // carries its own name. Lets the control-server filter prune
+        // by name reliably.
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        change_dir(&tmp, "y");
+        let mut detail_rx = orch.detail_events_subscribe();
+
+        orch.queue_workflow("x", None).unwrap();
+        orch.queue_workflow("y", None).unwrap();
+
+        let evs = drain_events(&mut detail_rx);
+        assert_eq!(evs.len(), 2);
+        let mut names: Vec<&str> = evs.iter().map(|e| updated_detail(e).name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["x", "y"]);
     }
 }

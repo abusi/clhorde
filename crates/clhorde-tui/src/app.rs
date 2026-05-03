@@ -11,7 +11,9 @@ use crate::editor::TextBuffer;
 use crate::key_encoding;
 use crate::keymap::{FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction};
 use crate::pty_renderer::PtyRenderer;
-use clhorde_core::control::{ControlRequest, WorkflowDetail, WorkflowSummary};
+use clhorde_core::control::{
+    ControlRequest, SchedulerEvent, WorkflowDetail, WorkflowSummary,
+};
 use clhorde_core::prompt::{PromptMode, PromptStatus};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent, DaemonState, PromptInfo};
 
@@ -1168,6 +1170,95 @@ impl App {
     /// hint instead of a stale list.
     pub fn note_scheduler_unreachable(&mut self) {
         self.scheduler_reachable = false;
+        self.scheduler_last_poll = Some(Instant::now());
+    }
+
+    /// Apply one push-based [`SchedulerEvent`]. Dispatches the two
+    /// concrete variants:
+    /// - [`SchedulerEvent::Snapshot`] reuses `apply_scheduler_status`
+    ///   so the initial state right after Subscribe lands the same way
+    ///   a poll-based status reply would have, including selection
+    ///   preservation and the freshness timer.
+    /// - [`SchedulerEvent::WorkflowUpdated`] upserts a single summary
+    ///   into the right list (drafts vs workflows) by name. A workflow
+    ///   transitioning between `drafted` and any other status migrates
+    ///   between the two lists in one event.
+    pub fn apply_scheduler_event(&mut self, event: SchedulerEvent) {
+        match event {
+            SchedulerEvent::Snapshot { workflows, root } => {
+                self.apply_scheduler_status(workflows, root.map(PathBuf::from));
+            }
+            SchedulerEvent::WorkflowUpdated { summary } => {
+                self.apply_workflow_summary_update(summary);
+            }
+            // Detail events ride on a separate subscription in 5.3.2;
+            // they never reach this code path through the summary
+            // Subscribe stream the orchestrator drives. Tolerate them
+            // for forward-compat in case the wire ever multiplexes.
+            SchedulerEvent::DetailSnapshot { .. }
+            | SchedulerEvent::DetailUpdated { .. } => {}
+        }
+    }
+
+    /// Upsert one [`WorkflowSummary`] into the local lists. The
+    /// workflow's current status decides whether it sits on the Drafts
+    /// pane or the Workflows pane; transitioning between the two
+    /// migrates the entry between lists. Selection by name is
+    /// preserved on each list across the upsert.
+    fn apply_workflow_summary_update(&mut self, summary: WorkflowSummary) {
+        let name = summary.name.clone();
+        let prev_draft = self.drafts.get(self.drafts_selected).cloned();
+        let prev_workflow = self
+            .workflows
+            .get(self.workflows_selected)
+            .map(|w| w.name.clone());
+
+        // Remove any prior entry under this name from both lists.
+        // A workflow that just went drafted→queued must vanish from
+        // drafts and appear in workflows.
+        self.drafts.retain(|n| n != &name);
+        self.workflows.retain(|w| w.name != name);
+
+        if summary.status == "drafted" {
+            // Insert sorted to match `apply_scheduler_status` output.
+            let pos = self.drafts.binary_search(&name).unwrap_or_else(|p| p);
+            self.drafts.insert(pos, name);
+        } else {
+            self.workflows.push(summary);
+            // Stable sort by name to mirror the sorted `Status` snapshot.
+            self.workflows.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+
+        // Restore selection by name on each list, falling back to a
+        // clamp on length if the previously-selected entry vanished.
+        if let Some(n) = prev_draft {
+            self.drafts_selected = self
+                .drafts
+                .iter()
+                .position(|name| *name == n)
+                .unwrap_or_else(|| {
+                    self.drafts_selected.min(self.drafts.len().saturating_sub(1))
+                });
+        } else {
+            self.drafts_selected =
+                self.drafts_selected.min(self.drafts.len().saturating_sub(1));
+        }
+        if let Some(n) = prev_workflow {
+            self.workflows_selected = self
+                .workflows
+                .iter()
+                .position(|w| w.name == n)
+                .unwrap_or_else(|| {
+                    self.workflows_selected
+                        .min(self.workflows.len().saturating_sub(1))
+                });
+        } else {
+            self.workflows_selected = self
+                .workflows_selected
+                .min(self.workflows.len().saturating_sub(1));
+        }
+
+        self.scheduler_reachable = true;
         self.scheduler_last_poll = Some(Instant::now());
     }
 
@@ -3595,6 +3686,118 @@ mod tests {
         app.note_scheduler_unreachable();
         assert!(!app.scheduler_reachable);
         assert!(app.scheduler_last_poll.is_some());
+    }
+
+    // ── Phase 5.1: push-based event handling ──
+
+    #[test]
+    fn apply_scheduler_event_snapshot_populates_lists() {
+        // The Snapshot event must walk the same code path as a poll
+        // would have: drafts split out, sorted; workflows preserve
+        // their summary in order; root stashed.
+        let (mut app, _rx) = new_test_app();
+        app.apply_scheduler_event(SchedulerEvent::Snapshot {
+            workflows: vec![
+                summary("draft-b", "drafted"),
+                summary("flow-1", "queued"),
+                summary("draft-a", "drafted"),
+            ],
+            root: Some("/repo".into()),
+        });
+        assert_eq!(app.drafts, vec!["draft-a", "draft-b"]);
+        assert_eq!(app.workflows.len(), 1);
+        assert_eq!(app.workflows[0].name, "flow-1");
+        assert_eq!(app.scheduler_root.as_deref(), Some(Path::new("/repo")));
+        assert!(app.scheduler_reachable);
+    }
+
+    #[test]
+    fn apply_scheduler_event_workflow_updated_inserts_new_draft() {
+        // Empty initial state → one WorkflowUpdated for a drafted
+        // workflow lands it in the drafts list.
+        let (mut app, _rx) = new_test_app();
+        app.apply_scheduler_event(SchedulerEvent::WorkflowUpdated {
+            summary: summary("new-draft", "drafted"),
+        });
+        assert_eq!(app.drafts, vec!["new-draft"]);
+        assert!(app.workflows.is_empty());
+        assert!(app.scheduler_reachable);
+    }
+
+    #[test]
+    fn apply_scheduler_event_workflow_updated_inserts_active() {
+        // Same path, non-drafted status → workflows list.
+        let (mut app, _rx) = new_test_app();
+        app.apply_scheduler_event(SchedulerEvent::WorkflowUpdated {
+            summary: summary("flow", "queued"),
+        });
+        assert!(app.drafts.is_empty());
+        assert_eq!(app.workflows.len(), 1);
+        assert_eq!(app.workflows[0].status, "queued");
+    }
+
+    #[test]
+    fn apply_scheduler_event_workflow_updated_migrates_drafted_to_queued() {
+        // A workflow that was drafted then transitions to queued must
+        // disappear from the drafts list and appear in the workflows
+        // list — without duplicating across both.
+        let (mut app, _rx) = new_test_app();
+        app.apply_scheduler_event(SchedulerEvent::Snapshot {
+            workflows: vec![summary("flow", "drafted")],
+            root: None,
+        });
+        assert_eq!(app.drafts, vec!["flow"]);
+
+        app.apply_scheduler_event(SchedulerEvent::WorkflowUpdated {
+            summary: summary("flow", "queued"),
+        });
+        assert!(app.drafts.is_empty());
+        assert_eq!(app.workflows.len(), 1);
+        assert_eq!(app.workflows[0].name, "flow");
+        assert_eq!(app.workflows[0].status, "queued");
+    }
+
+    #[test]
+    fn apply_scheduler_event_workflow_updated_replaces_in_place() {
+        // Updating an existing workflow must update the summary
+        // (status, priority, etc.) without duplicating the entry.
+        let (mut app, _rx) = new_test_app();
+        app.apply_scheduler_event(SchedulerEvent::Snapshot {
+            workflows: vec![summary("a", "queued"), summary("b", "queued")],
+            root: None,
+        });
+        app.workflows_selected = 1;
+
+        let mut s = summary("a", "implementing");
+        s.priority = 9;
+        app.apply_scheduler_event(SchedulerEvent::WorkflowUpdated { summary: s });
+
+        assert_eq!(app.workflows.len(), 2);
+        let a = app.workflows.iter().find(|w| w.name == "a").unwrap();
+        assert_eq!(a.status, "implementing");
+        assert_eq!(a.priority, 9);
+        // Selection by name "b" should still resolve to index 1
+        // (sorted by name, b comes second).
+        assert_eq!(app.workflows[app.workflows_selected].name, "b");
+    }
+
+    #[test]
+    fn apply_scheduler_event_workflow_updated_keeps_workflows_sorted() {
+        // Inserting via WorkflowUpdated must keep the workflows list
+        // alphabetically sorted, matching the snapshot ordering.
+        let (mut app, _rx) = new_test_app();
+        app.apply_scheduler_event(SchedulerEvent::WorkflowUpdated {
+            summary: summary("c", "queued"),
+        });
+        app.apply_scheduler_event(SchedulerEvent::WorkflowUpdated {
+            summary: summary("a", "queued"),
+        });
+        app.apply_scheduler_event(SchedulerEvent::WorkflowUpdated {
+            summary: summary("b", "queued"),
+        });
+        let names: Vec<String> =
+            app.workflows.iter().map(|w| w.name.clone()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
     }
 
     #[test]

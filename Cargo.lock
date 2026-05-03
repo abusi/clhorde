@@ -446,6 +446,7 @@ dependencies = [
  "include_dir",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tower-http",

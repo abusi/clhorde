@@ -54,6 +54,30 @@ pub enum ControlRequest {
     /// Fetch a [`WorkflowDetail`] for the given workflow. Returns
     /// [`ControlResponse::Error`] if the workflow does not exist.
     Detail { name: String },
+
+    /// Switch the connection into push-based stream mode.
+    ///
+    /// The server replies with one [`ControlResponse::Event`] carrying a
+    /// [`SchedulerEvent::Snapshot`] (initial state), then keeps the
+    /// connection open and emits one [`ControlResponse::Event`] per
+    /// orchestrator state change. The connection is one-way after the
+    /// initial Subscribe — clients that need to issue further requests
+    /// (Cancel, Retry, Detail, …) open a separate one-shot connection.
+    Subscribe,
+
+    /// Switch the connection into push-based stream mode, scoped to one
+    /// workflow's [`WorkflowDetail`].
+    ///
+    /// On success the server replies with one [`ControlResponse::Event`]
+    /// carrying a [`SchedulerEvent::DetailSnapshot`] (initial state),
+    /// then keeps the connection open and emits one
+    /// [`ControlResponse::Event`] with a [`SchedulerEvent::DetailUpdated`]
+    /// every time that workflow's detail changes. Other workflows'
+    /// events are filtered out server-side. If the workflow does not
+    /// exist the server writes a [`ControlResponse::Error`] and closes
+    /// the connection. Like [`ControlRequest::Subscribe`], the
+    /// connection is one-way after the request.
+    SubscribeDetail { name: String },
 }
 
 /// Outbound response from the server.
@@ -91,6 +115,50 @@ pub enum ControlResponse {
 
     /// Reply to [`ControlRequest::Detail`].
     Detail { detail: WorkflowDetail },
+
+    /// Push frame on a long-lived [`ControlRequest::Subscribe`]
+    /// connection. The first event after Subscribe is always a
+    /// [`SchedulerEvent::Snapshot`]; subsequent events report
+    /// individual workflow changes.
+    Event { event: SchedulerEvent },
+}
+
+/// Push-mode event payload streamed over a Subscribe connection.
+///
+/// The server sends one [`SchedulerEvent::Snapshot`] right after the
+/// client subscribes (so a fresh client doesn't need a separate Status
+/// round-trip) and then streams [`SchedulerEvent::WorkflowUpdated`]
+/// every time the orchestrator mutates a workflow.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SchedulerEvent {
+    /// Full state. Sent once per Subscribe (and re-sent if the
+    /// broadcast channel lagged the subscriber and we need to
+    /// re-establish a baseline).
+    Snapshot {
+        workflows: Vec<WorkflowSummary>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root: Option<String>,
+    },
+
+    /// One workflow's [`WorkflowSummary`] changed. Clients merge by
+    /// `summary.name`.
+    WorkflowUpdated { summary: WorkflowSummary },
+
+    /// Initial frame on a [`ControlRequest::SubscribeDetail`]
+    /// connection. Sent once right after the client subscribes and
+    /// re-sent if the broadcast channel lagged the subscriber. Carries
+    /// the full [`WorkflowDetail`] for the workflow named in the
+    /// request — the server filters by name so subscribers only ever
+    /// see their own workflow's detail events.
+    DetailSnapshot { detail: WorkflowDetail },
+
+    /// One workflow's [`WorkflowDetail`] changed. Streamed on a
+    /// [`ControlRequest::SubscribeDetail`] connection (filtered to
+    /// the subscribed name). Always carries the full detail rather
+    /// than a diff — payloads are small and full-snapshot semantics
+    /// keep merge logic on the client trivial.
+    DetailUpdated { detail: WorkflowDetail },
 }
 
 /// User-visible snapshot of one workflow. Carries the fields shown by
@@ -379,5 +447,169 @@ mod tests {
         let json = r#"{"type":"shutdown"}"#;
         let res: Result<ControlRequest, _> = serde_json::from_str(json);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn subscribe_request_round_trip() {
+        let json = serde_json::to_string(&ControlRequest::Subscribe).unwrap();
+        assert_eq!(json, r#"{"type":"subscribe"}"#);
+        let back: ControlRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ControlRequest::Subscribe);
+    }
+
+    #[test]
+    fn event_snapshot_round_trip() {
+        let event = SchedulerEvent::Snapshot {
+            workflows: vec![WorkflowSummary {
+                name: "x".into(),
+                status: "queued".into(),
+                failure_reason: None,
+                priority: 0,
+                queued_at: None,
+                started_at: None,
+                finished_at: None,
+                prompt_ids: vec![],
+            }],
+            root: Some("/tmp/repo".into()),
+        };
+        let resp = ControlResponse::Event {
+            event: event.clone(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""type":"event""#));
+        assert!(json.contains(r#""type":"snapshot""#));
+        let back: ControlResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn event_snapshot_back_compat_no_root() {
+        // A scheduler that doesn't set root must still decode cleanly:
+        // root is optional with `skip_serializing_if`, just like on
+        // ControlResponse::Status.
+        let json = r#"{"type":"event","event":{"type":"snapshot","workflows":[]}}"#;
+        let resp: ControlResponse = serde_json::from_str(json).unwrap();
+        match resp {
+            ControlResponse::Event {
+                event: SchedulerEvent::Snapshot { workflows, root },
+            } => {
+                assert!(workflows.is_empty());
+                assert!(root.is_none());
+            }
+            other => panic!("expected Snapshot event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_workflow_updated_round_trip() {
+        let summary = WorkflowSummary {
+            name: "y".into(),
+            status: "implementing".into(),
+            failure_reason: None,
+            priority: 3,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            prompt_ids: vec!["uuid-1".into()],
+        };
+        let resp = ControlResponse::Event {
+            event: SchedulerEvent::WorkflowUpdated {
+                summary: summary.clone(),
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""type":"workflow_updated""#));
+        let back: ControlResponse = serde_json::from_str(&json).unwrap();
+        match back {
+            ControlResponse::Event {
+                event: SchedulerEvent::WorkflowUpdated { summary: got },
+            } => assert_eq!(got, summary),
+            other => panic!("expected WorkflowUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_event_kind_is_an_error() {
+        // SchedulerEvent is a closed enum on the wire; an unknown event
+        // type should fail to decode rather than silently dropping the
+        // frame on a forward-compat client.
+        let json =
+            r#"{"type":"event","event":{"type":"bogus","name":"x"}}"#;
+        let res: Result<ControlResponse, _> = serde_json::from_str(json);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn subscribe_detail_request_round_trip() {
+        let req = ControlRequest::SubscribeDetail {
+            name: "add-oauth".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""type":"subscribe_detail""#));
+        assert!(json.contains(r#""name":"add-oauth""#));
+        let back: ControlRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    fn sample_detail() -> WorkflowDetail {
+        WorkflowDetail {
+            name: "z".into(),
+            status: "implementing".into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            apply: vec![DetailNode {
+                id: "1".into(),
+                label: "Setup".into(),
+                state: "running".into(),
+                prompt_id: Some(7),
+                prompt_uuid: None,
+                exit_code: None,
+                depends_on: vec![],
+            }],
+            verify: None,
+            archive: None,
+        }
+    }
+
+    #[test]
+    fn event_detail_snapshot_round_trip() {
+        let detail = sample_detail();
+        let resp = ControlResponse::Event {
+            event: SchedulerEvent::DetailSnapshot {
+                detail: detail.clone(),
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""type":"event""#));
+        assert!(json.contains(r#""type":"detail_snapshot""#));
+        let back: ControlResponse = serde_json::from_str(&json).unwrap();
+        match back {
+            ControlResponse::Event {
+                event: SchedulerEvent::DetailSnapshot { detail: got },
+            } => assert_eq!(got, detail),
+            other => panic!("expected DetailSnapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_detail_updated_round_trip() {
+        let detail = sample_detail();
+        let resp = ControlResponse::Event {
+            event: SchedulerEvent::DetailUpdated {
+                detail: detail.clone(),
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""type":"detail_updated""#));
+        let back: ControlResponse = serde_json::from_str(&json).unwrap();
+        match back {
+            ControlResponse::Event {
+                event: SchedulerEvent::DetailUpdated { detail: got },
+            } => assert_eq!(got, detail),
+            other => panic!("expected DetailUpdated, got {other:?}"),
+        }
     }
 }
