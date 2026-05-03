@@ -808,6 +808,7 @@ impl App {
             apply: Vec::new(),
             verify: None,
             archive: None,
+            blocked_by: wf.blocked_by.clone(),
         };
         self.workflow_detail = Some(optimistic);
         self.detail_scroll = 0;
@@ -3614,6 +3615,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             prompt_ids: vec![],
+            blocked_by: vec![],
         }
     }
 
@@ -4140,6 +4142,7 @@ mod tests {
             apply: vec![],
             verify: None,
             archive: None,
+            blocked_by: vec![],
         }
     }
 
@@ -4320,6 +4323,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 prompt_ids: vec![],
+                blocked_by: vec![],
             },
         });
         // Detail unchanged (empty_detail's default status is

@@ -306,6 +306,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 prompt_ids: vec![],
+                blocked_by: vec![],
             }],
             root: None,
         };
@@ -369,6 +370,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             prompt_ids: vec![],
+            blocked_by: vec![],
         };
         let events = vec![
             SchedulerEvent::Snapshot {
@@ -458,6 +460,7 @@ mod tests {
             apply: vec![],
             verify: None,
             archive: None,
+            blocked_by: vec![],
         }
     }
 

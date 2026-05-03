@@ -517,6 +517,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             prompt_ids: vec![],
+            blocked_by: vec![],
         }
     }
 
@@ -720,6 +721,7 @@ mod tests {
             apply: vec![],
             verify: None,
             archive: None,
+            blocked_by: vec![],
         };
 
         spawn_mock_dual_subscribe(
@@ -768,6 +770,7 @@ mod tests {
             apply: vec![],
             verify: None,
             archive: None,
+            blocked_by: vec![],
         };
 
         spawn_mock_dual_subscribe(

@@ -198,6 +198,14 @@ pub struct WorkflowSummary {
     pub finished_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub prompt_ids: Vec<String>,
+    /// Names of inter-workflow dependencies that are blocking this
+    /// workflow from leaving `Queued`. Populated by the scheduler only
+    /// when `status == "queued"` and the dep evaluator returned
+    /// `Pending`; empty in every other case (no deps, all deps
+    /// archived, or the workflow is no longer queued). Defaults to
+    /// empty for back-compat with older scheduler builds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
 }
 
 /// Per-workflow detail, returned by [`ControlRequest::Detail`].
@@ -231,6 +239,11 @@ pub struct WorkflowDetail {
     /// Archive-phase node. `None` until verify finishes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive: Option<DetailNode>,
+    /// Same semantics as [`WorkflowSummary::blocked_by`]: names of
+    /// inter-workflow deps holding this workflow in `Queued`. Empty
+    /// otherwise. Defaults to empty for back-compat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
 }
 
 /// One row in the workflow detail view. Models a single DAG node (for
@@ -390,6 +403,7 @@ mod tests {
             }],
             verify: None,
             archive: None,
+            blocked_by: vec![],
         };
         let resp = ControlResponse::Detail {
             detail: detail.clone(),
@@ -438,6 +452,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             prompt_ids: vec![],
+            blocked_by: vec![],
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: WorkflowSummary = serde_json::from_str(&json).unwrap();
@@ -451,6 +466,7 @@ mod tests {
         assert_eq!(s.name, "x");
         assert_eq!(s.status, "queued");
         assert_eq!(s.priority, 0);
+        assert!(s.blocked_by.is_empty());
         assert!(s.prompt_ids.is_empty());
         assert!(s.queued_at.is_none());
     }
@@ -482,6 +498,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 prompt_ids: vec![],
+                blocked_by: vec![],
             }],
             root: Some("/tmp/repo".into()),
         };
@@ -524,6 +541,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             prompt_ids: vec!["uuid-1".into()],
+            blocked_by: vec![],
         };
         let resp = ControlResponse::Event {
             event: SchedulerEvent::WorkflowUpdated {
@@ -592,6 +610,7 @@ mod tests {
             }],
             verify: None,
             archive: None,
+            blocked_by: vec![],
         }
     }
 
@@ -632,5 +651,69 @@ mod tests {
             } => assert_eq!(got, detail),
             other => panic!("expected DetailUpdated, got {other:?}"),
         }
+    }
+
+    // ── blocked_by (Phase 5.4.2) ──
+
+    #[test]
+    fn workflow_summary_with_blocked_by_round_trips() {
+        let s = WorkflowSummary {
+            name: "x".into(),
+            status: "queued".into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            prompt_ids: vec![],
+            blocked_by: vec!["a".into(), "b".into()],
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            json.contains(r#""blocked_by":["a","b"]"#),
+            "blocked_by missing in serialized form: {json}"
+        );
+        let back: WorkflowSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn workflow_summary_omits_blocked_by_when_empty() {
+        // skip_serializing_if = "Vec::is_empty" keeps the wire payload
+        // identical to what older schedulers (without the field) emit,
+        // so a TUI/web upgraded ahead of the scheduler stays compatible.
+        let s = WorkflowSummary {
+            name: "x".into(),
+            status: "drafted".into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            prompt_ids: vec![],
+            blocked_by: vec![],
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            !json.contains("blocked_by"),
+            "empty blocked_by should be skipped: {json}"
+        );
+    }
+
+    #[test]
+    fn workflow_detail_blocked_by_round_trips_and_back_compat() {
+        // New payload encodes + decodes the field.
+        let mut d = sample_detail();
+        d.status = "queued".into();
+        d.blocked_by = vec!["upstream".into()];
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""blocked_by":["upstream"]"#));
+        let back: WorkflowDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+
+        // Old payload (no blocked_by field) decodes cleanly with default.
+        let legacy = r#"{"name":"x","status":"queued","apply":[]}"#;
+        let parsed: WorkflowDetail = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.blocked_by.is_empty());
     }
 }

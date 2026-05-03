@@ -573,6 +573,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             prompt_ids: vec![],
+            blocked_by: vec![],
         };
         let event = SchedulerEvent::WorkflowUpdated { summary };
         let msg = scheduler_message(&event).unwrap();
@@ -597,6 +598,7 @@ mod tests {
             apply: vec![],
             verify: None,
             archive: None,
+            blocked_by: vec![],
         }
     }
 

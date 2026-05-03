@@ -644,12 +644,19 @@ Sliced into three independently-shippable sub-phases:
 - `advance_archiving` post-archive: collect dependents of `wf.name` from `workflows` and call `try_advance_inner` on each. Bounded by orchestrator size; recursion impossible because an archived workflow can't re-trigger the cycle.
 - Tests: ~12 in `orchestrator::deps` (satisfied/pending/missing-dep-fails/cancelled-dep-fails/failed-dep-fails/two-step chain holds then unblocks/cycle-of-2/cycle-of-3/self-dep/transitive satisfied/archive cascade re-evaluates dependents/idempotent on already-failed dependent).
 
-#### 5.4.2 `blocked_by` on Summary + Detail + push events
+#### 5.4.2 `blocked_by` on Summary + Detail + push events — ✅ shipped
 
-- Add `blocked_by: Vec<String>` to `WorkflowSummary` and `WorkflowDetail` (`clhorde-core::control`). `#[serde(default, skip_serializing_if = "Vec::is_empty")]` for back-compat both ways.
-- `Orchestrator::summary` / `Orchestrator::detail` populate `blocked_by` by re-running the evaluator (cheap; reuses 5.4.1's `Pending` arm). Filled only for `Queued` workflows.
-- Diff helpers already cover this since the field is part of `WorkflowSummary` / `WorkflowDetail`. Verify with one round-trip test that a dep clearing emits exactly one `WorkflowUpdated` whose `blocked_by` shrunk.
-- 1 new wire round-trip test (`Snapshot` carrying summaries with `blocked_by`), 2 in `clhorde-core` (back-compat with absent/empty `blocked_by`), 3 in orchestrator (`summary().blocked_by` populated when pending; emptied when satisfied; emptied for terminal states).
+Delivered:
+
+- **`blocked_by: Vec<String>`** added to both `WorkflowSummary` and `WorkflowDetail` (`clhorde-core::control`). `#[serde(default, skip_serializing_if = "Vec::is_empty")]` keeps the wire payload byte-identical to the pre-5.4 shape when no deps are blocking — older clients see no new field, older schedulers' payloads decode cleanly with an empty default. Both directions of the version skew are covered.
+- **`workflow_summary` helper** grew a `&BTreeMap<String, Workflow>` parameter and re-runs `deps::evaluate` for `Queued` workflows. `Pending` → those names land in `blocked_by`; `Satisfied` / `Failed` / non-`Queued` → empty. This means even a workflow that just transitioned from `Drafted` to `Queued` immediately surfaces its blockers without waiting for the next try-advance pass. All call sites (`summaries`, `summary`, `detail`, `snapshot_state`, `emit_diff`) now thread `&self.workflows`.
+- **`detail()`** mirrors the field by reading the value the helper computed (no second evaluator call).
+- **Diff machinery** transparently picks up the new field — `WorkflowSummary` / `WorkflowDetail` already drive their respective `WorkflowUpdated` / `DetailUpdated` events through `PartialEq`. A dep clearing → `blocked_by` shrinks → exactly one push event fires. No new event variants, no new diff plumbing.
+- **Test sites** (`clhorde-tui::app`, `clhorde-tui::scheduler_client`, `clhorde-web::ws`, `clhorde-web::scheduler_bridge`) updated to construct `WorkflowSummary` / `WorkflowDetail` literals with `blocked_by: vec![]` — those are pure test fixtures, not production code paths.
+
+6 new tests (workspace 785 → 791):
+- 3 in `clhorde-core::control` (round-trip with non-empty `blocked_by`; `skip_serializing_if` omits the field when empty so the wire stays back-compat with old schedulers; `WorkflowDetail` round-trip + decoding a legacy payload without the field).
+- 3 in `clhorde-scheduler::orchestrator` (`summary().blocked_by` populated for pending Queued; empty for Drafted + Archived; `WorkflowUpdated` carrying empty `blocked_by` after the dep cascade-archives — final value of x reflects the cleared list).
 
 #### 5.4.3 CLI + TUI + Web surfacing
 
@@ -712,8 +719,8 @@ Open questions (to resolve during 5.4.1):
 | **5.3.1** | ✅ shipped | `SubscribeDetail` wire + orchestrator detail broadcast + control-server stream branch | Server-side push surface for one workflow's `WorkflowDetail` — 12 new tests. |
 | **5.3.2** | ✅ shipped | TUI: spawn/abort detail subscription with overlay; drop 2s polling | Removes the last polling path inside the TUI — 5 net new tests. |
 | **5.3.3** | ✅ shipped | Web: `SubscribeAllDetails` + bridge fan-in + SPA push handler | SPA reaches push parity with the TUI — 8 new tests. |
-| **5.4.1** | ⏳ in progress | Inter-workflow deps: gate in `advance_queued` + cycle detection + dep-failure propagation | Pure orchestrator logic — testable in isolation. |
-| **5.4.2** | ⏳ pending | `blocked_by: Vec<String>` on Summary + Detail; populate via evaluator; back-compat round-trip | Wire surface so push events carry the "why blocked". |
+| **5.4.1** | ✅ shipped | Inter-workflow deps: gate in `advance_queued` + cycle detection + dep-failure propagation | Pure orchestrator logic — 22 new tests. |
+| **5.4.2** | ✅ shipped | `blocked_by: Vec<String>` on Summary + Detail; populate via evaluator; back-compat round-trip | Wire surface so push events carry the "why blocked" — 6 new tests. |
 | **5.4.3** | ⏳ pending | CLI `flow status` enriched + TUI badge suffix + Web badge + Blocked-by line | Presentation layer — no logic, just rendering. |
 | **5.x** | ⏳ pending | Advanced (parallel safety, hooks, multi-repo, manual `--ignore-deps`) | Polish. |
 

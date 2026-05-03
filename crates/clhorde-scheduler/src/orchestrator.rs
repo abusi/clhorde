@@ -246,7 +246,7 @@ impl Orchestrator {
         let summaries = self
             .workflows
             .iter()
-            .map(|(name, wf)| (name.clone(), workflow_summary(wf)))
+            .map(|(name, wf)| (name.clone(), workflow_summary(wf, &self.workflows)))
             .collect();
         let details = self
             .workflows
@@ -273,7 +273,7 @@ impl Orchestrator {
     /// `implementing`, `prompt_ids` unchanged).
     fn emit_diff(&self, before: &StateSnapshot) {
         for wf in self.workflows.values() {
-            let summary = workflow_summary(wf);
+            let summary = workflow_summary(wf, &self.workflows);
             if before.summaries.get(&wf.name) != Some(&summary) {
                 let _ = self
                     .events
@@ -344,13 +344,18 @@ impl Orchestrator {
     /// Snapshot every workflow as a [`WorkflowSummary`]. Used by the
     /// scheduler control socket to answer `Status { name: None }`.
     pub fn summaries(&self) -> Vec<WorkflowSummary> {
-        self.workflows.values().map(workflow_summary).collect()
+        self.workflows
+            .values()
+            .map(|wf| workflow_summary(wf, &self.workflows))
+            .collect()
     }
 
     /// Snapshot one workflow as a [`WorkflowSummary`], or `None` if it
     /// does not exist.
     pub fn summary(&self, name: &str) -> Option<WorkflowSummary> {
-        self.workflows.get(name).map(workflow_summary)
+        self.workflows
+            .get(name)
+            .map(|wf| workflow_summary(wf, &self.workflows))
     }
 
     /// Assemble a [`WorkflowDetail`] for `name`, or `None` if no
@@ -362,7 +367,7 @@ impl Orchestrator {
     /// described on `WorkflowDetail::apply`.
     pub fn detail(&self, name: &str) -> Option<WorkflowDetail> {
         let wf = self.workflows.get(name)?;
-        let summary = workflow_summary(wf);
+        let summary = workflow_summary(wf, &self.workflows);
         let runtime = self.runtimes.get(name);
         let apply = runtime
             .and_then(|r| r.dag.as_ref().map(|d| (r, d)))
@@ -391,6 +396,7 @@ impl Orchestrator {
             apply,
             verify,
             archive,
+            blocked_by: summary.blocked_by,
         })
     }
 
@@ -1439,7 +1445,14 @@ impl Orchestrator {
 /// Convert a [`Workflow`] into the wire-format [`WorkflowSummary`] used
 /// by the control socket. Pure transformation; lives outside the impl
 /// block so tests can call it directly.
-fn workflow_summary(wf: &Workflow) -> WorkflowSummary {
+///
+/// `others` is the orchestrator's view of every other workflow, used to
+/// compute the `blocked_by` field via [`deps::evaluate`]. For workflows
+/// in any state other than `Queued`, `blocked_by` is always empty.
+fn workflow_summary(
+    wf: &Workflow,
+    others: &BTreeMap<String, Workflow>,
+) -> WorkflowSummary {
     let (status, failure_reason) = match &wf.status {
         WorkflowStatus::Drafted => ("drafted", None),
         WorkflowStatus::Queued => ("queued", None),
@@ -1450,6 +1463,20 @@ fn workflow_summary(wf: &Workflow) -> WorkflowSummary {
         WorkflowStatus::Cancelled => ("cancelled", None),
         WorkflowStatus::Failed { reason } => ("failed", Some(reason.clone())),
     };
+    let blocked_by = if matches!(wf.status, WorkflowStatus::Queued) {
+        match deps::evaluate(wf, others) {
+            DepEvaluation::Pending(names) => names,
+            // Satisfied / Failed are not "blocking" states from the
+            // user's POV: Satisfied means the workflow will advance on
+            // the next try; Failed means the gate already promoted the
+            // workflow into `Failed` (so we won't see Queued+Failed at
+            // a single instant, but if we did, we'd surface the dep
+            // failure via `failure_reason` rather than `blocked_by`).
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
     WorkflowSummary {
         name: wf.name.clone(),
         status: status.to_string(),
@@ -1459,6 +1486,7 @@ fn workflow_summary(wf: &Workflow) -> WorkflowSummary {
         started_at: wf.started_at,
         finished_at: wf.finished_at,
         prompt_ids: wf.prompt_ids.clone(),
+        blocked_by,
     }
 }
 
@@ -3022,5 +3050,151 @@ mod tests {
             WorkflowStatus::Cancelled
         );
         assert_failed(&orch, "x", "cancelled");
+    }
+
+    // ── blocked_by surfacing (Phase 5.4.2) ──
+
+    #[test]
+    fn summary_populates_blocked_by_for_pending_queued_workflow() {
+        let (tmp, mut orch, _rx) = fixture();
+        // base sits Drafted on disk → x stays Queued blocked.
+        change_dir(&tmp, "base");
+        write_tasks(&tmp, "base", "## 1. A\n- [ ] 1.1 a\n");
+
+        write_tasks(&tmp, "x", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "x", "depends_on = [\"base\"]\n");
+        orch.reconcile().unwrap();
+
+        let s = orch.summary("x").expect("summary");
+        assert_eq!(s.status, "queued");
+        assert_eq!(s.blocked_by, vec!["base".to_string()]);
+        // Detail mirrors the same field.
+        let d = orch.detail("x").expect("detail");
+        assert_eq!(d.blocked_by, vec!["base".to_string()]);
+    }
+
+    #[test]
+    fn summary_blocked_by_is_empty_for_non_queued_states() {
+        let (_tmp, mut orch, _rx) = fixture();
+        // Inject a Drafted workflow with deps directly. Drafted is not
+        // Queued, so blocked_by must stay empty regardless of dep state.
+        let mut wf = Workflow::drafted("x");
+        wf.metadata = MarkerMetadata {
+            depends_on: vec!["ghost".into()],
+            ..MarkerMetadata::default()
+        };
+        orch.store.save(&wf).unwrap();
+        orch.reconcile().unwrap();
+
+        let s = orch.summary("x").expect("summary");
+        assert_eq!(s.status, "drafted");
+        assert!(
+            s.blocked_by.is_empty(),
+            "Drafted workflow should not surface blocked_by, got {:?}",
+            s.blocked_by
+        );
+
+        // Same for an Archived workflow (terminal).
+        orch.store.save(&archived_workflow("done")).unwrap();
+        orch.reconcile().unwrap();
+        let s2 = orch.summary("done").expect("summary");
+        assert_eq!(s2.status, "archived");
+        assert!(s2.blocked_by.is_empty());
+    }
+
+    #[test]
+    fn dep_clearing_emits_workflow_updated_with_shrunken_blocked_by() {
+        let (tmp, mut orch, mut rx) = fixture();
+
+        // base independent + x blocked on base.
+        write_tasks(&tmp, "base", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "base", "");
+        write_tasks(&tmp, "x", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "x", "depends_on = [\"base\"]\n");
+
+        orch.handle_event(FsEvent::TasksModified { name: "base".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::TasksModified { name: "x".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::MarkerCreated { name: "base".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::MarkerCreated { name: "x".into() })
+            .unwrap();
+
+        // x is Queued + blocked_by=["base"].
+        assert_eq!(
+            orch.summary("x").unwrap().blocked_by,
+            vec!["base".to_string()]
+        );
+
+        // Subscribe *after* the initial setup so we only observe events
+        // emitted by the cascade we're about to trigger.
+        let mut events = orch.events_subscribe();
+
+        // Drive base apply → verify → archive.
+        let base_apply_tag = submit_tag(&drain_requests(&mut rx)[0]).to_string();
+        orch.handle_daemon_event(&fake_prompt_added(1, &base_apply_tag))
+            .unwrap();
+        write_tasks(&tmp, "base", "## 1. A\n- [x] 1.1 a\n");
+        orch.handle_event(FsEvent::TasksModified { name: "base".into() })
+            .unwrap();
+        orch.handle_daemon_event(&DaemonEvent::WorkerFinished {
+            prompt_id: 1,
+            exit_code: Some(0),
+        })
+        .unwrap();
+
+        let verify_tag = submit_tag(&drain_requests(&mut rx)[0]).to_string();
+        orch.handle_daemon_event(&fake_prompt_added(2, &verify_tag))
+            .unwrap();
+        orch.handle_daemon_event(&DaemonEvent::WorkerFinished {
+            prompt_id: 2,
+            exit_code: Some(0),
+        })
+        .unwrap();
+
+        let archive_tag = submit_tag(&drain_requests(&mut rx)[0]).to_string();
+        orch.handle_daemon_event(&fake_prompt_added(3, &archive_tag))
+            .unwrap();
+        // Final WorkerFinished archives base AND cascades x → Implementing.
+        orch.handle_daemon_event(&DaemonEvent::WorkerFinished {
+            prompt_id: 3,
+            exit_code: Some(0),
+        })
+        .unwrap();
+
+        // x's final state.
+        let s = orch.summary("x").expect("summary");
+        assert_eq!(s.status, "implementing");
+        assert!(
+            s.blocked_by.is_empty(),
+            "blocked_by should clear once base is archived"
+        );
+
+        // Among the emitted events, find at least one for x with empty
+        // blocked_by. The exact event count varies because the cascade
+        // also emits for base + x's apply dispatch; the diff machinery
+        // dedupes so we get one per genuine state shift, not per call.
+        let emitted = drain_events(&mut events);
+        let x_updates: Vec<_> = emitted
+            .iter()
+            .filter_map(|e| match e {
+                SchedulerEvent::WorkflowUpdated { summary } if summary.name == "x" => {
+                    Some(summary)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !x_updates.is_empty(),
+            "expected at least one WorkflowUpdated for x in {emitted:#?}"
+        );
+        // The last x update should reflect the cleared blocked_by.
+        let final_x = x_updates.last().unwrap();
+        assert!(
+            final_x.blocked_by.is_empty(),
+            "final x update should have empty blocked_by, got {:?}",
+            final_x.blocked_by
+        );
     }
 }
