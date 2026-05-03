@@ -78,6 +78,19 @@ pub enum ControlRequest {
     /// the connection. Like [`ControlRequest::Subscribe`], the
     /// connection is one-way after the request.
     SubscribeDetail { name: String },
+
+    /// Switch the connection into push-based stream mode covering
+    /// **every** workflow's detail events.
+    ///
+    /// The server forwards every [`SchedulerEvent::DetailUpdated`]
+    /// the orchestrator emits, with no per-workflow filter and no
+    /// initial snapshot — clients that need an initial state should
+    /// REST-fetch [`ControlRequest::Detail`] for whatever workflow
+    /// they care about. Designed for the web bridge: one stream,
+    /// many WS clients filtering on the SPA side. Like the other
+    /// subscribe variants, the connection is one-way after the
+    /// request.
+    SubscribeAllDetails,
 }
 
 /// Outbound response from the server.
@@ -549,6 +562,14 @@ mod tests {
         assert!(json.contains(r#""name":"add-oauth""#));
         let back: ControlRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn subscribe_all_details_request_round_trip() {
+        let json = serde_json::to_string(&ControlRequest::SubscribeAllDetails).unwrap();
+        assert_eq!(json, r#"{"type":"subscribe_all_details"}"#);
+        let back: ControlRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ControlRequest::SubscribeAllDetails);
     }
 
     fn sample_detail() -> WorkflowDetail {

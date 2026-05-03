@@ -573,7 +573,7 @@ Delivered:
 
 The web dashboard keeps the existing 1495-line vanilla-JS SPA approach — no build step, no framework. The new tabs add ~290 lines of JS and ~90 lines of CSS.
 
-### 5.3 Detail subscription — ⏳ in progress
+### 5.3 Detail subscription — ✅ shipped
 
 Goal: kill the 2s polling that powers the workflow detail overlay (TUI) and the expanded workflow card (web SPA). Replace it with push-based detail events delivered over the same Subscribe-style stream Phase 5.1 introduced for summaries. Mirrors 5.1 but scoped to one workflow at a time, since `WorkflowDetail` is heavier than `WorkflowSummary` and most viewers only care about one workflow.
 
@@ -605,12 +605,16 @@ Delivered:
 - −1 obsolete test (`detail_refresh_target_throttled` — function removed).
 - 1 test rewritten (`r_inside_detail_clears_poll_timer` → `r_inside_detail_queues_explicit_detail_request` since `r`'s semantics changed).
 
-#### 5.3.3 Web bridge + SPA push
+#### 5.3.3 Web bridge + SPA push — ✅ shipped
 
-- `SchedulerBridge` already feeds every `SchedulerEvent` it receives into a single broadcast surface — `DetailSnapshot` / `DetailUpdated` ride that channel for free. The bridge stays one-Subscribe-connection wide; per-workflow subscriptions are not introduced (every WS client filters on the SPA side, payloads are small).
-- The bridge gains a one-shot `request_subscribe_detail(name)` only if needed for the explicit "I just opened this card" bootstrap; first pass: rely on the existing `GET /api/scheduler/workflow/{name}` for the initial render, then let push events take over.
-- WS frames: re-use the existing `{type: "SchedulerEvent", event: ...}` envelope; the new variants flow through unchanged.
-- SPA: when a `DetailUpdated` arrives whose `name` matches the currently expanded card, replace `expandedWorkflowDetail` and re-render. Drop the post-action `fetchWorkflowDetail` re-fetches (Cancel/Retry) — those events now arrive via the push stream within ms of the orchestrator state change.
+Delivered:
+
+- **New wire variant `ControlRequest::SubscribeAllDetails`**: an unfiltered detail stream the bridge consumes. The orchestrator's `detail_events` broadcast already emits every workflow's `DetailUpdated`; the new server handler `run_subscribe_all_details_stream` forwards them without per-name filtering and without an initial snapshot (clients REST-fetch the seed for whatever card they expand). `dispatch_request` rejects the variant on a one-shot connection. 1 new round-trip test in `clhorde-core` + 1 server-side stream test (two workflows mutate, both `DetailUpdated` frames surface).
+- **`SchedulerBridge` parallel detail loop**: a second long-lived task `subscribe_all_details_loop` opens a `SubscribeAllDetails` connection and forwards every event into the same `event_tx` broadcast the summary loop writes to. Reconnects independently with the same capped exponential backoff (250 ms → 15 s) so a transient blip on one stream doesn't drop the other. The `connected` flag still tracks summary connectivity only — that's the signal the SPA banner reads. The bridge's `request()` now rejects `Subscribe`, `SubscribeAllDetails`, and per-workflow `SubscribeDetail` with a clear `BadResponse` so callers can't accidentally one-shot a stream-mode request and deadlock. 5 new tests in `clhorde-web::scheduler_bridge` (details forwarding to subscribers; combined summary+detail multiplexing onto one broadcast; rejection of all three subscribe variants on `request()`).
+- **WS envelope**: `scheduler_message` already wraps any `SchedulerEvent` through serde, so `DetailSnapshot` and `DetailUpdated` ride the existing `{type:"SchedulerEvent",event:…}` envelope without changes. 2 new envelope tests (`detail_snapshot` and `detail_updated` produce the expected `event.type` discriminator).
+- **SPA push detail**: `_applySchedulerEvent` learned `detail_snapshot` / `detail_updated` cases — when the event's `detail.name` matches `expandedWorkflow`, it replaces `expandedWorkflowDetail` and calls `renderWorkflowDetail()`. Off-screen workflows are silently dropped. Crucially: `cancelWorkflow` and `retrySection` no longer issue a follow-up `fetchWorkflowDetail` after the action — the orchestrator's `emit_diff` pushes `DetailUpdated` within ms of the mutation committing and the SPA re-renders from the push stream. The initial render of an expanded card still uses `GET /api/scheduler/workflow/{name}` for an immediate paint.
+
+8 new tests (workspace 755 → 763): 1 in `clhorde-core` (`SubscribeAllDetails` round-trip), 1 in `clhorde-scheduler::control::server` (unfiltered stream forwards every workflow), 5 in `clhorde-web::scheduler_bridge` (3 reject-on-request + 2 forward), 2 in `clhorde-web::ws` (envelope shape).
 
 Open questions (to resolve during 5.3.1):
 - Does the orchestrator need a `WorkflowRemoved` event too, paired with detail teardown? Decision deferred — workflows don't currently disappear from `workflows`, same as 5.1.
@@ -663,7 +667,7 @@ Open questions (to resolve during 5.3.1):
 | **5.2** | ✅ shipped | Web routes + Drafts/Workflows SPA tabs | Browser dashboard reaches feature parity with TUI tabs — 14 new tests. |
 | **5.3.1** | ✅ shipped | `SubscribeDetail` wire + orchestrator detail broadcast + control-server stream branch | Server-side push surface for one workflow's `WorkflowDetail` — 12 new tests. |
 | **5.3.2** | ✅ shipped | TUI: spawn/abort detail subscription with overlay; drop 2s polling | Removes the last polling path inside the TUI — 5 net new tests. |
-| **5.3.3** | ⏳ pending | Web: forward DetailSnapshot/DetailUpdated through the existing WS envelope; SPA replaces expanded card on push | SPA reaches push parity with the TUI. |
+| **5.3.3** | ✅ shipped | Web: `SubscribeAllDetails` + bridge fan-in + SPA push handler | SPA reaches push parity with the TUI — 8 new tests. |
 | **5.x** | ⏳ pending | Advanced (parallel safety, inter-workflow deps, hooks, multi-repo) | Polish. |
 
 Each phase is independently shippable. Phase 0 alone is already a feature win; Phase 2.4 already produces value for users who want a scriptable workflow runner.

@@ -116,6 +116,11 @@ where
                 // workflow's detail.
                 return run_subscribe_detail_stream(reader, writer, orch, name).await;
             }
+            Ok(ControlRequest::SubscribeAllDetails) => {
+                // Unfiltered detail stream for the web bridge; same
+                // one-way handoff.
+                return run_subscribe_all_details_stream(reader, writer, orch).await;
+            }
             Ok(req) => {
                 let response = {
                     let mut guard = orch
@@ -389,6 +394,66 @@ where
     }
 }
 
+/// Stream-mode handler for a [`ControlRequest::SubscribeAllDetails`]
+/// connection. Forwards every [`SchedulerEvent::DetailUpdated`] the
+/// orchestrator emits — no filter, no initial snapshot. Designed for
+/// the web bridge to fan out to many WS clients that filter
+/// per-workflow on the SPA side.
+async fn run_subscribe_all_details_stream<R, W>(
+    mut reader: R,
+    mut writer: W,
+    orch: Arc<Mutex<Orchestrator>>,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut events = {
+        let guard = orch.lock().unwrap_or_else(|poison| poison.into_inner());
+        guard.detail_events_subscribe()
+    };
+
+    let mut sink = [0u8; 1024];
+
+    loop {
+        tokio::select! {
+            event_res = events.recv() => {
+                match event_res {
+                    Ok(event) => {
+                        if let Err(e) = write_response(
+                            &mut writer,
+                            &ControlResponse::Event { event },
+                        )
+                        .await
+                        {
+                            debug!(error = %e, "subscribe_all_details write failed");
+                            return Ok(());
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // The bridge re-resolves expanded cards via REST
+                        // when a user opens them, so a missed
+                        // DetailUpdated is recoverable on the next
+                        // mutation. Log and keep streaming rather than
+                        // close the connection.
+                        debug!("subscribe_all_details lag — events dropped");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Ok(());
+                    }
+                }
+            }
+            read_res = reader.read(&mut sink) => {
+                match read_res {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => {}
+                    Err(_) => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
 /// Apply one request to the orchestrator and return the response.
 /// Pure dispatch — no I/O, no awaits — so tests can hit it directly.
 pub fn dispatch_request(
@@ -448,6 +513,9 @@ pub fn dispatch_request(
         },
         ControlRequest::SubscribeDetail { .. } => ControlResponse::Error {
             message: "subscribe_detail not supported on a one-shot connection".into(),
+        },
+        ControlRequest::SubscribeAllDetails => ControlResponse::Error {
+            message: "subscribe_all_details not supported on a one-shot connection".into(),
         },
     }
 }
@@ -1217,6 +1285,66 @@ mod tests {
             }
             other => panic!("expected DetailUpdated, got {other:?}"),
         }
+
+        drop(client);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_all_details_forwards_every_workflow() {
+        // The unfiltered detail stream forwards DetailUpdated for any
+        // workflow that mutates — no per-name filter. Two queues on
+        // different workflows produce two DetailUpdated frames.
+        let (tmp, orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        change_dir(&tmp, "y");
+
+        let (mut client, server) = duplex(8192);
+        let (sr, sw) = tokio::io::split(server);
+        let orch_for_server = orch.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = run_with_streams(sr, sw, orch_for_server).await;
+        });
+
+        client
+            .write_all(&encode_request(&ControlRequest::SubscribeAllDetails))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        // The server-side subscribe happens asynchronously after the
+        // SubscribeAllDetails frame lands. Unlike `SubscribeDetail`
+        // there's no initial snapshot to use as a sync barrier — wait
+        // for the broadcast to register the new subscriber so any
+        // events we emit below actually reach the stream.
+        for _ in 0..50 {
+            if orch.lock().unwrap().detail_event_subscriber_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            orch.lock().unwrap().detail_event_subscriber_count() > 0,
+            "server never subscribed to the detail broadcast"
+        );
+
+        {
+            let mut g = orch.lock().unwrap();
+            g.queue_workflow("x", None).unwrap();
+            g.queue_workflow("y", None).unwrap();
+        }
+
+        let mut names = Vec::new();
+        for _ in 0..2 {
+            match read_event(&mut client).await {
+                SchedulerEvent::DetailUpdated { detail } => {
+                    names.push(detail.name);
+                }
+                other => panic!("expected DetailUpdated, got {other:?}"),
+            }
+        }
+        names.sort();
+        assert_eq!(names, vec!["x".to_string(), "y".to_string()]);
 
         drop(client);
         let _ = server_task.await;

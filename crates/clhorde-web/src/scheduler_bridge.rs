@@ -3,10 +3,16 @@
 //! Mirrors [`crate::bridge::DaemonBridge`] but for `clhorde-scheduler`'s
 //! lighter wire protocol:
 //!
-//! 1. A long-lived `Subscribe` connection feeds [`SchedulerEvent`]s
-//!    onto a `tokio::sync::broadcast` channel that every WebSocket
-//!    client subscribes to. Push-based, no polling.
-//! 2. One-shot helpers (`request`) open a fresh connection per call
+//! 1. A long-lived `Subscribe` connection feeds summary
+//!    [`SchedulerEvent`]s (`Snapshot` / `WorkflowUpdated`) onto a
+//!    `tokio::sync::broadcast` channel that every WebSocket client
+//!    subscribes to. Push-based, no polling.
+//! 2. A parallel long-lived `SubscribeAllDetails` connection feeds
+//!    detail [`SchedulerEvent`]s (`DetailUpdated`) onto the **same**
+//!    broadcast channel, so a WS client subscribed to one sink sees
+//!    both kinds. The orchestrator runs the two surfaces on separate
+//!    `broadcast::Sender`s — the bridge fans them in here.
+//! 3. One-shot helpers (`request`) open a fresh connection per call
 //!    for status/detail/queue/cancel/retry — the scheduler's own
 //!    control protocol is request/response on a non-Subscribe
 //!    connection, so each REST handler that needs a response just
@@ -15,7 +21,7 @@
 //! Critically, this bridge **does not block startup**. The scheduler
 //! is an optional background process — `clhorde-web` happily serves
 //! the daemon-only views (Prompts) when the scheduler is offline. The
-//! subscribe loop reconnects in the background and routes that need
+//! subscribe loops reconnect in the background and routes that need
 //! the scheduler return 503 until it comes up.
 
 use std::path::{Path, PathBuf};
@@ -89,16 +95,26 @@ pub struct SchedulerBridge {
     socket_path: PathBuf,
     connected: AtomicBool,
     event_tx: broadcast::Sender<SchedulerEvent>,
-    /// Held to keep the subscribe loop alive for the bridge lifetime.
-    /// Wrapped in a `tokio::sync::Mutex` so the constructor can swap
-    /// in the real handle after the bridge `Arc` is built (mirrors
-    /// the DaemonBridge bootstrap pattern).
+    /// Held to keep the summary subscribe loop alive for the bridge
+    /// lifetime. Wrapped in a `tokio::sync::Mutex` so the constructor
+    /// can swap in the real handle after the bridge `Arc` is built
+    /// (mirrors the DaemonBridge bootstrap pattern).
     _conn_handle: Mutex<tokio::task::JoinHandle<()>>,
+    /// Held to keep the parallel detail subscribe loop alive.
+    _detail_handle: Mutex<tokio::task::JoinHandle<()>>,
 }
 
 impl SchedulerBridge {
     /// Start the bridge against `socket_path`. Always succeeds — the
-    /// background task handles the connect/reconnect lifecycle.
+    /// background tasks handle the connect/reconnect lifecycle.
+    ///
+    /// Two long-lived subscribers run in parallel:
+    /// - `subscribe_loop` for summary events (`Subscribe`).
+    /// - `subscribe_all_details_loop` for unfiltered detail events
+    ///   (`SubscribeAllDetails`).
+    ///
+    /// Both feed the same `event_tx` broadcast — WS clients see a
+    /// single combined stream and filter by variant.
     pub async fn start(socket_path: PathBuf) -> Arc<Self> {
         let (event_tx, _) = broadcast::channel::<SchedulerEvent>(EVENT_BROADCAST_SIZE);
 
@@ -107,13 +123,27 @@ impl SchedulerBridge {
             connected: AtomicBool::new(false),
             event_tx: event_tx.clone(),
             _conn_handle: Mutex::new(tokio::spawn(async {})), // placeholder
+            _detail_handle: Mutex::new(tokio::spawn(async {})), // placeholder
         });
 
         let bridge_for_loop = bridge.clone();
+        let event_tx_clone = event_tx.clone();
+        let socket_clone = socket_path.clone();
         let handle = tokio::spawn(async move {
-            subscribe_loop(socket_path, event_tx, bridge_for_loop).await;
+            subscribe_loop(socket_clone, event_tx_clone, bridge_for_loop).await;
         });
         *bridge._conn_handle.lock().await = handle;
+
+        // Parallel detail subscriber. Reconnects independently —
+        // a transient detail-stream blip doesn't tear down the summary
+        // stream and vice versa.
+        let detail_event_tx = event_tx.clone();
+        let detail_socket = socket_path;
+        let detail_handle = tokio::spawn(async move {
+            subscribe_all_details_loop(detail_socket, detail_event_tx).await;
+        });
+        *bridge._detail_handle.lock().await = detail_handle;
+
         bridge
     }
 
@@ -146,10 +176,28 @@ impl SchedulerBridge {
         &self,
         req: ControlRequest,
     ) -> Result<ControlResponse, SchedulerBridgeError> {
-        if matches!(req, ControlRequest::Subscribe) {
-            return Err(SchedulerBridgeError::BadResponse(
-                "Subscribe is reserved for the bridge's own loop".into(),
-            ));
+        match req {
+            ControlRequest::Subscribe => {
+                return Err(SchedulerBridgeError::BadResponse(
+                    "Subscribe is reserved for the bridge's own loop".into(),
+                ));
+            }
+            ControlRequest::SubscribeAllDetails => {
+                return Err(SchedulerBridgeError::BadResponse(
+                    "SubscribeAllDetails is reserved for the bridge's own loop".into(),
+                ));
+            }
+            ControlRequest::SubscribeDetail { .. } => {
+                // Detail events ride on the bridge's own
+                // SubscribeAllDetails stream; per-WS-client
+                // SubscribeDetail connections aren't supported here.
+                return Err(SchedulerBridgeError::BadResponse(
+                    "SubscribeDetail is not supported through the bridge — \
+                     subscribe to the bridge's event stream instead"
+                        .into(),
+                ));
+            }
+            _ => {}
         }
         match tokio::time::timeout(
             REQUEST_TIMEOUT,
@@ -304,6 +352,102 @@ async fn run_subscribe_session(
                 warn!(
                     response = ?other,
                     "unexpected non-Event frame on subscribe stream"
+                );
+            }
+        }
+    }
+}
+
+/// Long-lived loop that opens a [`ControlRequest::SubscribeAllDetails`]
+/// connection and forwards every [`SchedulerEvent::DetailUpdated`]
+/// onto the same broadcast channel summary events ride on. Reconnects
+/// with capped exponential backoff, independent of the summary loop —
+/// a transient blip on one stream doesn't tear down the other.
+///
+/// Doesn't touch `bridge.connected` — that flag tracks the summary
+/// stream specifically, since it's the one that signals "scheduler
+/// reachable" to the SPA. The detail stream may be momentarily down
+/// while summary is up; from a UX standpoint the SPA's expanded card
+/// would briefly stop receiving updates but the rest of the dashboard
+/// keeps working.
+async fn subscribe_all_details_loop(
+    socket_path: PathBuf,
+    event_tx: broadcast::Sender<SchedulerEvent>,
+) {
+    let mut backoff = INITIAL_BACKOFF;
+
+    loop {
+        debug!(path = %socket_path.display(), "connecting to scheduler details stream");
+        match run_subscribe_all_details_session(&socket_path, &event_tx).await {
+            Ok(()) => {
+                warn!("scheduler details stream closed cleanly");
+                backoff = INITIAL_BACKOFF;
+            }
+            Err(e) => {
+                debug!(error = %e, "scheduler details subscribe failed");
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// One details-subscribe session. Mirrors [`run_subscribe_session`]
+/// but writes a `SubscribeAllDetails` frame and forwards every event
+/// on the broadcast channel.
+async fn run_subscribe_all_details_session(
+    socket_path: &Path,
+    event_tx: &broadcast::Sender<SchedulerEvent>,
+) -> Result<(), SchedulerBridgeError> {
+    let stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(|_| SchedulerBridgeError::Unreachable)?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+    let json = serde_json::to_vec(&ControlRequest::SubscribeAllDetails)
+        .map_err(|e| SchedulerBridgeError::BadResponse(format!("encode: {e}")))?;
+    let frame = ipc::encode_frame(&json);
+    writer
+        .write_all(&frame)
+        .await
+        .map_err(|e| SchedulerBridgeError::Io(e.to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| SchedulerBridgeError::Io(e.to_string()))?;
+
+    info!("connected to scheduler details stream");
+
+    loop {
+        let mut len_buf = [0u8; 4];
+        if let Err(e) = reader.read_exact(&mut len_buf).await {
+            return if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                Ok(())
+            } else {
+                Err(SchedulerBridgeError::Io(e.to_string()))
+            };
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_FRAME_SIZE {
+            return Err(SchedulerBridgeError::BadResponse(format!(
+                "oversized frame: {len}"
+            )));
+        }
+        let mut payload = vec![0u8; len];
+        reader
+            .read_exact(&mut payload)
+            .await
+            .map_err(|e| SchedulerBridgeError::Io(e.to_string()))?;
+        let response: ControlResponse = serde_json::from_slice(&payload)
+            .map_err(|e| SchedulerBridgeError::BadResponse(format!("decode: {e}")))?;
+        match response {
+            ControlResponse::Event { event } => {
+                let _ = event_tx.send(event);
+            }
+            other => {
+                warn!(
+                    response = ?other,
+                    "unexpected non-Event frame on details stream"
                 );
             }
         }
@@ -472,5 +616,188 @@ mod tests {
             }
             other => panic!("expected BadResponse, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn request_rejects_subscribe_all_details_to_avoid_misuse() {
+        // Same trap as Subscribe: SubscribeAllDetails switches the
+        // connection into stream mode, so a one-shot caller would
+        // hang waiting for a response.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("sched.sock");
+        let bridge = SchedulerBridge::start(path).await;
+
+        let res = bridge.request(ControlRequest::SubscribeAllDetails).await;
+        match res {
+            Err(SchedulerBridgeError::BadResponse(msg)) => {
+                assert!(msg.contains("SubscribeAllDetails"));
+            }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_rejects_per_workflow_subscribe_detail() {
+        // Per-workflow SubscribeDetail isn't supported through the
+        // bridge — clients consume the bridge's combined event
+        // stream and filter on the SPA side.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("sched.sock");
+        let bridge = SchedulerBridge::start(path).await;
+
+        let res = bridge
+            .request(ControlRequest::SubscribeDetail {
+                name: "x".into(),
+            })
+            .await;
+        match res {
+            Err(SchedulerBridgeError::BadResponse(msg)) => {
+                assert!(msg.contains("SubscribeDetail"));
+            }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    /// Mock server that handles BOTH the Subscribe and
+    /// SubscribeAllDetails connections the bridge opens in parallel.
+    /// Routes by inspecting the request frame and replies with the
+    /// corresponding events.
+    async fn spawn_mock_dual_subscribe(
+        path: PathBuf,
+        summary_events: Vec<SchedulerEvent>,
+        detail_events: Vec<SchedulerEvent>,
+    ) {
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            // Accept both connections; spawn a per-connection handler.
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let summary_clone = summary_events.clone();
+                let detail_clone = detail_events.clone();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = tokio::io::split(stream);
+                    let mut len_buf = [0u8; 4];
+                    r.read_exact(&mut len_buf).await.unwrap();
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    let mut payload = vec![0u8; len];
+                    r.read_exact(&mut payload).await.unwrap();
+                    let req: ControlRequest = serde_json::from_slice(&payload).unwrap();
+
+                    let events = match req {
+                        ControlRequest::Subscribe => summary_clone,
+                        ControlRequest::SubscribeAllDetails => detail_clone,
+                        other => panic!("unexpected request: {other:?}"),
+                    };
+                    for event in events {
+                        let resp = ControlResponse::Event { event };
+                        let body = serde_json::to_vec(&resp).unwrap();
+                        let frame = ipc::encode_frame(&body);
+                        w.write_all(&frame).await.unwrap();
+                    }
+                    w.flush().await.unwrap();
+                });
+            }
+            // Keep the listener alive until both connections finish.
+        });
+    }
+
+    #[tokio::test]
+    async fn details_stream_forwards_detail_events_to_subscribers() {
+        // The bridge's parallel SubscribeAllDetails loop must
+        // forward DetailUpdated frames into the same broadcast as
+        // summary events so WS clients see one combined stream.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("sched.sock");
+
+        let detail = clhorde_core::control::WorkflowDetail {
+            name: "alpha".into(),
+            status: "implementing".into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            apply: vec![],
+            verify: None,
+            archive: None,
+        };
+
+        spawn_mock_dual_subscribe(
+            path.clone(),
+            vec![],
+            vec![SchedulerEvent::DetailUpdated {
+                detail: detail.clone(),
+            }],
+        )
+        .await;
+
+        let bridge = SchedulerBridge::start(path).await;
+        let mut rx = bridge.subscribe_events();
+
+        let evt = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("event arrived in time")
+            .expect("event payload");
+        match evt {
+            SchedulerEvent::DetailUpdated { detail: got } => {
+                assert_eq!(got, detail);
+            }
+            other => panic!("expected DetailUpdated, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_and_detail_streams_share_one_broadcast() {
+        // Multiplexing both kinds onto one channel is the
+        // load-bearing simplification — without it WS handlers would
+        // need to manage two receivers each. The test asserts that
+        // both kinds of events surface on a single subscribe_events
+        // receiver.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("sched.sock");
+
+        let summary = sample_summary("alpha", "queued");
+        let detail = clhorde_core::control::WorkflowDetail {
+            name: "alpha".into(),
+            status: "queued".into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            apply: vec![],
+            verify: None,
+            archive: None,
+        };
+
+        spawn_mock_dual_subscribe(
+            path.clone(),
+            vec![SchedulerEvent::WorkflowUpdated {
+                summary: summary.clone(),
+            }],
+            vec![SchedulerEvent::DetailUpdated {
+                detail: detail.clone(),
+            }],
+        )
+        .await;
+
+        let bridge = SchedulerBridge::start(path).await;
+        let mut rx = bridge.subscribe_events();
+
+        let mut got_summary = false;
+        let mut got_detail = false;
+        for _ in 0..2 {
+            let evt = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("event arrived in time")
+                .expect("event payload");
+            match evt {
+                SchedulerEvent::WorkflowUpdated { .. } => got_summary = true,
+                SchedulerEvent::DetailUpdated { .. } => got_detail = true,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(got_summary, "summary stream did not deliver");
+        assert!(got_detail, "details stream did not deliver");
     }
 }

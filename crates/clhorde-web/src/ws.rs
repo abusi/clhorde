@@ -585,6 +585,56 @@ mod tests {
         assert_eq!(json["event"]["summary"]["status"], "implementing");
     }
 
+    fn detail_for_envelope(name: &str, status: &str) -> clhorde_core::control::WorkflowDetail {
+        clhorde_core::control::WorkflowDetail {
+            name: name.into(),
+            status: status.into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            apply: vec![],
+            verify: None,
+            archive: None,
+        }
+    }
+
+    #[test]
+    fn scheduler_message_wraps_detail_snapshot() {
+        // SubscribeAllDetails emits no snapshots, but the WS envelope
+        // must still encode the variant correctly so per-WS-client
+        // SubscribeDetail can land on this path later if introduced.
+        let event = SchedulerEvent::DetailSnapshot {
+            detail: detail_for_envelope("alpha", "queued"),
+        };
+        let msg = scheduler_message(&event).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["type"], "SchedulerEvent");
+        assert_eq!(json["event"]["type"], "detail_snapshot");
+        assert_eq!(json["event"]["detail"]["name"], "alpha");
+        assert_eq!(json["event"]["detail"]["status"], "queued");
+    }
+
+    #[test]
+    fn scheduler_message_wraps_detail_updated() {
+        // The bridge's SubscribeAllDetails stream is the primary
+        // producer of DetailUpdated frames the SPA dispatches on.
+        let event = SchedulerEvent::DetailUpdated {
+            detail: detail_for_envelope("alpha", "implementing"),
+        };
+        let msg = scheduler_message(&event).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["type"], "SchedulerEvent");
+        assert_eq!(json["event"]["type"], "detail_updated");
+        assert_eq!(json["event"]["detail"]["name"], "alpha");
+        assert_eq!(json["event"]["detail"]["status"], "implementing");
+    }
+
     // -----------------------------------------------------------------------
     // ClientEnvelope deserialization
     // -----------------------------------------------------------------------

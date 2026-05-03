@@ -251,6 +251,11 @@ class AppState {
      * - WorkflowUpdated upserts a single summary by name, migrating
      *   between drafts and workflows when the status crosses the
      *   `drafted` boundary.
+     * - DetailSnapshot/DetailUpdated (Phase 5.3.3) replace
+     *   `expandedWorkflowDetail` when the event's name matches the
+     *   currently open card. Other workflows' detail events are
+     *   ignored — payloads are small but rendering would be wasted
+     *   work since only one card is open at a time.
      */
     _applySchedulerEvent(event) {
         if (!event || !event.type) return;
@@ -285,6 +290,22 @@ class AppState {
                     this.workflows.sort((a, b) => a.name.localeCompare(b.name));
                 }
                 break;
+            }
+
+            case "detail_snapshot":
+            case "detail_updated": {
+                const d = event.detail;
+                if (!d || !d.name) return;
+                // Filter to the currently expanded card. Bridge fans
+                // out every workflow's detail to every WS client; the
+                // SPA prunes here so we don't render off-screen.
+                if (expandedWorkflow !== d.name) return;
+                expandedWorkflowDetail = d;
+                renderWorkflowDetail();
+                // No need to _notify — the listing renderers depend on
+                // schedulerSeen / drafts / workflows, none of which
+                // changed. Detail re-render is targeted above.
+                return;
             }
 
             default:
@@ -1603,11 +1624,9 @@ async function queueDraft(name) {
 async function cancelWorkflow(name) {
     if (!confirm(`Cancel workflow ${name}?`)) return;
     await schedulerAction("cancel", `/api/scheduler/workflow/${encodeURIComponent(name)}/cancel`, null);
-    if (expandedWorkflow === name) {
-        // Refresh the detail since the status will have flipped.
-        expandedWorkflowDetail = await fetchWorkflowDetail(name);
-        renderWorkflowDetail();
-    }
+    // The orchestrator emits DetailUpdated within ms of the cancel
+    // committing — the SPA's _applySchedulerEvent handler picks it
+    // up and re-renders the expanded card. No manual refetch.
 }
 
 async function retrySection(name, section) {
@@ -1616,12 +1635,9 @@ async function retrySection(name, section) {
         showToast("section id required", "error");
         return;
     }
-    if (await schedulerAction("retry", `/api/scheduler/workflow/${encodeURIComponent(name)}/retry`, { section: trimmed })) {
-        if (expandedWorkflow === name) {
-            expandedWorkflowDetail = await fetchWorkflowDetail(name);
-            renderWorkflowDetail();
-        }
-    }
+    // Same push-driven refresh as cancel above — DetailUpdated for
+    // this workflow lands shortly and re-renders the card.
+    await schedulerAction("retry", `/api/scheduler/workflow/${encodeURIComponent(name)}/retry`, { section: trimmed });
 }
 
 async function toggleWorkflow(name) {

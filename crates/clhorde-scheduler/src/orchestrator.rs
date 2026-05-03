@@ -228,6 +228,13 @@ impl Orchestrator {
         self.detail_events.subscribe()
     }
 
+    /// How many subscribers are currently listening on the detail
+    /// broadcast channel. Used by tests as a synchronization barrier
+    /// — production code shouldn't branch on this value.
+    pub fn detail_event_subscriber_count(&self) -> usize {
+        self.detail_events.receiver_count()
+    }
+
     /// Snapshot the orchestrator's externally-visible state, paired
     /// across the two broadcast surfaces. Used by the emit-diff
     /// helpers below to detect which workflows actually changed
