@@ -27,6 +27,7 @@ use clhorde_core::protocol::{ClientRequest, DaemonEvent, PromptInfo};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::control::{DetailNode, SchedulerEvent, WorkflowDetail, WorkflowSummary};
+use crate::deps::{self, DepEvaluation};
 use crate::dispatch::{is_node_done, next_runnable_nodes};
 use crate::openspec::affected_changes::{self, ChangesSnapshot};
 use crate::openspec::annotations::{annotate, AnnotatedSection};
@@ -442,7 +443,20 @@ impl Orchestrator {
         // Reuse the existing transition logic. It does the right thing:
         // Queued→Drafted, Implementing/Verifying/Archiving→Cancelled, and
         // saves the result.
+        let pre_terminal = self
+            .workflows
+            .get(name)
+            .map(|w| w.status.is_terminal())
+            .unwrap_or(true);
         self.on_marker_removed(name.to_string())?;
+        let post_terminal = self
+            .workflows
+            .get(name)
+            .map(|w| w.status.is_terminal())
+            .unwrap_or(true);
+        if !pre_terminal && post_terminal {
+            self.cascade_dependents(name);
+        }
         Ok(kind)
     }
 
@@ -711,14 +725,50 @@ impl Orchestrator {
         let Some(mut wf) = self.workflows.remove(name) else {
             return Ok(());
         };
+        let pre_terminal = wf.status.is_terminal();
         let result = self.advance_inner(&mut wf);
         // Save and reinsert regardless of error so we don't lose the
         // workflow on a transient failure.
         if let Err(e) = self.store.save(&wf) {
             tracing::warn!(name = %wf.name, error = %e, "persisting after advance failed");
         }
+        let post_terminal = wf.status.is_terminal();
         self.workflows.insert(name.to_string(), wf);
+
+        // Inter-workflow cascade: a freshly-terminal workflow may unblock
+        // (Archived) or fail (Cancelled/Failed) any dependent in `Queued`.
+        // Bounded recursion: each invocation drops one workflow into a
+        // terminal state; with cycle detection rejecting cycles, the dep
+        // graph is a DAG and recursion depth = depth of dependents.
+        if !pre_terminal && post_terminal {
+            self.cascade_dependents(name);
+        }
         result
+    }
+
+    /// Find every workflow that lists `name` in its `depends_on` and
+    /// re-evaluate it via [`Self::try_advance_inner`]. Called after a
+    /// state transition that may have unblocked or failed a dependent.
+    fn cascade_dependents(&mut self, name: &str) {
+        let dependents: Vec<String> = self
+            .workflows
+            .iter()
+            .filter(|(n, w)| {
+                n.as_str() != name
+                    && w.metadata.depends_on.iter().any(|d| d == name)
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        for dep_name in dependents {
+            if let Err(e) = self.try_advance_inner(&dep_name) {
+                tracing::warn!(
+                    name = %dep_name,
+                    parent = %name,
+                    error = %e,
+                    "cascade try_advance failed"
+                );
+            }
+        }
     }
 
     // ── advance phases ──
@@ -741,6 +791,17 @@ impl Orchestrator {
         };
         if sections.is_empty() {
             return Ok(());
+        }
+        // Inter-workflow gate: hold or fail per `depends_on` in the marker.
+        // `wf` is owned here (already removed from `self.workflows` by
+        // `try_advance_inner`) so passing `&self.workflows` is fine.
+        match deps::evaluate(wf, &self.workflows) {
+            DepEvaluation::Satisfied => {}
+            DepEvaluation::Pending(_) => return Ok(()),
+            DepEvaluation::Failed(reason) => {
+                let _ = wf.fail(reason);
+                return Ok(());
+            }
         }
         let dag = match dag::build(&sections) {
             Ok(d) => d,
@@ -2680,5 +2741,286 @@ mod tests {
         let mut names: Vec<&str> = evs.iter().map(|e| updated_detail(e).name.as_str()).collect();
         names.sort();
         assert_eq!(names, vec!["x", "y"]);
+    }
+
+    // ── inter-workflow dependency gate (Phase 5.4.1) ──
+
+    /// Build a fully-archived `Workflow` ready to be saved into a store
+    /// fixture. Used as the "satisfied dep" in the gate tests below.
+    fn archived_workflow(name: &str) -> Workflow {
+        let mut w = Workflow::drafted(name);
+        w.queue(MarkerMetadata::default()).unwrap();
+        w.start_implementing().unwrap();
+        w.start_verifying().unwrap();
+        w.start_archiving().unwrap();
+        w.archive().unwrap();
+        w
+    }
+
+    fn assert_failed(orch: &Orchestrator, name: &str, reason_contains: &str) {
+        match &orch.workflow(name).unwrap().status {
+            WorkflowStatus::Failed { reason } => {
+                assert!(
+                    reason.contains(reason_contains),
+                    "expected reason to contain {reason_contains:?}, got: {reason}"
+                );
+            }
+            other => panic!("expected {name} to be Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queued_with_archived_dep_proceeds_to_implementing() {
+        let (tmp, mut orch, mut rx) = fixture();
+        // Pre-populate the store with `base` already archived. Reconcile
+        // loads it back into the in-memory map so `evaluate` sees it.
+        orch.store.save(&archived_workflow("base")).unwrap();
+
+        write_tasks(&tmp, "x", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "x", "depends_on = [\"base\"]\n");
+        orch.reconcile().unwrap();
+
+        assert_eq!(
+            orch.workflow("x").unwrap().status,
+            WorkflowStatus::Implementing
+        );
+        let reqs = drain_requests(&mut rx);
+        assert_eq!(reqs.len(), 1, "expected one apply prompt for x");
+        assert!(submit_tag(&reqs[0]).contains("wf=x/phase=apply"));
+    }
+
+    #[test]
+    fn queued_with_pending_dep_stays_queued_and_dispatches_nothing() {
+        let (tmp, mut orch, mut rx) = fixture();
+        // `base` is on disk but never queued — it stays Drafted, which
+        // counts as "not Archived" → the dependent must hold.
+        change_dir(&tmp, "base");
+        write_tasks(&tmp, "base", "## 1. A\n- [ ] 1.1 a\n");
+
+        write_tasks(&tmp, "x", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "x", "depends_on = [\"base\"]\n");
+        orch.reconcile().unwrap();
+
+        assert_eq!(orch.workflow("x").unwrap().status, WorkflowStatus::Queued);
+        assert!(
+            drain_requests(&mut rx).is_empty(),
+            "no prompt should have been dispatched while x is blocked"
+        );
+    }
+
+    #[test]
+    fn queued_with_missing_dep_fails() {
+        let (tmp, mut orch, _rx) = fixture();
+        write_tasks(&tmp, "x", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "x", "depends_on = [\"ghost\"]\n");
+
+        orch.handle_event(FsEvent::TasksModified { name: "x".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::MarkerCreated { name: "x".into() })
+            .unwrap();
+
+        assert_failed(&orch, "x", "ghost");
+    }
+
+    #[test]
+    fn queued_with_cancelled_dep_fails() {
+        let (tmp, mut orch, _rx) = fixture();
+        // Save a Cancelled `base` directly. Reconcile loads it back.
+        let mut base = Workflow::drafted("base");
+        base.queue(MarkerMetadata::default()).unwrap();
+        base.cancel().unwrap();
+        orch.store.save(&base).unwrap();
+
+        write_tasks(&tmp, "x", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "x", "depends_on = [\"base\"]\n");
+        orch.reconcile().unwrap();
+
+        assert_failed(&orch, "x", "cancelled");
+    }
+
+    #[test]
+    fn cycle_between_two_queued_workflows_fails_them() {
+        let (tmp, mut orch, _rx) = fixture();
+        write_tasks(&tmp, "x", "## 1. A\n- [ ] 1.1 a\n");
+        write_tasks(&tmp, "y", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "x", "depends_on = [\"y\"]\n");
+        write_marker(&tmp, "y", "depends_on = [\"x\"]\n");
+
+        orch.reconcile().unwrap();
+
+        // Whichever side reconcile evaluates first detects the cycle and
+        // fails. The other one then sees the first is Failed and fails
+        // too via the `failed_dep_propagates_reason` arm. Either way both
+        // end up Failed; the *first* may carry the cycle reason while the
+        // *second* may carry the propagated-failure reason.
+        let x_status = orch.workflow("x").unwrap().status.clone();
+        let y_status = orch.workflow("y").unwrap().status.clone();
+        assert!(
+            matches!(x_status, WorkflowStatus::Failed { .. }),
+            "x: {x_status:?}"
+        );
+        assert!(
+            matches!(y_status, WorkflowStatus::Failed { .. }),
+            "y: {y_status:?}"
+        );
+        // At least one of them should mention "cycle" — the other may
+        // carry a propagated dep-failure reason.
+        let xr = match &x_status {
+            WorkflowStatus::Failed { reason } => reason.clone(),
+            _ => unreachable!(),
+        };
+        let yr = match &y_status {
+            WorkflowStatus::Failed { reason } => reason.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            xr.contains("cycle") || yr.contains("cycle"),
+            "expected cycle reason on at least one; got x={xr}, y={yr}"
+        );
+    }
+
+    // ── cascade-on-terminal (Phase 5.4.1) ──
+
+    #[test]
+    fn dependent_unblocks_when_dep_archives() {
+        let (tmp, mut orch, mut rx) = fixture();
+
+        // base: independent, will run to completion.
+        write_tasks(&tmp, "base", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "base", "");
+        // x: depends on base. Should sit Queued until base archives.
+        write_tasks(&tmp, "x", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "x", "depends_on = [\"base\"]\n");
+
+        orch.handle_event(FsEvent::TasksModified { name: "base".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::TasksModified { name: "x".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::MarkerCreated { name: "base".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::MarkerCreated { name: "x".into() })
+            .unwrap();
+
+        assert_eq!(
+            orch.workflow("base").unwrap().status,
+            WorkflowStatus::Implementing
+        );
+        assert_eq!(orch.workflow("x").unwrap().status, WorkflowStatus::Queued);
+
+        let reqs = drain_requests(&mut rx);
+        assert_eq!(reqs.len(), 1, "only base's apply prompt expected so far");
+        let base_apply_tag = submit_tag(&reqs[0]).to_string();
+
+        // Drive base apply → done.
+        orch.handle_daemon_event(&fake_prompt_added(1, &base_apply_tag))
+            .unwrap();
+        write_tasks(&tmp, "base", "## 1. A\n- [x] 1.1 a\n");
+        orch.handle_event(FsEvent::TasksModified { name: "base".into() })
+            .unwrap();
+        orch.handle_daemon_event(&DaemonEvent::WorkerFinished {
+            prompt_id: 1,
+            exit_code: Some(0),
+        })
+        .unwrap();
+
+        let verify_tag = submit_tag(&drain_requests(&mut rx)[0]).to_string();
+        orch.handle_daemon_event(&fake_prompt_added(2, &verify_tag))
+            .unwrap();
+        orch.handle_daemon_event(&DaemonEvent::WorkerFinished {
+            prompt_id: 2,
+            exit_code: Some(0),
+        })
+        .unwrap();
+
+        let archive_tag = submit_tag(&drain_requests(&mut rx)[0]).to_string();
+        orch.handle_daemon_event(&fake_prompt_added(3, &archive_tag))
+            .unwrap();
+        // The WorkerFinished that archives `base` is the cascade trigger.
+        orch.handle_daemon_event(&DaemonEvent::WorkerFinished {
+            prompt_id: 3,
+            exit_code: Some(0),
+        })
+        .unwrap();
+
+        assert_eq!(
+            orch.workflow("base").unwrap().status,
+            WorkflowStatus::Archived
+        );
+        // Cascade should have advanced x into Implementing automatically.
+        assert_eq!(
+            orch.workflow("x").unwrap().status,
+            WorkflowStatus::Implementing
+        );
+        let final_reqs = drain_requests(&mut rx);
+        assert!(
+            final_reqs
+                .iter()
+                .any(|r| submit_tag(r).contains("wf=x/phase=apply")),
+            "expected cascade to dispatch x's apply prompt; got {final_reqs:#?}"
+        );
+    }
+
+    #[test]
+    fn dependent_fails_when_dep_fails_via_cascade() {
+        let (tmp, mut orch, mut rx) = fixture();
+        write_tasks(&tmp, "base", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "base", "");
+        write_tasks(&tmp, "x", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "x", "depends_on = [\"base\"]\n");
+
+        orch.handle_event(FsEvent::TasksModified { name: "base".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::TasksModified { name: "x".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::MarkerCreated { name: "base".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::MarkerCreated { name: "x".into() })
+            .unwrap();
+
+        let base_apply_tag = submit_tag(&drain_requests(&mut rx)[0]).to_string();
+        orch.handle_daemon_event(&fake_prompt_added(1, &base_apply_tag))
+            .unwrap();
+        // base apply exits non-zero → base fails.
+        orch.handle_daemon_event(&DaemonEvent::WorkerFinished {
+            prompt_id: 1,
+            exit_code: Some(1),
+        })
+        .unwrap();
+
+        assert!(matches!(
+            orch.workflow("base").unwrap().status,
+            WorkflowStatus::Failed { .. }
+        ));
+        // Cascade should have failed x with a dependency-failed reason.
+        assert_failed(&orch, "x", "'base'");
+    }
+
+    #[test]
+    fn cancel_workflow_cascades_failure_to_dependents() {
+        let (tmp, mut orch, _rx) = fixture();
+        // base is queued + running, x depends on it.
+        write_tasks(&tmp, "base", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "base", "");
+        write_tasks(&tmp, "x", "## 1. A\n- [ ] 1.1 a\n");
+        write_marker(&tmp, "x", "depends_on = [\"base\"]\n");
+
+        orch.handle_event(FsEvent::TasksModified { name: "base".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::TasksModified { name: "x".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::MarkerCreated { name: "base".into() })
+            .unwrap();
+        orch.handle_event(FsEvent::MarkerCreated { name: "x".into() })
+            .unwrap();
+
+        // Cancel base via the control-socket entry point. This goes
+        // through `cancel_workflow_inner`, which now triggers the cascade.
+        orch.cancel_workflow("base").unwrap();
+
+        assert_eq!(
+            orch.workflow("base").unwrap().status,
+            WorkflowStatus::Cancelled
+        );
+        assert_failed(&orch, "x", "cancelled");
     }
 }

@@ -17,6 +17,7 @@ pub mod cli;
 pub mod commands;
 pub mod control;
 pub mod daemon_client;
+pub mod deps;
 pub mod dispatch;
 pub mod openspec;
 pub mod orchestrator;

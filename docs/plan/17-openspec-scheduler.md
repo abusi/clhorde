@@ -620,13 +620,57 @@ Open questions (to resolve during 5.3.1):
 - Does the orchestrator need a `WorkflowRemoved` event too, paired with detail teardown? Decision deferred — workflows don't currently disappear from `workflows`, same as 5.1.
 - Should SubscribeDetail accept multiple names? Decision: no, one workflow per connection. Two viewers = two connections; the orchestrator broadcast fans them out.
 
+### 5.4 Inter-workflow dependencies — ⏳ in progress
+
+Goal: honor `depends_on: ["other-change-name", …]` in `.clhorde-ready` so a workflow stays held until every named dependency reaches `Archived`. `MarkerMetadata.depends_on` is already parsed (Phase 0.x) and surfaced read-only by `flow status`, but no gate enforces it — the orchestrator currently transitions any `Queued` workflow into `Implementing` as soon as a worker slot opens up. This phase wires the gate, surfaces *why* a workflow is held, and propagates dep failures so dependents don't dangle silently.
+
+Design choices:
+
+- **No new `Blocked` status.** A "soft hold" is just `Queued` with a non-empty `blocked_by`. Avoids a state-machine variant + persistence migration + new badge palette for what is fundamentally a runtime pause. Forward-compat for older clients is automatic since the new field defaults to empty.
+- **Gate sits in `advance_queued`** (orchestrator.rs). Before `start_implementing()`, evaluate `wf.metadata.depends_on` against the current `workflows` map. If any dep is missing-from-disk, `Cancelled`, `Failed`, or part of a cycle, fail the dependent with a clear reason. If any dep is `Drafted`/`Queued`/`Implementing`/`Verifying`/`Archiving`, return `Ok(())` and stay queued. Only an all-`Archived` dep set unblocks the transition.
+- **Cancelled / Failed deps propagate.** A dependent whose dep ends up `Cancelled` or `Failed` is itself failed with `dependency '<name>' <state>`. Rationale: the dep produced no artifact, so silently stalling the dependent forever is worse than telling the user explicitly. Retry path: user removes the dep marker, re-drops one, then `flow retry` the dependent (or re-queues it).
+- **Cycle detection** at `advance_queued` time. Walk `depends_on` transitively across the orchestrator's view; if a cycle including this workflow is reachable, fail every member with `dependency cycle: A → B → A`. Cheap (workflows are O(dozens), not O(thousands)) and deterministic.
+- **Cascading wake.** When a workflow transitions to `Archived`, sweep `workflows` and `try_advance_inner` every entry that lists it in `depends_on`. Same hook re-runs cycle detection, so a previously-stuck dependent that is now satisfiable picks up automatically without an explicit FS event.
+- **Surface in `WorkflowSummary` + `WorkflowDetail`** via a new `blocked_by: Vec<String>` field (defaults to empty, `#[serde(default, skip_serializing_if = "Vec::is_empty")]`). Always populated for `Queued` workflows whose deps aren't all archived, empty otherwise. The existing `emit_diff` helpers fire `WorkflowUpdated` / `DetailUpdated` automatically when this field shrinks (i.e. when a dep clears), so TUI/web repaint without new event plumbing.
+- **No marker file format change.** `depends_on = ["a", "b"]` already round-trips through TOML.
+
+Sliced into three independently-shippable sub-phases:
+
+#### 5.4.1 Core gating + cycle detection + dep-failure propagation
+
+- New `orchestrator::deps::evaluate(name, workflows)` returning a `DepEvaluation` enum: `Satisfied`, `Pending(Vec<String>)`, `Failed(String)`. Pure function over a snapshot — easy to unit-test exhaustively without spinning up a full orchestrator.
+- `advance_queued` consults `evaluate` before `start_implementing`. `Pending` keeps the workflow in `Queued`, `Failed` calls `wf.fail(reason)`, `Satisfied` proceeds as today.
+- Cycle detection: depth-first walk over `depends_on` edges restricted to known workflow names. If `name` revisits itself, every workflow in the cycle is failed with the same `dependency cycle: A → B → A` reason.
+- `advance_archiving` post-archive: collect dependents of `wf.name` from `workflows` and call `try_advance_inner` on each. Bounded by orchestrator size; recursion impossible because an archived workflow can't re-trigger the cycle.
+- Tests: ~12 in `orchestrator::deps` (satisfied/pending/missing-dep-fails/cancelled-dep-fails/failed-dep-fails/two-step chain holds then unblocks/cycle-of-2/cycle-of-3/self-dep/transitive satisfied/archive cascade re-evaluates dependents/idempotent on already-failed dependent).
+
+#### 5.4.2 `blocked_by` on Summary + Detail + push events
+
+- Add `blocked_by: Vec<String>` to `WorkflowSummary` and `WorkflowDetail` (`clhorde-core::control`). `#[serde(default, skip_serializing_if = "Vec::is_empty")]` for back-compat both ways.
+- `Orchestrator::summary` / `Orchestrator::detail` populate `blocked_by` by re-running the evaluator (cheap; reuses 5.4.1's `Pending` arm). Filled only for `Queued` workflows.
+- Diff helpers already cover this since the field is part of `WorkflowSummary` / `WorkflowDetail`. Verify with one round-trip test that a dep clearing emits exactly one `WorkflowUpdated` whose `blocked_by` shrunk.
+- 1 new wire round-trip test (`Snapshot` carrying summaries with `blocked_by`), 2 in `clhorde-core` (back-compat with absent/empty `blocked_by`), 3 in orchestrator (`summary().blocked_by` populated when pending; emptied when satisfied; emptied for terminal states).
+
+#### 5.4.3 CLI + TUI + Web surfacing
+
+- `clhorde-cli flow status <name>`: enrich the existing `depends_on:` line to `depends_on: A (archived), B (queued — blocking)`. When `blocked_by` is non-empty, also print `blocked_by: A, B` so it's grep-friendly.
+- TUI Workflows pane: append `· blocked` to the status badge when `blocked_by` is non-empty (e.g. `queued · blocked`). Detail overlay header gains a `Blocked by: A, B` line above the apply DAG when populated.
+- Web SPA: matching badge suffix in the workflow row + `Blocked by: A, B` line in the expanded card. CSS reuses the existing dim-orange accent class.
+- 4–6 small tests across the three layers (CLI snapshot of `flow status` text; TUI render path for the badge suffix; SPA: 1 unit test that the badge appears when `blocked_by` is non-empty).
+
+Open questions (to resolve during 5.4.1):
+
+- **Should a `Drafted` dep block forever, or be treated as a bad-dep?** Recommend block forever — user might intend to queue it later. Make the "stuck" state visible enough via `blocked_by` that users notice. (Counter-arg: typo workflow name silently stalls everything that depends on it. Mitigation: if the name doesn't exist *as a workflow at all* — i.e. no `openspec/changes/<name>/` directory — fail immediately with `dependency '<name>' not found`. Drafted deps still hold.)
+- **Manual override knob?** A `--ignore-deps` flag on `flow queue` that strips `depends_on` from the marker before write. Defer to 5.x unless needed.
+- **Do we need `WorkflowFailed` as a distinct event for the cascade?** No — `WorkflowUpdated` already carries the new `Failed` status and the existing diff machinery emits it. Dependents-of-failed-dep get their own `WorkflowUpdated` as the cascade fails them.
+
 ### 5.x Remaining (deferred)
 
 - **Disjoint-files analysis**: refuse `parallel-with` annotations when sections touch overlapping files (cheap heuristic via grep over `proposal.md` / `design.md`).
-- **Inter-workflow deps**: `depends_on: [other-change-name]` in `.clhorde-ready` defers pickup until the other change is `Archived`.
 - **Auto-retry policies** per phase (apply: 2, verify: 1, archive: 0; configurable).
 - **Hooks**: `post-archive: gh pr create --title "{{change_name}}"`.
 - **Multi-repo**: a scheduler instance can watch several repos.
+- **`--ignore-deps` flag** on `flow queue` (manual override for the gate added in Phase 5.4).
 
 ## Open questions
 
@@ -668,7 +712,10 @@ Open questions (to resolve during 5.3.1):
 | **5.3.1** | ✅ shipped | `SubscribeDetail` wire + orchestrator detail broadcast + control-server stream branch | Server-side push surface for one workflow's `WorkflowDetail` — 12 new tests. |
 | **5.3.2** | ✅ shipped | TUI: spawn/abort detail subscription with overlay; drop 2s polling | Removes the last polling path inside the TUI — 5 net new tests. |
 | **5.3.3** | ✅ shipped | Web: `SubscribeAllDetails` + bridge fan-in + SPA push handler | SPA reaches push parity with the TUI — 8 new tests. |
-| **5.x** | ⏳ pending | Advanced (parallel safety, inter-workflow deps, hooks, multi-repo) | Polish. |
+| **5.4.1** | ⏳ in progress | Inter-workflow deps: gate in `advance_queued` + cycle detection + dep-failure propagation | Pure orchestrator logic — testable in isolation. |
+| **5.4.2** | ⏳ pending | `blocked_by: Vec<String>` on Summary + Detail; populate via evaluator; back-compat round-trip | Wire surface so push events carry the "why blocked". |
+| **5.4.3** | ⏳ pending | CLI `flow status` enriched + TUI badge suffix + Web badge + Blocked-by line | Presentation layer — no logic, just rendering. |
+| **5.x** | ⏳ pending | Advanced (parallel safety, hooks, multi-repo, manual `--ignore-deps`) | Polish. |
 
 Each phase is independently shippable. Phase 0 alone is already a feature win; Phase 2.4 already produces value for users who want a scriptable workflow runner.
 
