@@ -21,10 +21,13 @@ use chrono::{DateTime, Utc};
 use clhorde_core::protocol::ClientRequest;
 use tokio::sync::mpsc;
 
+use std::collections::BTreeMap;
+
 use crate::cli::{
     ApplyArgs, DraftsArgs, NameArg, ProposeArgs, QueueArgs, RetryArgs, StatusArgs,
 };
 use crate::daemon_client::{self, OneShotError};
+use crate::deps::{self, DepEvaluation};
 use crate::openspec::annotations::annotate;
 use crate::openspec::dag::{self, DagNode};
 use crate::openspec::discovery::{self, ChangeStatus};
@@ -191,10 +194,20 @@ pub fn status(
 ) -> Result<CommandOutput, CommandError> {
     match args.name {
         Some(name) => {
-            let wf = store
-                .load(&name)?
+            // Load every workflow so the dep evaluator can compute
+            // `blocked_by` against the full set, not just the requested
+            // one. Cheap — workflows live as small JSON files.
+            let all = store.list()?;
+            let wf = all
+                .iter()
+                .find(|w| w.name == name)
                 .ok_or_else(|| CommandError::NoSuchWorkflow(name.clone()))?;
-            Ok(CommandOutput::ok(format_workflow_detail(&wf)))
+            let others: BTreeMap<String, Workflow> = all
+                .iter()
+                .filter(|w| w.name != name)
+                .map(|w| (w.name.clone(), w.clone()))
+                .collect();
+            Ok(CommandOutput::ok(format_workflow_detail(wf, &others)))
         }
         None => {
             let workflows = store.list()?;
@@ -224,7 +237,10 @@ fn format_workflow_summary(wf: &Workflow) -> String {
     }
 }
 
-fn format_workflow_detail(wf: &Workflow) -> String {
+fn format_workflow_detail(
+    wf: &Workflow,
+    others: &BTreeMap<String, Workflow>,
+) -> String {
     let mut s = String::new();
     s.push_str(&format!("name: {}\n", wf.name));
     s.push_str(&format!("status: {}\n", workflow_status_label(&wf.status)));
@@ -236,10 +252,25 @@ fn format_workflow_detail(wf: &Workflow) -> String {
         s.push_str(&format!("worktree_branch: {b}\n"));
     }
     if !wf.metadata.depends_on.is_empty() {
-        s.push_str(&format!(
-            "depends_on: {}\n",
-            wf.metadata.depends_on.join(", ")
-        ));
+        // Annotate each dep with its current status so the user sees
+        // *which* deps are blocking without a second `flow status` call.
+        // Format: `depends_on: a (archived), b (queued), ghost (not found)`.
+        let parts: Vec<String> = wf
+            .metadata
+            .depends_on
+            .iter()
+            .map(|d| match others.get(d) {
+                Some(o) => format!("{d} ({})", workflow_status_label(&o.status)),
+                None => format!("{d} (not found)"),
+            })
+            .collect();
+        s.push_str(&format!("depends_on: {}\n", parts.join(", ")));
+    }
+    // Runtime gate verdict: only meaningful for Queued workflows.
+    if matches!(wf.status, WorkflowStatus::Queued) {
+        if let DepEvaluation::Pending(blocked) = deps::evaluate(wf, others) {
+            s.push_str(&format!("blocked_by: {}\n", blocked.join(", ")));
+        }
     }
     s.push_str(&format!("queued_at: {}\n", iso_or_dash(wf.queued_at)));
     s.push_str(&format!("started_at: {}\n", iso_or_dash(wf.started_at)));
@@ -777,7 +808,89 @@ mod tests {
         assert!(out.stdout.contains("name: add-oauth"));
         assert!(out.stdout.contains("status: queued"));
         assert!(out.stdout.contains("priority: 7"));
-        assert!(out.stdout.contains("depends_on: base"));
+        // The dep `base` does not exist in the store → annotation is
+        // `(not found)`, and the workflow's gate verdict is `Failed`
+        // (not `Pending`), so no `blocked_by:` line is emitted.
+        assert!(
+            out.stdout.contains("depends_on: base (not found)"),
+            "missing depends_on annotation in:\n{}",
+            out.stdout
+        );
+        assert!(
+            !out.stdout.contains("blocked_by:"),
+            "missing dep should not surface as blocked_by; got:\n{}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn status_for_queued_with_pending_dep_shows_blocked_by_and_dep_annotation() {
+        let tmp = TempDir::new().unwrap();
+        let store = WorkflowStore::open(tmp.path().join("wf"));
+        // `base` exists but is only Drafted → dep evaluator returns
+        // Pending, so the dependent gets a `blocked_by:` line and an
+        // annotated `depends_on:` line.
+        store.save(&Workflow::drafted("base")).unwrap();
+
+        let mut wf = Workflow::drafted("add-oauth");
+        wf.metadata.depends_on = vec!["base".into()];
+        wf.queue(wf.metadata.clone()).unwrap();
+        store.save(&wf).unwrap();
+
+        let out = status(
+            StatusArgs {
+                name: Some("add-oauth".into()),
+            },
+            &store,
+        )
+        .unwrap();
+        assert!(
+            out.stdout.contains("depends_on: base (drafted)"),
+            "expected drafted annotation in:\n{}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("blocked_by: base"),
+            "expected blocked_by line in:\n{}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn status_for_queued_with_archived_dep_omits_blocked_by() {
+        let tmp = TempDir::new().unwrap();
+        let store = WorkflowStore::open(tmp.path().join("wf"));
+        let mut base = Workflow::drafted("base");
+        base.queue(crate::openspec::discovery::MarkerMetadata::default())
+            .unwrap();
+        base.start_implementing().unwrap();
+        base.start_verifying().unwrap();
+        base.start_archiving().unwrap();
+        base.archive().unwrap();
+        store.save(&base).unwrap();
+
+        let mut wf = Workflow::drafted("add-oauth");
+        wf.metadata.depends_on = vec!["base".into()];
+        wf.queue(wf.metadata.clone()).unwrap();
+        store.save(&wf).unwrap();
+
+        let out = status(
+            StatusArgs {
+                name: Some("add-oauth".into()),
+            },
+            &store,
+        )
+        .unwrap();
+        assert!(
+            out.stdout.contains("depends_on: base (archived)"),
+            "expected archived annotation in:\n{}",
+            out.stdout
+        );
+        assert!(
+            !out.stdout.contains("blocked_by:"),
+            "archived dep is satisfied — blocked_by should be absent. Got:\n{}",
+            out.stdout
+        );
     }
 
     #[test]

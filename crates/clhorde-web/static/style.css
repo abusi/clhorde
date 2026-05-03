@@ -883,6 +883,24 @@ textarea.input {
 .badge-workflow-failed      { background: rgba(239, 68, 68, 0.15); color: #f87171; }
 .badge-workflow-cancelled   { background: var(--bg-tertiary); color: var(--text-secondary); }
 
+/* Inter-workflow dependency gate annotations (Phase 5.4.3).
+ * Dim warning palette: visible enough to flag the held workflow
+ * without overpowering the status badge it sits next to. */
+.blocked-suffix {
+    color: #fbbf24;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    margin-left: var(--space-xs);
+    cursor: help;
+}
+
+.workflow-blocked-line {
+    color: #fbbf24;
+    font-size: var(--font-size-sm);
+    margin-top: var(--space-xs);
+    flex-basis: 100%;
+}
+
 /* Workflow detail block. */
 .workflow-detail {
     border: 1px solid var(--border);

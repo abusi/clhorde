@@ -1485,10 +1485,14 @@ function renderWorkflows() {
 
     listEl.innerHTML = appState.workflows.map(w => {
         const isOpen = expandedWorkflow === w.name;
+        const blocked = (w.blocked_by && w.blocked_by.length)
+            ? `<span class="blocked-suffix" title="Blocked by: ${escapeHtml(w.blocked_by.join(", "))}">· blocked</span>`
+            : "";
         return `
             <div class="scheduler-row ${isOpen ? "scheduler-row-open" : ""}" data-workflow="${escapeHtml(w.name)}">
                 <span class="scheduler-name">${escapeHtml(w.name)}</span>
                 <span class="badge badge-workflow-${w.status}">${w.status}</span>
+                ${blocked}
                 ${w.priority ? `<span class="footer-label">prio ${w.priority}</span>` : ""}
                 <button class="btn btn-sm" data-workflow-action="toggle" data-name="${escapeHtml(w.name)}">${isOpen ? "Close" : "Open"}</button>
                 <button class="btn btn-sm btn-danger" data-workflow-action="cancel" data-name="${escapeHtml(w.name)}">Cancel</button>
@@ -1524,11 +1528,15 @@ function renderWorkflowDetail() {
     const failureBadge = detail.failure_reason
         ? `<span class="badge badge-failed" title="${escapeHtml(detail.failure_reason)}">${escapeHtml(detail.failure_reason)}</span>`
         : "";
+    const blockedLine = (detail.blocked_by && detail.blocked_by.length)
+        ? `<div class="workflow-blocked-line"><strong>Blocked by:</strong> ${escapeHtml(detail.blocked_by.join(", "))}</div>`
+        : "";
 
     header.innerHTML = `
         <strong>${escapeHtml(detail.name)}</strong>
         <span class="badge badge-workflow-${detail.status}">${detail.status}</span>
         ${failureBadge}
+        ${blockedLine}
     `;
 
     const renderNode = (node, label) => {

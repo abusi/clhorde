@@ -658,12 +658,22 @@ Delivered:
 - 3 in `clhorde-core::control` (round-trip with non-empty `blocked_by`; `skip_serializing_if` omits the field when empty so the wire stays back-compat with old schedulers; `WorkflowDetail` round-trip + decoding a legacy payload without the field).
 - 3 in `clhorde-scheduler::orchestrator` (`summary().blocked_by` populated for pending Queued; empty for Drafted + Archived; `WorkflowUpdated` carrying empty `blocked_by` after the dep cascade-archives — final value of x reflects the cleared list).
 
-#### 5.4.3 CLI + TUI + Web surfacing
+#### 5.4.3 CLI + TUI + Web surfacing — ✅ shipped
 
-- `clhorde-cli flow status <name>`: enrich the existing `depends_on:` line to `depends_on: A (archived), B (queued — blocking)`. When `blocked_by` is non-empty, also print `blocked_by: A, B` so it's grep-friendly.
-- TUI Workflows pane: append `· blocked` to the status badge when `blocked_by` is non-empty (e.g. `queued · blocked`). Detail overlay header gains a `Blocked by: A, B` line above the apply DAG when populated.
-- Web SPA: matching badge suffix in the workflow row + `Blocked by: A, B` line in the expanded card. CSS reuses the existing dim-orange accent class.
-- 4–6 small tests across the three layers (CLI snapshot of `flow status` text; TUI render path for the badge suffix; SPA: 1 unit test that the badge appears when `blocked_by` is non-empty).
+Delivered:
+
+- **`clhorde-cli flow status <name>`** (renderer in `clhorde-scheduler::commands`, CLI shells out): the existing `depends_on:` line now annotates each dep with its current status — `depends_on: a (archived), b (queued), ghost (not found)`. When the runtime gate verdict is `Pending`, an additional `blocked_by: a, c` line lands below it (sorted, grep-friendly). The renderer loads every workflow from the store once and runs `deps::evaluate` over the collection — no control-socket dependency, so `flow status` keeps working even when the live scheduler is down.
+- **TUI Workflows pane** (`workflow_line` in `ui.rs`): a yellow `· blocked` suffix lands after the status badge when `WorkflowSummary.blocked_by` is non-empty. Kept outside the padded label so the rest of the row stays aligned. The badge palette is unchanged — blocked is an annotation, not a new state.
+- **TUI workflow detail overlay** (`render_workflow_detail_view`): when `WorkflowDetail.blocked_by` is non-empty, a `Blocked by: A, B` line lands in the header section between the timestamps row and the empty separator that precedes the apply DAG. Same yellow-bold accent as the workflows-pane suffix for visual consistency.
+- **Web SPA** (`renderWorkflows` + `renderWorkflowDetail` in `app.js`): row-level `· blocked` suffix with a `title="Blocked by: …"` tooltip listing the deps; expanded-card header gains a full-width `Blocked by: …` line. Both gated on `w.blocked_by && w.blocked_by.length` so older scheduler payloads (before 5.4.2) silently render as before.
+- **CSS** (`style.css`): two new classes — `.blocked-suffix` (inline yellow accent) and `.workflow-blocked-line` (full-width row in the detail card header). Both use `#fbbf24` (the project's existing warning amber, also used by the freshness/pending palette) so the new annotation slots into the existing visual vocabulary without a fresh palette decision.
+
+5 new tests (workspace 791 → 796):
+- 2 in `clhorde-scheduler::commands`: `flow status <name>` against a Queued workflow with a Drafted dep emits both `depends_on: base (drafted)` and `blocked_by: base`; against a Queued workflow with an Archived dep, the line annotates `(archived)` and `blocked_by:` is absent. Existing test (`status_for_specific_workflow_dumps_detail`) was strengthened to assert `(not found)` annotation when the dep is missing.
+- 2 in `clhorde-tui::ui::tests`: `workflow_line` includes `· blocked` when `blocked_by` is non-empty; absent when it's empty.
+- 1 in `clhorde-web::ws::tests`: the `scheduler_message` envelope wrapping a `WorkflowUpdated` carries `blocked_by` as a JSON array (so the SPA can read it directly off the WS frame, not as a stringified inner value).
+
+The Web layer doesn't have a JS test harness, so the SPA-side rendering relies on the wire-shape test above + the round-trip tests added in 5.4.2.
 
 Open questions (to resolve during 5.4.1):
 
@@ -721,7 +731,7 @@ Open questions (to resolve during 5.4.1):
 | **5.3.3** | ✅ shipped | Web: `SubscribeAllDetails` + bridge fan-in + SPA push handler | SPA reaches push parity with the TUI — 8 new tests. |
 | **5.4.1** | ✅ shipped | Inter-workflow deps: gate in `advance_queued` + cycle detection + dep-failure propagation | Pure orchestrator logic — 22 new tests. |
 | **5.4.2** | ✅ shipped | `blocked_by: Vec<String>` on Summary + Detail; populate via evaluator; back-compat round-trip | Wire surface so push events carry the "why blocked" — 6 new tests. |
-| **5.4.3** | ⏳ pending | CLI `flow status` enriched + TUI badge suffix + Web badge + Blocked-by line | Presentation layer — no logic, just rendering. |
+| **5.4.3** | ✅ shipped | CLI `flow status` enriched + TUI badge suffix + Web badge + Blocked-by line | Presentation layer — 5 new tests. |
 | **5.x** | ⏳ pending | Advanced (parallel safety, hooks, multi-repo, manual `--ignore-deps`) | Polish. |
 
 Each phase is independently shippable. Phase 0 alone is already a feature win; Phase 2.4 already produces value for users who want a scriptable workflow runner.

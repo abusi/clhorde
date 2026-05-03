@@ -195,6 +195,21 @@ fn render_workflow_detail_view(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Red),
         )));
     }
+    if !detail.blocked_by.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "Blocked by: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                detail.blocked_by.join(", "),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
     if !lines.is_empty() {
         lines.push(Line::from(""));
     }
@@ -531,6 +546,17 @@ fn workflow_line(w: &WorkflowSummary) -> Line<'static> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
     ];
+    // Surface the inter-workflow dep gate alongside the status badge.
+    // Kept outside the padded label so the rest of the row stays aligned.
+    if !w.blocked_by.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            "· blocked",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(reason) = &w.failure_reason {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -2210,4 +2236,50 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let paragraph = Paragraph::new(Line::from(spans));
     f.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clhorde_core::control::WorkflowSummary;
+
+    fn summary(name: &str, status: &str, blocked_by: Vec<String>) -> WorkflowSummary {
+        WorkflowSummary {
+            name: name.into(),
+            status: status.into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            prompt_ids: vec![],
+            blocked_by,
+        }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn workflow_line_appends_blocked_suffix_when_blocked_by_non_empty() {
+        let s = summary("alpha", "queued", vec!["base".into()]);
+        let line = workflow_line(&s);
+        let text = line_text(&line);
+        assert!(
+            text.contains("· blocked"),
+            "expected blocked suffix in: {text}"
+        );
+    }
+
+    #[test]
+    fn workflow_line_omits_blocked_suffix_when_blocked_by_empty() {
+        let s = summary("alpha", "queued", vec![]);
+        let line = workflow_line(&s);
+        let text = line_text(&line);
+        assert!(
+            !text.contains("blocked"),
+            "blocked suffix should not appear for unblocked queued workflow: {text}"
+        );
+    }
 }

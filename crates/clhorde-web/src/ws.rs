@@ -586,6 +586,31 @@ mod tests {
         assert_eq!(json["event"]["summary"]["status"], "implementing");
     }
 
+    #[test]
+    fn scheduler_message_workflow_updated_carries_blocked_by_when_populated() {
+        // SPA reads detail.blocked_by directly off the WS frame to render
+        // the "· blocked" suffix and the "Blocked by:" detail line. Make
+        // sure the field lands in the envelope as a JSON array, not a
+        // serialized inner string or a stringified vec.
+        let summary = clhorde_core::control::WorkflowSummary {
+            name: "x".into(),
+            status: "queued".into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            prompt_ids: vec![],
+            blocked_by: vec!["base".into(), "shared".into()],
+        };
+        let event = SchedulerEvent::WorkflowUpdated { summary };
+        let msg = scheduler_message(&event).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let blocked = &json["event"]["summary"]["blocked_by"];
+        assert_eq!(blocked, &serde_json::json!(["base", "shared"]));
+    }
+
     fn detail_for_envelope(name: &str, status: &str) -> clhorde_core::control::WorkflowDetail {
         clhorde_core::control::WorkflowDetail {
             name: name.into(),
