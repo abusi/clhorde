@@ -11,6 +11,7 @@ use crate::editor::TextBuffer;
 use crate::key_encoding;
 use crate::keymap::{FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction};
 use crate::pty_renderer::PtyRenderer;
+use clhorde_core::control::WorkflowSummary;
 use clhorde_core::prompt::{PromptMode, PromptStatus};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent, DaemonState, PromptInfo};
 
@@ -23,6 +24,25 @@ pub enum AppMode {
     /// Raw keystroke forwarding to PTY worker.
     PtyInteract,
     Filter,
+}
+
+/// Top-level tab in the TUI. The existing prompt-list/output split
+/// becomes the [`RootView::Prompts`] body; the other two views host
+/// scheduler-driven panes (read-only in Phase 4.1; actions arrive in
+/// 4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RootView {
+    /// Existing prompt list + output panel (the only view available
+    /// before Phase 4).
+    #[default]
+    Prompts,
+    /// `openspec/changes/<X>/` directories without a `.clhorde-ready`
+    /// marker — work-in-progress drafts the user is still iterating
+    /// on. Sourced from the running scheduler via the control socket.
+    Drafts,
+    /// Queued + running + recently-finished workflows. Sourced from
+    /// the same scheduler control socket.
+    Workflows,
 }
 
 pub struct App {
@@ -109,6 +129,28 @@ pub struct App {
     pub visual_select_active: bool,
     /// Whether batch delete confirmation dialog is showing.
     pub confirm_batch_delete: bool,
+
+    // ── Phase 4: top-level tabs ──
+    /// Which top-level tab the user is looking at.
+    pub root_view: RootView,
+    /// Drafts list, populated by the scheduler control socket. Empty
+    /// when the scheduler is unreachable.
+    pub drafts: Vec<String>,
+    /// Workflows list (queued + active + recently-finished), keyed by
+    /// the `WorkflowSummary` order returned by the scheduler.
+    pub workflows: Vec<WorkflowSummary>,
+    /// Selection index for the Drafts tab (saturating against
+    /// `drafts.len()`).
+    pub drafts_selected: usize,
+    /// Selection index for the Workflows tab.
+    pub workflows_selected: usize,
+    /// Whether the most recent scheduler poll succeeded. `false` means
+    /// the Drafts/Workflows panes show a "scheduler not running" hint
+    /// instead of stale data.
+    pub scheduler_reachable: bool,
+    /// Last time the Drafts/Workflows data was refreshed; used by the
+    /// main loop to throttle polling.
+    pub scheduler_last_poll: Option<Instant>,
 }
 
 impl App {
@@ -166,6 +208,14 @@ impl App {
             selected_ids: HashSet::new(),
             visual_select_active: false,
             confirm_batch_delete: false,
+
+            root_view: RootView::default(),
+            drafts: Vec::new(),
+            workflows: Vec::new(),
+            drafts_selected: 0,
+            workflows_selected: 0,
+            scheduler_reachable: false,
+            scheduler_last_poll: None,
         }
     }
 
@@ -505,6 +555,187 @@ impl App {
         self.last_pty_size = Some((cols, rows));
     }
 
+    // ── Root-view (Phase 4) helpers ──
+
+    /// Switch the active top-level tab. Does not currently flip out of
+    /// non-Normal modes — switching while in Insert/Filter/etc. would
+    /// be confusing because those modes don't apply to Drafts/Workflows
+    /// anyway. The dispatch in `handle_key` only checks the digit keys
+    /// from Normal.
+    pub fn set_root_view(&mut self, view: RootView) {
+        if self.root_view == view {
+            return;
+        }
+        self.root_view = view;
+        // Clamp selections so a switch back doesn't land out of bounds
+        // after the underlying lists change.
+        if self.drafts_selected >= self.drafts.len() {
+            self.drafts_selected = self.drafts.len().saturating_sub(1);
+        }
+        if self.workflows_selected >= self.workflows.len() {
+            self.workflows_selected = self.workflows.len().saturating_sub(1);
+        }
+        // Force a poll on next tick when switching to a scheduler-backed
+        // tab so the user sees fresh data immediately rather than waiting
+        // for the next throttled poll.
+        if matches!(view, RootView::Drafts | RootView::Workflows) {
+            self.scheduler_last_poll = None;
+        }
+    }
+
+    /// Handle a key while the active tab is Drafts or Workflows. Phase
+    /// 4.1 ships only navigation + refresh + tab switching + quit;
+    /// actions (Q queue, X cancel, T retry, …) come in Phase 4.2.
+    fn handle_root_view_key(&mut self, key: KeyEvent) {
+        // Esc returns to the Prompts tab so the user can always bail
+        // back to the familiar view with one keystroke.
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+            self.set_root_view(RootView::Prompts);
+            return;
+        }
+        // q quits (same semantics as the Prompts tab).
+        if key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::NONE {
+            if self.active_workers > 0 {
+                self.confirm_quit = true;
+            } else {
+                self.should_quit = true;
+            }
+            return;
+        }
+        // r forces an immediate scheduler refresh on the next tick.
+        if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::NONE {
+            self.scheduler_last_poll = None;
+            return;
+        }
+        // Show the help overlay (matches the Normal-tab `?` binding).
+        if key.code == KeyCode::Char('?') && key.modifiers == KeyModifiers::NONE {
+            self.show_help_overlay = true;
+            return;
+        }
+        // j / Down — move selection down; k / Up — move up.
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.root_view_select_next(),
+            KeyCode::Char('k') | KeyCode::Up => self.root_view_select_prev(),
+            KeyCode::Char('g') => self.root_view_select_first(),
+            KeyCode::Char('G') => self.root_view_select_last(),
+            _ => {}
+        }
+    }
+
+    fn root_view_select_next(&mut self) {
+        match self.root_view {
+            RootView::Drafts => {
+                let len = self.drafts.len();
+                if len > 0 {
+                    self.drafts_selected = (self.drafts_selected + 1).min(len - 1);
+                }
+            }
+            RootView::Workflows => {
+                let len = self.workflows.len();
+                if len > 0 {
+                    self.workflows_selected = (self.workflows_selected + 1).min(len - 1);
+                }
+            }
+            RootView::Prompts => {}
+        }
+    }
+
+    fn root_view_select_prev(&mut self) {
+        match self.root_view {
+            RootView::Drafts => {
+                self.drafts_selected = self.drafts_selected.saturating_sub(1);
+            }
+            RootView::Workflows => {
+                self.workflows_selected = self.workflows_selected.saturating_sub(1);
+            }
+            RootView::Prompts => {}
+        }
+    }
+
+    fn root_view_select_first(&mut self) {
+        match self.root_view {
+            RootView::Drafts => self.drafts_selected = 0,
+            RootView::Workflows => self.workflows_selected = 0,
+            RootView::Prompts => {}
+        }
+    }
+
+    fn root_view_select_last(&mut self) {
+        match self.root_view {
+            RootView::Drafts => {
+                self.drafts_selected = self.drafts.len().saturating_sub(1);
+            }
+            RootView::Workflows => {
+                self.workflows_selected = self.workflows.len().saturating_sub(1);
+            }
+            RootView::Prompts => {}
+        }
+    }
+
+    /// Apply the result of a `ControlRequest::Status { name: None }`
+    /// poll: split the returned workflows into drafts (status == drafted)
+    /// and the rest, while preserving the user's current selection on
+    /// each list when possible.
+    ///
+    /// This is the single entry point both Drafts and Workflows tabs
+    /// feed off — we only ever issue one scheduler request per poll.
+    pub fn apply_scheduler_status(&mut self, summaries: Vec<WorkflowSummary>) {
+        let prev_draft = self.drafts.get(self.drafts_selected).cloned();
+        let prev_workflow = self
+            .workflows
+            .get(self.workflows_selected)
+            .map(|w| w.name.clone());
+
+        let mut drafts: Vec<String> = summaries
+            .iter()
+            .filter(|s| s.status == "drafted")
+            .map(|s| s.name.clone())
+            .collect();
+        drafts.sort();
+        let workflows: Vec<WorkflowSummary> = summaries
+            .into_iter()
+            .filter(|s| s.status != "drafted")
+            .collect();
+
+        self.drafts = drafts;
+        self.workflows = workflows;
+
+        if let Some(n) = prev_draft {
+            if let Some(idx) = self.drafts.iter().position(|name| *name == n) {
+                self.drafts_selected = idx;
+            } else {
+                self.drafts_selected =
+                    self.drafts_selected.min(self.drafts.len().saturating_sub(1));
+            }
+        } else {
+            self.drafts_selected =
+                self.drafts_selected.min(self.drafts.len().saturating_sub(1));
+        }
+        if let Some(n) = prev_workflow {
+            if let Some(idx) = self.workflows.iter().position(|w| w.name == n) {
+                self.workflows_selected = idx;
+            } else {
+                self.workflows_selected = self
+                    .workflows_selected
+                    .min(self.workflows.len().saturating_sub(1));
+            }
+        } else {
+            self.workflows_selected = self
+                .workflows_selected
+                .min(self.workflows.len().saturating_sub(1));
+        }
+
+        self.scheduler_reachable = true;
+        self.scheduler_last_poll = Some(Instant::now());
+    }
+
+    /// Mark the most recent scheduler poll as failed so the UI shows a
+    /// hint instead of a stale list.
+    pub fn note_scheduler_unreachable(&mut self) {
+        self.scheduler_reachable = false;
+        self.scheduler_last_poll = Some(Instant::now());
+    }
+
     // ── Key handling ──
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -543,6 +774,38 @@ impl App {
                 }
                 _ => self.confirm_batch_delete = false,
             }
+            return;
+        }
+
+        // Top-level tab switching: the digit keys 1/2/3 switch the
+        // root view from any non-modal mode. We do this before the
+        // per-mode dispatch so it works even from Insert (where '1'
+        // would otherwise just type a character) — but only when no
+        // input is being composed. In Insert/Filter/Interact/PtyInteract
+        // the digits remain available as text.
+        if self.mode == AppMode::Normal && key.modifiers == KeyModifiers::NONE {
+            match key.code {
+                KeyCode::Char('1') => {
+                    self.set_root_view(RootView::Prompts);
+                    return;
+                }
+                KeyCode::Char('2') => {
+                    self.set_root_view(RootView::Drafts);
+                    return;
+                }
+                KeyCode::Char('3') => {
+                    self.set_root_view(RootView::Workflows);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Drafts and Workflows tabs route their own keys (j/k navigation,
+        // q to quit, 1/2/3 to switch back). The existing prompt-list
+        // shortcuts only apply when the user is on the Prompts tab.
+        if self.mode == AppMode::Normal && self.root_view != RootView::Prompts {
+            self.handle_root_view_key(key);
             return;
         }
 
@@ -1932,6 +2195,14 @@ mod tests {
             selected_ids: HashSet::new(),
             visual_select_active: false,
             confirm_batch_delete: false,
+
+            root_view: RootView::default(),
+            drafts: Vec::new(),
+            workflows: Vec::new(),
+            drafts_selected: 0,
+            workflows_selected: 0,
+            scheduler_reachable: false,
+            scheduler_last_poll: None,
         };
         app.list_state.select(None);
         (app, daemon_rx)
@@ -2678,5 +2949,147 @@ mod tests {
         });
 
         assert_eq!(app.prompts[0].output.as_deref(), Some("new full output"));
+    }
+
+    // ── Phase 4: RootView + scheduler-status integration ──
+
+    use std::time::Duration;
+
+    fn key_press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn summary(name: &str, status: &str) -> WorkflowSummary {
+        WorkflowSummary {
+            name: name.into(),
+            status: status.into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            prompt_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn root_view_default_is_prompts() {
+        let (app, _rx) = new_test_app();
+        assert_eq!(app.root_view, RootView::Prompts);
+    }
+
+    #[test]
+    fn digit_keys_switch_root_view() {
+        let (mut app, _rx) = new_test_app();
+        app.handle_key(key_press(KeyCode::Char('2')));
+        assert_eq!(app.root_view, RootView::Drafts);
+        app.handle_key(key_press(KeyCode::Char('3')));
+        assert_eq!(app.root_view, RootView::Workflows);
+        app.handle_key(key_press(KeyCode::Char('1')));
+        assert_eq!(app.root_view, RootView::Prompts);
+    }
+
+    #[test]
+    fn esc_on_drafts_returns_to_prompts() {
+        let (mut app, _rx) = new_test_app();
+        app.set_root_view(RootView::Drafts);
+        app.handle_key(key_press(KeyCode::Esc));
+        assert_eq!(app.root_view, RootView::Prompts);
+    }
+
+    #[test]
+    fn r_key_forces_immediate_repoll() {
+        let (mut app, _rx) = new_test_app();
+        app.set_root_view(RootView::Workflows);
+        // Pretend we polled five seconds ago.
+        app.scheduler_last_poll = Some(Instant::now() - Duration::from_secs(5));
+        app.handle_key(key_press(KeyCode::Char('r')));
+        assert!(app.scheduler_last_poll.is_none());
+    }
+
+    #[test]
+    fn switching_into_scheduler_tab_clears_poll_timer() {
+        let (mut app, _rx) = new_test_app();
+        app.scheduler_last_poll = Some(Instant::now());
+        app.set_root_view(RootView::Drafts);
+        assert!(app.scheduler_last_poll.is_none());
+    }
+
+    #[test]
+    fn apply_scheduler_status_splits_drafts_from_workflows() {
+        let (mut app, _rx) = new_test_app();
+        app.apply_scheduler_status(vec![
+            summary("a-draft", "drafted"),
+            summary("running-flow", "implementing"),
+            summary("b-draft", "drafted"),
+            summary("done-flow", "archived"),
+        ]);
+        assert_eq!(app.drafts, vec!["a-draft", "b-draft"]); // sorted
+        assert_eq!(
+            app.workflows.iter().map(|w| w.name.clone()).collect::<Vec<_>>(),
+            vec!["running-flow", "done-flow"]
+        );
+        assert!(app.scheduler_reachable);
+    }
+
+    #[test]
+    fn apply_scheduler_status_preserves_selection_by_name() {
+        let (mut app, _rx) = new_test_app();
+        // Initial poll: 3 workflows, select the middle one.
+        app.apply_scheduler_status(vec![
+            summary("a", "queued"),
+            summary("b", "implementing"),
+            summary("c", "verifying"),
+        ]);
+        app.workflows_selected = 1;
+        // Refresh: reorder + add. The selection should follow "b".
+        app.apply_scheduler_status(vec![
+            summary("c", "verifying"),
+            summary("b", "implementing"),
+            summary("a", "queued"),
+            summary("d", "queued"),
+        ]);
+        assert_eq!(
+            app.workflows[app.workflows_selected].name,
+            "b".to_string()
+        );
+    }
+
+    #[test]
+    fn note_unreachable_sets_flag() {
+        let (mut app, _rx) = new_test_app();
+        app.note_scheduler_unreachable();
+        assert!(!app.scheduler_reachable);
+        assert!(app.scheduler_last_poll.is_some());
+    }
+
+    #[test]
+    fn navigation_clamped_to_list_bounds() {
+        let (mut app, _rx) = new_test_app();
+        app.set_root_view(RootView::Drafts);
+        app.apply_scheduler_status(vec![
+            summary("x", "drafted"),
+            summary("y", "drafted"),
+        ]);
+        // j past end → stays at last index.
+        app.handle_key(key_press(KeyCode::Char('j')));
+        app.handle_key(key_press(KeyCode::Char('j')));
+        app.handle_key(key_press(KeyCode::Char('j')));
+        assert_eq!(app.drafts_selected, 1);
+        // k past beginning → stays at 0.
+        for _ in 0..5 {
+            app.handle_key(key_press(KeyCode::Char('k')));
+        }
+        assert_eq!(app.drafts_selected, 0);
+    }
+
+    #[test]
+    fn prompts_tab_keys_unaffected() {
+        // Sanity check: the existing prompt-list shortcuts still fire
+        // when on the Prompts tab. We pick `i` (Insert) as the canary.
+        let (mut app, _rx) = new_test_app();
+        assert_eq!(app.root_view, RootView::Prompts);
+        app.handle_key(key_press(KeyCode::Char('i')));
+        assert_eq!(app.mode, AppMode::Insert);
     }
 }

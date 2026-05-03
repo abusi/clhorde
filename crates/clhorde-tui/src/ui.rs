@@ -8,13 +8,20 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, AppMode};
+use crate::app::{App, AppMode, RootView};
 use crate::keymap::{NormalAction, ViewAction};
 use crate::pty_renderer::PtyRenderer;
+use clhorde_core::control::WorkflowSummary;
 use clhorde_core::prompt::{PromptMode, PromptStatus};
 
 pub fn render(f: &mut Frame, app: &mut App) {
-    let input_bar_height = if app.mode == AppMode::Insert && app.input.is_multiline() {
+    // Drafts and Workflows tabs don't have an input bar — they're
+    // navigation views with no text composition. Reclaim the space so
+    // the list fills the panel.
+    let on_prompts_tab = app.root_view == RootView::Prompts;
+    let input_bar_height = if !on_prompts_tab {
+        0
+    } else if app.mode == AppMode::Insert && app.input.is_multiline() {
         (app.input.line_count() as u16 + 2).clamp(3, 10) // +2 for borders
     } else {
         3
@@ -23,6 +30,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),                // status bar (1 content + bottom border)
+            Constraint::Length(1),                // tab bar (Phase 4)
             Constraint::Min(5),                   // main area
             Constraint::Length(input_bar_height), // input bar
             Constraint::Length(1),                // help bar
@@ -30,16 +38,20 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     render_status_bar(f, app, chunks[0]);
-    render_main_area(f, app, chunks[1]);
-    render_input_bar(f, app, chunks[2]);
-    render_help_bar(f, app, chunks[3]);
-    render_suggestions(f, app, chunks[2]);
-    render_template_suggestions(f, app, chunks[2]);
+    render_tab_bar(f, app, chunks[1]);
+    render_main_area_dispatch(f, app, chunks[2]);
+    if on_prompts_tab {
+        render_input_bar(f, app, chunks[3]);
+        render_suggestions(f, app, chunks[3]);
+        render_template_suggestions(f, app, chunks[3]);
+    }
+    render_help_bar(f, app, chunks[4]);
 
     if app.show_quick_prompts_popup
+        && on_prompts_tab
         && (app.mode == AppMode::ViewOutput || app.mode == AppMode::PtyInteract)
     {
-        render_quick_prompts_popup(f, app, chunks[1]);
+        render_quick_prompts_popup(f, app, chunks[2]);
     }
 
     if app.confirm_quit {
@@ -52,6 +64,243 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     if app.show_help_overlay {
         render_help_overlay(f, app, f.area());
+    }
+}
+
+fn render_main_area_dispatch(f: &mut Frame, app: &mut App, area: Rect) {
+    match app.root_view {
+        RootView::Prompts => render_main_area(f, app, area),
+        RootView::Drafts => render_drafts_view(f, app, area),
+        RootView::Workflows => render_workflows_view(f, app, area),
+    }
+}
+
+/// Top-of-screen tab bar: `[1] Prompts  [2] Drafts  [3] Workflows`.
+/// The active tab is highlighted; the digit prefix doubles as a visible
+/// reminder of the keybinding.
+fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+    let mut spans = Vec::with_capacity(7);
+    let pad = Span::raw("  ");
+    for (i, (digit, label, view)) in [
+        ('1', "Prompts", RootView::Prompts),
+        ('2', "Drafts", RootView::Drafts),
+        ('3', "Workflows", RootView::Workflows),
+    ]
+    .iter()
+    .enumerate()
+    {
+        if i > 0 {
+            spans.push(pad.clone());
+        }
+        let active = app.root_view == *view;
+        let fg = if active { Color::Black } else { Color::Gray };
+        let bg = if active {
+            Color::Cyan
+        } else {
+            Color::Rgb(30, 30, 40)
+        };
+        let modifier = if active {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        };
+        spans.push(Span::styled(
+            format!(" [{digit}] {label} "),
+            Style::default().fg(fg).bg(bg).add_modifier(modifier),
+        ));
+    }
+    let para = Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+    f.render_widget(para, area);
+}
+
+/// Drafts tab: list of `openspec/changes/<X>/` directories without a
+/// `.clhorde-ready` marker. Polled from the scheduler control socket.
+fn render_drafts_view(f: &mut Frame, app: &App, area: Rect) {
+    let title = format!(" Drafts ({}) ", app.drafts.len());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    if !app.scheduler_reachable {
+        let body = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  scheduler not reachable",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Start it with: clhorde-scheduler daemon",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  (press 'r' to retry)",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(body).block(block), area);
+        return;
+    }
+
+    if app.drafts.is_empty() {
+        let body = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  no drafts",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Drafts appear when openspec/changes/<X>/ exists",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "  without a .clhorde-ready marker.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(body).block(block), area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .drafts
+        .iter()
+        .map(|n| ListItem::new(Line::from(Span::raw(format!("  {n}")))))
+        .collect();
+    let mut state = ListState::default();
+    if !app.drafts.is_empty() {
+        state.select(Some(app.drafts_selected.min(app.drafts.len() - 1)));
+    }
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(50, 50, 80))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▌ ");
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+/// Workflows tab: queued + running + recent terminal workflows. One
+/// line per workflow showing status and (if present) a short suffix.
+fn render_workflows_view(f: &mut Frame, app: &App, area: Rect) {
+    let title = format!(" Workflows ({}) ", app.workflows.len());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    if !app.scheduler_reachable {
+        let body = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  scheduler not reachable",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Start it with: clhorde-scheduler daemon",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  (press 'r' to retry)",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(body).block(block), area);
+        return;
+    }
+
+    if app.workflows.is_empty() {
+        let body = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  no workflows",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  A workflow is created when a change is queued",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "  (writing openspec/changes/<X>/.clhorde-ready).",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(body).block(block), area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .workflows
+        .iter()
+        .map(|w| ListItem::new(workflow_line(w)))
+        .collect();
+    let mut state = ListState::default();
+    if !app.workflows.is_empty() {
+        state.select(Some(
+            app.workflows_selected.min(app.workflows.len() - 1),
+        ));
+    }
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(50, 50, 80))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▌ ");
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn workflow_line(w: &WorkflowSummary) -> Line<'static> {
+    let (color, label) = workflow_status_style(&w.status);
+    let mut spans: Vec<Span> = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<24}", w.name),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{label:<13}"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(reason) = &w.failure_reason {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            reason.clone(),
+            Style::default().fg(Color::Red),
+        ));
+    } else if w.priority != 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("p={}", w.priority),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn workflow_status_style(status: &str) -> (Color, &'static str) {
+    match status {
+        "drafted" => (Color::DarkGray, "drafted"),
+        "queued" => (Color::Yellow, "queued"),
+        "implementing" => (Color::Cyan, "implementing"),
+        "verifying" => (Color::Blue, "verifying"),
+        "archiving" => (Color::Magenta, "archiving"),
+        "archived" => (Color::Green, "archived"),
+        "cancelled" => (Color::DarkGray, "cancelled"),
+        "failed" => (Color::Red, "failed"),
+        _ => (Color::Gray, "?"),
     }
 }
 
@@ -1458,6 +1707,57 @@ fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    // On Drafts / Workflows tabs the keymap is much smaller — the
+    // existing per-mode hints don't apply. Surface the navigation +
+    // refresh + tab-switch keys instead.
+    if app.mode == AppMode::Normal && app.root_view != RootView::Prompts {
+        let label = match app.root_view {
+            RootView::Drafts => "drafts",
+            RootView::Workflows => "workflows",
+            RootView::Prompts => "prompts",
+        };
+        let bindings: Vec<(String, &str)> = vec![
+            ("j/k".to_string(), "navigate"),
+            ("r".to_string(), "refresh"),
+            ("1/2/3".to_string(), "switch tab"),
+            ("Esc".to_string(), "→ Prompts"),
+            ("?".to_string(), "help"),
+            ("q".to_string(), "quit"),
+        ];
+        let mut spans: Vec<Span> = vec![
+            Span::raw(" "),
+            Span::styled(
+                format!("{label:<10}"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ];
+        for (i, (key, desc)) in bindings.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(
+                    "  ",
+                    Style::default().fg(Color::Rgb(60, 60, 60)),
+                ));
+            }
+            spans.push(Span::styled(
+                key.as_str(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                *desc,
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        let para = Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(Color::Rgb(20, 20, 30)));
+        f.render_widget(para, area);
+        return;
+    }
+
     let bindings: Vec<(String, &str)> = match app.mode {
         AppMode::Normal if app.visual_select_active => {
             vec![

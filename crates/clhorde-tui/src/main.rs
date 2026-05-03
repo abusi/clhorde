@@ -5,10 +5,11 @@ mod ipc_client;
 mod key_encoding;
 mod keymap;
 mod pty_renderer;
+mod scheduler_client;
 mod ui;
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -22,10 +23,29 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use app::App;
+use app::{App, RootView};
+use clhorde_core::control::{ControlRequest, ControlResponse};
 use clhorde_core::protocol::ClientRequest;
 use cli::{CliAction, LaunchOptions};
 use ipc_client::DaemonMessage;
+use scheduler_client::SchedulerError;
+
+/// How often the TUI polls the scheduler when sitting on a Drafts /
+/// Workflows tab. Fast enough that newly-queued workflows show up
+/// without conscious effort, slow enough that the scheduler isn't
+/// hammered.
+const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Result fed back from a spawned scheduler poll. The main loop
+/// consumes these and updates `App` state accordingly.
+enum SchedulerPollOutcome {
+    Status(Vec<clhorde_core::control::WorkflowSummary>),
+    Unreachable,
+    /// Anything else (timeout, decode error, …). Treated identically to
+    /// Unreachable for the user-visible hint, but logged separately
+    /// in the future if we add tracing.
+    Other,
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -111,6 +131,13 @@ async fn run_app(
     let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
     let mut reconnect_interval = tokio::time::interval(Duration::from_secs(2));
 
+    // Channel + flag for scheduler polling. We only ever have one poll
+    // in flight at a time; the flag prevents a slow scheduler from
+    // being hit again on the next tick.
+    let (sched_tx, mut sched_rx) =
+        mpsc::unbounded_channel::<SchedulerPollOutcome>();
+    let mut sched_in_flight = false;
+
     loop {
         terminal.draw(|f| ui::render(f, &mut app))?;
 
@@ -167,6 +194,44 @@ async fn run_app(
             _ = tick_interval.tick() => {
                 app.tick = app.tick.wrapping_add(1);
                 app.clear_expired_status();
+
+                // Phase 4: when the user is on Drafts/Workflows, poll
+                // the scheduler periodically (or immediately, if the
+                // user just switched in). Fire-and-forget — the result
+                // arrives on `sched_rx`.
+                if !sched_in_flight && needs_scheduler_poll(&app) {
+                    sched_in_flight = true;
+                    let tx = sched_tx.clone();
+                    tokio::spawn(async move {
+                        let outcome = match scheduler_client::request(
+                            ControlRequest::Status { name: None },
+                        )
+                        .await
+                        {
+                            Ok(ControlResponse::Status { workflows }) => {
+                                SchedulerPollOutcome::Status(workflows)
+                            }
+                            Ok(_) => SchedulerPollOutcome::Other,
+                            Err(SchedulerError::Unreachable(_)) => {
+                                SchedulerPollOutcome::Unreachable
+                            }
+                            Err(_) => SchedulerPollOutcome::Other,
+                        };
+                        let _ = tx.send(outcome);
+                    });
+                }
+            }
+            Some(outcome) = sched_rx.recv() => {
+                sched_in_flight = false;
+                match outcome {
+                    SchedulerPollOutcome::Status(summaries) => {
+                        app.apply_scheduler_status(summaries);
+                    }
+                    SchedulerPollOutcome::Unreachable
+                    | SchedulerPollOutcome::Other => {
+                        app.note_scheduler_unreachable();
+                    }
+                }
             }
             _ = reconnect_interval.tick(), if !app.connected => {
                 if let Ok((new_tx, new_rx)) = ipc_client::connect().await {
@@ -192,6 +257,21 @@ async fn run_app(
             // TUI disconnects — daemon keeps running, workers continue
             return Ok(());
         }
+    }
+}
+
+/// Returns true if the next tick should kick off a scheduler poll.
+/// Conditions: user is on a scheduler-backed tab, AND either we've
+/// never polled or enough time has elapsed since the last poll. The
+/// app sets `scheduler_last_poll = None` when the user switches into a
+/// scheduler tab so the first poll fires immediately.
+fn needs_scheduler_poll(app: &App) -> bool {
+    if !matches!(app.root_view, RootView::Drafts | RootView::Workflows) {
+        return false;
+    }
+    match app.scheduler_last_poll {
+        None => true,
+        Some(t) => Instant::now().duration_since(t) >= SCHEDULER_POLL_INTERVAL,
     }
 }
 
