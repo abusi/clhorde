@@ -8,14 +8,10 @@ use crate::pty_worker::PtyHandle;
 use clhorde_core::prompt::PromptMode;
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum WorkerMessage {
     OutputChunk {
         prompt_id: usize,
         text: String,
-    },
-    TurnComplete {
-        prompt_id: usize,
     },
     Finished {
         prompt_id: usize,
@@ -26,7 +22,6 @@ pub enum WorkerMessage {
         error: String,
     },
     PtyUpdate {
-        #[allow(dead_code)]
         prompt_id: usize,
     },
     SessionId {

@@ -38,17 +38,13 @@ struct PendingRequest {
 
 /// PTY bytes received from the daemon.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PtyFrame {
     pub prompt_id: usize,
     pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum BridgeError {
-    /// Not currently connected to the daemon.
-    NotConnected,
     /// Connection was lost while waiting for a response.
     Disconnected,
     /// Failed to serialize the request.
@@ -60,7 +56,6 @@ pub enum BridgeError {
 impl std::fmt::Display for BridgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BridgeError::NotConnected => write!(f, "not connected to daemon"),
             BridgeError::Disconnected => write!(f, "disconnected from daemon"),
             BridgeError::Serialize(e) => write!(f, "serialize error: {e}"),
             BridgeError::SendFailed => write!(f, "failed to send request"),
@@ -150,13 +145,11 @@ impl DaemonBridge {
     }
 
     /// Subscribe to the daemon event broadcast stream.
-    #[allow(dead_code)]
     pub fn subscribe_events(&self) -> broadcast::Receiver<DaemonEvent> {
         self.event_tx.subscribe()
     }
 
     /// Subscribe to the PTY bytes broadcast stream.
-    #[allow(dead_code)]
     pub fn subscribe_pty(&self) -> broadcast::Receiver<PtyFrame> {
         self.pty_tx.subscribe()
     }

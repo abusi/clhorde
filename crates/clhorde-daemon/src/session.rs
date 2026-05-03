@@ -11,7 +11,7 @@ pub struct ClientSession {
 
 pub struct SessionManager {
     sessions: Vec<ClientSession>,
-    #[allow(dead_code)]
+    #[cfg(test)]
     next_session_id: usize,
 }
 
@@ -19,12 +19,13 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: Vec::new(),
+            #[cfg(test)]
             next_session_id: 1,
         }
     }
 
     /// Register a new client, returning its session ID.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn add_session(&mut self, event_tx: mpsc::Sender<DaemonEvent>) -> usize {
         let id = self.next_session_id;
         self.next_session_id += 1;

@@ -6,7 +6,6 @@ pub struct TextBuffer {
     col: usize,
 }
 
-#[allow(dead_code)]
 impl TextBuffer {
     pub fn new() -> Self {
         Self {
@@ -16,6 +15,7 @@ impl TextBuffer {
         }
     }
 
+    #[cfg(test)]
     pub fn from_string(s: &str) -> Self {
         let lines: Vec<String> = if s.is_empty() {
             vec![String::new()]
@@ -43,10 +43,6 @@ impl TextBuffer {
         self.col = 0;
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.lines.len() == 1 && self.lines[0].is_empty()
-    }
-
     pub fn is_multiline(&self) -> bool {
         self.lines.len() > 1
     }
@@ -57,10 +53,6 @@ impl TextBuffer {
 
     pub fn cursor(&self) -> (usize, usize) {
         (self.row, self.col)
-    }
-
-    pub fn lines(&self) -> &[String] {
-        &self.lines
     }
 
     pub fn first_line(&self) -> &str {
@@ -170,11 +162,6 @@ impl TextBuffer {
         self.col = self.lines[self.row].len();
     }
 
-    /// Move cursor to absolute end (last line, end of line).
-    pub fn move_to_end(&mut self) {
-        self.row = self.lines.len() - 1;
-        self.col = self.lines[self.row].len();
-    }
 }
 
 impl std::fmt::Display for TextBuffer {
@@ -219,11 +206,10 @@ mod tests {
     #[test]
     fn new_is_empty() {
         let buf = TextBuffer::new();
-        assert!(buf.is_empty());
+        assert_eq!(buf.to_string(), "");
         assert!(!buf.is_multiline());
         assert_eq!(buf.line_count(), 1);
         assert_eq!(buf.cursor(), (0, 0));
-        assert_eq!(buf.to_string(), "");
     }
 
     #[test]
@@ -240,13 +226,13 @@ mod tests {
         assert_eq!(buf.line_count(), 2);
         assert!(buf.is_multiline());
         assert_eq!(buf.cursor(), (1, 5));
-        assert_eq!(buf.lines(), &["hello", "world"]);
+        assert_eq!(buf.to_string(), "hello\nworld");
     }
 
     #[test]
     fn from_string_empty() {
         let buf = TextBuffer::from_string("");
-        assert!(buf.is_empty());
+        assert_eq!(buf.to_string(), "");
         assert_eq!(buf.cursor(), (0, 0));
     }
 
@@ -257,7 +243,7 @@ mod tests {
         assert_eq!(buf.to_string(), "foo\nbar");
         assert_eq!(buf.cursor(), (1, 3));
         buf.set("");
-        assert!(buf.is_empty());
+        assert_eq!(buf.to_string(), "");
     }
 
     #[test]
@@ -284,7 +270,7 @@ mod tests {
         // Move cursor to after "hello"
         buf.col = 5;
         buf.insert_newline();
-        assert_eq!(buf.lines(), &["hello", " world"]);
+        assert_eq!(buf.to_string(), "hello\n world");
         assert_eq!(buf.cursor(), (1, 0));
     }
 
@@ -413,19 +399,10 @@ mod tests {
     }
 
     #[test]
-    fn move_to_end_multiline() {
-        let mut buf = TextBuffer::from_string("hello\nworld\n!");
-        buf.row = 0;
-        buf.col = 0;
-        buf.move_to_end();
-        assert_eq!(buf.cursor(), (2, 1));
-    }
-
-    #[test]
     fn clear_resets() {
         let mut buf = TextBuffer::from_string("hello\nworld");
         buf.clear();
-        assert!(buf.is_empty());
+        assert_eq!(buf.to_string(), "");
         assert_eq!(buf.cursor(), (0, 0));
     }
 

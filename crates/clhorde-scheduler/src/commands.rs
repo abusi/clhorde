@@ -828,7 +828,6 @@ mod tests {
     }
 
     // Drag args type into compile coverage so they don't bit-rot.
-    #[allow(dead_code)]
     fn _templates_args_compile() {
         let _ = TemplatesArgs {
             action: TemplatesAction::Path,

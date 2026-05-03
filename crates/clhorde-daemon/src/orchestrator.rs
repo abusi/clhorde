@@ -591,28 +591,6 @@ impl Orchestrator {
                 self.sessions
                     .broadcast(&DaemonEvent::OutputChunk { prompt_id, text });
             }
-            WorkerMessage::TurnComplete { prompt_id } => {
-                debug!(prompt_id, "worker turn complete");
-                let mut save = false;
-                if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
-                    if prompt.status == PromptStatus::Running {
-                        if let Some(output) = &mut prompt.output {
-                            output.push('\n');
-                        }
-                        prompt.status = PromptStatus::Idle;
-                        save = true;
-                    }
-                }
-                if save {
-                    self.persist_prompt_by_id(prompt_id);
-                }
-                self.sessions
-                    .broadcast(&DaemonEvent::TurnComplete { prompt_id });
-                if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
-                    let info = self.to_prompt_info(prompt);
-                    self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
-                }
-            }
             WorkerMessage::PtyUpdate { prompt_id } => {
                 self.sessions
                     .broadcast(&DaemonEvent::PtyUpdate { prompt_id });
@@ -2428,17 +2406,6 @@ mod tests {
 
         let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
         assert_eq!(prompt.output.as_deref(), Some("first second"));
-    }
-
-    #[tokio::test]
-    async fn apply_turn_complete_sets_idle() {
-        let mut orch = Orchestrator::new_for_test();
-        insert_prompt(&mut orch, 1, PromptStatus::Running);
-
-        orch.apply_message(WorkerMessage::TurnComplete { prompt_id: 1 });
-
-        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
-        assert_eq!(prompt.status, PromptStatus::Idle);
     }
 
     #[tokio::test]

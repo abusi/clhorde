@@ -536,7 +536,6 @@ impl App {
             }
             // Events we don't need to handle
             DaemonEvent::PtyUpdate { .. }
-            | DaemonEvent::TurnComplete { .. }
             | DaemonEvent::SessionId { .. }
             | DaemonEvent::WorkerStarted { .. }
             | DaemonEvent::Pong

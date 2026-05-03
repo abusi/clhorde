@@ -131,9 +131,6 @@ pub enum DaemonEvent {
         prompt_id: usize,
         error: String,
     },
-    TurnComplete {
-        prompt_id: usize,
-    },
     SessionId {
         prompt_id: usize,
         session_id: String,
