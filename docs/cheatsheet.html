@@ -15,6 +15,7 @@
       <div class="nav-links">
         <a href="guide.html">Guide</a>
         <a href="features.html">Features</a>
+        <a href="scheduler.html">Scheduler</a>
         <a href="keybindings.html">Keys</a>
         <a href="configuration.html">Config</a>
         <a href="cli.html">CLI</a>
@@ -117,6 +118,31 @@
           </table>
         </div>
 
+        <div class="cheat-card">
+          <div class="cheat-card-header normal">Tabs (Normal)</div>
+          <table>
+            <tr><td><kbd>1</kbd></td><td>Prompts tab</td></tr>
+            <tr><td><kbd>2</kbd></td><td>Drafts tab</td></tr>
+            <tr><td><kbd>3</kbd></td><td>Workflows tab</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Back to Prompts</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
+          <div class="cheat-card-header view">Drafts &amp; Workflows</div>
+          <table>
+            <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Navigate</td></tr>
+            <tr><td><kbd>r</kbd></td><td>Force refresh</td></tr>
+            <tr><td><kbd>Q</kbd></td><td>Queue draft (Drafts)</td></tr>
+            <tr><td><kbd>X</kbd></td><td>Cancel workflow (Workflows)</td></tr>
+            <tr><td><kbd>T</kbd></td><td>Retry section (Workflows)</td></tr>
+            <tr><td><kbd>R</kbd></td><td>Open proposal/design in $PAGER</td></tr>
+            <tr><td><kbd>E</kbd></td><td>Continue exploring (Drafts)</td></tr>
+            <tr><td><kbd>Enter</kbd></td><td>Open detail (Workflows)</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Close detail / back to Prompts</td></tr>
+          </table>
+        </div>
+
       </div>
 
       <div class="cheat-grid">
@@ -126,6 +152,8 @@
             <tr><td><code>clhorded &amp;</code></td><td>Start daemon (background)</td></tr>
             <tr><td><code>clhorde</code></td><td>Launch TUI</td></tr>
             <tr><td><code>clhorde-cli</code></td><td>CLI tool</td></tr>
+            <tr><td><code>clhorde-web</code></td><td>HTTP/WebSocket bridge</td></tr>
+            <tr><td><code>clhorde-scheduler daemon</code></td><td>Scheduler watcher</td></tr>
           </table>
         </div>
 
@@ -133,6 +161,8 @@
           <div class="cheat-card-header cli">CLI Commands (clhorde-cli)</div>
           <table>
             <tr><td><code>submit "text"</code></td><td>Submit prompt to daemon</td></tr>
+            <tr><td><code>submit "..." --depends-on 1,2</code></td><td>Submit blocked on others</td></tr>
+            <tr><td><code>submit "..." --worktree-id flow-x</code></td><td>Share a worktree across prompts</td></tr>
             <tr><td><code>status</code></td><td>Show daemon status</td></tr>
             <tr><td><code>attach &lt;id&gt;</code></td><td>Stream prompt output</td></tr>
             <tr><td><code>store list</code></td><td>List stored prompts</td></tr>
@@ -145,21 +175,43 @@
         </div>
 
         <div class="cheat-card">
+          <div class="cheat-card-header cli">Scheduler (clhorde-cli flow)</div>
+          <table>
+            <tr><td><code>flow daemon</code></td><td>Run watcher in cwd</td></tr>
+            <tr><td><code>flow drafts</code></td><td>List unqueued changes</td></tr>
+            <tr><td><code>flow queue &lt;name&gt;</code></td><td>Write <code>.clhorde-ready</code></td></tr>
+            <tr><td><code>flow unqueue &lt;name&gt;</code></td><td>Remove marker</td></tr>
+            <tr><td><code>flow status [name]</code></td><td>Workflow state(s) + <code>blocked_by</code></td></tr>
+            <tr><td><code>flow apply &lt;name&gt;</code></td><td>One-shot dispatch</td></tr>
+            <tr><td><code>flow retry &lt;n&gt; --section 3.2</code></td><td>Re-dispatch a section</td></tr>
+            <tr><td><code>flow cancel &lt;name&gt;</code></td><td>Cancel workflow</td></tr>
+            <tr><td><code>flow archive &lt;name&gt;</code></td><td>Run archive prompt</td></tr>
+            <tr><td><code>flow propose &lt;idea...&gt;</code></td><td>Spawn /opsx:propose</td></tr>
+            <tr><td><code>flow templates path|edit</code></td><td>User template dir</td></tr>
+          </table>
+        </div>
+
+        <div class="cheat-card">
           <div class="cheat-card-header config">Config &amp; Symbols</div>
           <table>
             <tr><td><code>~/.config/clhorde/</code></td><td>Config directory</td></tr>
             <tr><td><code>keymap.toml</code></td><td>Keys, settings, quick prompts</td></tr>
             <tr><td><code>templates.toml</code></td><td>Prompt templates</td></tr>
+            <tr><td><code>scheduler/templates/</code></td><td>User template overrides</td></tr>
             <tr><td><code>~/.local/share/clhorde/</code></td><td>Data directory</td></tr>
             <tr><td><code>daemon.sock</code></td><td>Daemon Unix socket</td></tr>
-            <tr><td><code>daemon.pid</code></td><td>Daemon PID file</td></tr>
+            <tr><td><code>scheduler.sock</code></td><td>Scheduler control socket</td></tr>
+            <tr><td><code>workflows/</code></td><td>Per-workflow JSON</td></tr>
+            <tr><td><code>.clhorde-ready</code></td><td>Hand-off marker (per change)</td></tr>
           </table>
           <table>
             <tr><td>&#10004;</td><td>Completed</td></tr>
             <tr><td>&#8635;</td><td>Running</td></tr>
             <tr><td>&#9203;</td><td>Pending / Queued</td></tr>
+            <tr><td>&#128274;</td><td>Blocked (waiting on deps)</td></tr>
             <tr><td>&#10008;</td><td>Failed</td></tr>
             <tr><td>[WT]</td><td>Worktree enabled</td></tr>
+            <tr><td>&middot; blocked</td><td>Workflow held by inter-workflow dep</td></tr>
             <tr><td>@tag</td><td>Prompt tag</td></tr>
           </table>
         </div>

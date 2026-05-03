@@ -14,6 +14,7 @@
       <div class="nav-links">
         <a href="guide.html">Guide</a>
         <a href="features.html">Features</a>
+        <a href="scheduler.html">Scheduler</a>
         <a href="keybindings.html">Keys</a>
         <a href="configuration.html">Config</a>
         <a href="cli.html">CLI</a>
@@ -173,10 +174,20 @@
     <p>Tag prompts when creating them by including <code>@tag</code> in the prompt text:</p>
     <pre><code>@frontend @urgent Fix the login page CSS</code></pre>
 
+    <h2>Beyond One-off Prompts</h2>
+
+    <p>Once you're comfortable queueing prompts by hand, two layers sit on top:</p>
+
+    <ul>
+      <li><strong><a href="features.html#prompt-dependencies">Prompt dependencies</a></strong> &mdash; submit a prompt that waits on others to complete: <code>clhorde-cli submit "land it" --depends-on 1,2</code>. Useful for ad-hoc pipelines.</li>
+      <li><strong><a href="scheduler.html">Spec-driven workflows</a></strong> &mdash; the new <code>clhorde-scheduler</code> binary watches an <a href="https://openspec.dev/">OpenSpec</a> repo, parses each change's <code>tasks.md</code> into a DAG, and dispatches sections as dependent prompts that share a worktree. Drafts/Workflows tabs show up in the TUI (press <kbd>2</kbd>/<kbd>3</kbd>) and the web dashboard. Drive it from the CLI with <code>clhorde-cli flow</code>.</li>
+    </ul>
+
     <h2>Next Steps</h2>
 
     <ul>
       <li><a href="features.html">Feature deep-dives</a> &mdash; learn about worktrees, batch operations, quick prompts, and more</li>
+      <li><a href="scheduler.html">Scheduler &amp; Workflows</a> &mdash; spec-driven multi-prompt orchestration with OpenSpec</li>
       <li><a href="keybindings.html">Keybinding reference</a> &mdash; complete key reference for all modes</li>
       <li><a href="configuration.html">Configuration</a> &mdash; customize keybindings, templates, and settings</li>
       <li><a href="web.html">Web interface</a> &mdash; browser dashboard, REST API, and WebSocket reference</li>

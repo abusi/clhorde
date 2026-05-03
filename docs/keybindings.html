@@ -14,6 +14,7 @@
       <div class="nav-links">
         <a href="guide.html">Guide</a>
         <a href="features.html">Features</a>
+        <a href="scheduler.html">Scheduler</a>
         <a href="keybindings.html">Keys</a>
         <a href="configuration.html">Config</a>
         <a href="cli.html">CLI</a>
@@ -196,6 +197,99 @@
         <tr><td><kbd>Esc</kbd></td><td>cancel</td><td>Clear filter and return to normal</td></tr>
       </tbody>
     </table>
+
+    <hr>
+
+    <!-- ── Tab Switching ── -->
+    <div class="mode-header">
+      <h2 id="tabs">Tab Switching (any tab)</h2>
+      <span class="mode-badge normal">Normal</span>
+    </div>
+
+    <p>The TUI groups its three top-level views in a tab bar: <strong>Prompts</strong> (default), <strong>Drafts</strong>, and <strong>Workflows</strong>. Switch from Normal mode with the digit keys.</p>
+
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>1</kbd></td><td>tab_prompts</td><td>Show the Prompts tab (the original list/output split)</td></tr>
+        <tr><td><kbd>2</kbd></td><td>tab_drafts</td><td>Show the Drafts tab (OpenSpec changes without a <code>.clhorde-ready</code> marker)</td></tr>
+        <tr><td><kbd>3</kbd></td><td>tab_workflows</td><td>Show the Workflows tab (queued + active + recent terminal)</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>back</td><td>From Drafts/Workflows, returns to Prompts</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Drafts Tab ── -->
+    <div class="mode-header">
+      <h2 id="drafts-tab">Drafts Tab</h2>
+      <span class="mode-badge normal">Drafts</span>
+    </div>
+
+    <p>One row per <code>openspec/changes/&lt;X&gt;/</code> without a marker. Polled live from the scheduler control socket; freshness shown in the title bar.</p>
+
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>j</kbd> / <kbd>Down</kbd></td><td>&mdash;</td><td>Next draft</td></tr>
+        <tr><td><kbd>k</kbd> / <kbd>Up</kbd></td><td>&mdash;</td><td>Previous draft</td></tr>
+        <tr><td><kbd>g</kbd></td><td>&mdash;</td><td>Top</td></tr>
+        <tr><td><kbd>G</kbd></td><td>&mdash;</td><td>Bottom</td></tr>
+        <tr><td><kbd>r</kbd></td><td>&mdash;</td><td>Force a refresh from the scheduler</td></tr>
+        <tr><td><kbd>Q</kbd></td><td>&mdash;</td><td>Queue this draft (writes <code>.clhorde-ready</code>)</td></tr>
+        <tr><td><kbd>E</kbd></td><td>&mdash;</td><td>Continue exploring &mdash; switches to Prompts + Insert with <code>&lt;scheduler-root&gt;: </code> seeded</td></tr>
+        <tr><td><kbd>R</kbd></td><td>&mdash;</td><td>Open <code>proposal.md</code> (fallback <code>design.md</code>) in <code>$PAGER</code></td></tr>
+        <tr><td><kbd>?</kbd></td><td>&mdash;</td><td>Help overlay</td></tr>
+        <tr><td><kbd>q</kbd></td><td>&mdash;</td><td>Quit (confirms if workers active)</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Workflows Tab ── -->
+    <div class="mode-header">
+      <h2 id="workflows-tab">Workflows Tab</h2>
+      <span class="mode-badge view">Workflows</span>
+    </div>
+
+    <p>One row per workflow (queued, running, recently archived/cancelled/failed). Status is color-coded; a yellow <code>&middot; blocked</code> suffix tags any workflow waiting on inter-workflow deps.</p>
+
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>&mdash;</td><td>Navigate</td></tr>
+        <tr><td><kbd>g</kbd> / <kbd>G</kbd></td><td>&mdash;</td><td>Top / bottom</td></tr>
+        <tr><td><kbd>Enter</kbd></td><td>&mdash;</td><td>Open the detail overlay (per-section DAG)</td></tr>
+        <tr><td><kbd>r</kbd></td><td>&mdash;</td><td>Force a refresh</td></tr>
+        <tr><td><kbd>X</kbd></td><td>&mdash;</td><td>Cancel this workflow (also unqueues if still <code>queued</code>)</td></tr>
+        <tr><td><kbd>T</kbd></td><td>&mdash;</td><td>Inline retry-section prompt (accepts dotted decimals like <code>3.2</code>)</td></tr>
+        <tr><td><kbd>R</kbd></td><td>&mdash;</td><td>Open <code>proposal.md</code> / <code>design.md</code> in <code>$PAGER</code></td></tr>
+        <tr><td><kbd>?</kbd></td><td>&mdash;</td><td>Help overlay</td></tr>
+        <tr><td><kbd>q</kbd></td><td>&mdash;</td><td>Quit</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Detail Overlay ── -->
+    <div class="mode-header">
+      <h2 id="detail-overlay">Workflow Detail Overlay</h2>
+      <span class="mode-badge view">Detail</span>
+    </div>
+
+    <p>Press <kbd>Enter</kbd> on a workflow to open. Shows each apply-DAG node (id, label, state, prompt id, exit code, deps) plus the verify and archive singletons. Updates live via push events.</p>
+
+    <table>
+      <thead><tr><th>Key</th><th>Action</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>&mdash;</td><td>Scroll detail</td></tr>
+        <tr><td><kbd>gg</kbd> / <kbd>G</kbd></td><td>&mdash;</td><td>Top / bottom</td></tr>
+        <tr><td><kbd>r</kbd></td><td>&mdash;</td><td>Force-refresh detail (push updates run continuously regardless)</td></tr>
+        <tr><td><kbd>X</kbd></td><td>&mdash;</td><td>Cancel the open workflow</td></tr>
+        <tr><td><kbd>T</kbd></td><td>&mdash;</td><td>Open inline retry-section prompt for the open workflow</td></tr>
+        <tr><td><kbd>R</kbd></td><td>&mdash;</td><td>Open <code>proposal.md</code> / <code>design.md</code> in <code>$PAGER</code></td></tr>
+        <tr><td><kbd>Esc</kbd> / <kbd>Enter</kbd></td><td>&mdash;</td><td>Close overlay</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout info">
+      <div class="callout-title">Where the data comes from</div>
+      <p>Drafts and Workflows are populated over the scheduler control socket at <code>~/.local/share/clhorde/scheduler.sock</code>. If the scheduler isn't running, the panes show a <em>"scheduler not reachable &mdash; start with: clhorde-scheduler daemon"</em> banner. The Prompts tab is unaffected.</p>
+    </div>
 
     <hr>
 

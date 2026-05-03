@@ -14,6 +14,7 @@
       <div class="nav-links">
         <a href="guide.html">Guide</a>
         <a href="features.html">Features</a>
+        <a href="scheduler.html">Scheduler</a>
         <a href="keybindings.html">Keys</a>
         <a href="configuration.html">Config</a>
         <a href="cli.html">CLI</a>
@@ -138,6 +139,16 @@
         <span class="card-icon">&#127760;</span>
         <h3>Web Interface</h3>
         <p>Browser-based <a href="web.html">dashboard</a> with real-time updates via WebSocket. Full xterm.js terminal for interactive prompts. REST API for automation.</p>
+      </div>
+      <div class="card">
+        <span class="card-icon">&#128279;</span>
+        <h3>Prompt Dependencies</h3>
+        <p>Submit a prompt that waits on others: <code>--depends-on 1,2,3</code>. Dependents stay <code>Blocked</code> until every dep completes. Cycles are rejected at submit time.</p>
+      </div>
+      <div class="card">
+        <span class="card-icon">&#9879;</span>
+        <h3>Spec-driven Workflows</h3>
+        <p>The new <a href="scheduler.html">scheduler</a> consumes <a href="https://openspec.dev/">OpenSpec</a> changes, parses <code>tasks.md</code> into a DAG, and dispatches each section as a dependent prompt. Drafts and Workflows tabs in the TUI &amp; web dashboard.</p>
       </div>
     </div>
 
