@@ -159,6 +159,7 @@ mod tests {
                 finished_at: None,
                 prompt_ids: vec![],
             }],
+            root: None,
         };
         spawn_one_shot_server(path.clone(), response.clone()).await;
 

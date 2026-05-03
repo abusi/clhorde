@@ -39,12 +39,19 @@ const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Result fed back from a spawned scheduler poll. The main loop
 /// consumes these and updates `App` state accordingly.
 enum SchedulerPollOutcome {
-    Status(Vec<clhorde_core::control::WorkflowSummary>),
+    Status {
+        workflows: Vec<clhorde_core::control::WorkflowSummary>,
+        root: Option<std::path::PathBuf>,
+    },
     Unreachable,
     /// Anything else (timeout, decode error, …). Treated identically to
     /// Unreachable for the user-visible hint, but logged separately
     /// in the future if we add tracing.
     Other,
+    /// Result of a Q/X/T mutation. `ok = true` for `ControlResponse::Ok`,
+    /// `false` for `Error`/network failure. The message is shown verbatim
+    /// in the status line.
+    ActionResult { ok: bool, message: String },
 }
 
 #[tokio::main]
@@ -208,8 +215,11 @@ async fn run_app(
                         )
                         .await
                         {
-                            Ok(ControlResponse::Status { workflows }) => {
-                                SchedulerPollOutcome::Status(workflows)
+                            Ok(ControlResponse::Status { workflows, root }) => {
+                                SchedulerPollOutcome::Status {
+                                    workflows,
+                                    root: root.map(std::path::PathBuf::from),
+                                }
                             }
                             Ok(_) => SchedulerPollOutcome::Other,
                             Err(SchedulerError::Unreachable(_)) => {
@@ -220,16 +230,60 @@ async fn run_app(
                         let _ = tx.send(outcome);
                     });
                 }
+
+                // Drain Q/X/T action requests the user composed since
+                // the previous tick. One spawn per request — tiny cost,
+                // results land on the same `sched_rx` channel as polls.
+                for req in app.take_pending_scheduler_actions() {
+                    let tx = sched_tx.clone();
+                    tokio::spawn(async move {
+                        let outcome = match scheduler_client::request(req).await {
+                            Ok(ControlResponse::Ok { message }) => {
+                                SchedulerPollOutcome::ActionResult {
+                                    ok: true,
+                                    message,
+                                }
+                            }
+                            Ok(ControlResponse::Error { message }) => {
+                                SchedulerPollOutcome::ActionResult {
+                                    ok: false,
+                                    message,
+                                }
+                            }
+                            Ok(_) => SchedulerPollOutcome::ActionResult {
+                                ok: false,
+                                message: "unexpected response".into(),
+                            },
+                            Err(SchedulerError::Unreachable(_)) => {
+                                SchedulerPollOutcome::ActionResult {
+                                    ok: false,
+                                    message: "not reachable".into(),
+                                }
+                            }
+                            Err(e) => SchedulerPollOutcome::ActionResult {
+                                ok: false,
+                                message: e.to_string(),
+                            },
+                        };
+                        let _ = tx.send(outcome);
+                    });
+                }
             }
             Some(outcome) = sched_rx.recv() => {
-                sched_in_flight = false;
                 match outcome {
-                    SchedulerPollOutcome::Status(summaries) => {
-                        app.apply_scheduler_status(summaries);
+                    SchedulerPollOutcome::Status { workflows, root } => {
+                        sched_in_flight = false;
+                        app.apply_scheduler_status(workflows, root);
                     }
                     SchedulerPollOutcome::Unreachable
                     | SchedulerPollOutcome::Other => {
+                        sched_in_flight = false;
                         app.note_scheduler_unreachable();
+                    }
+                    SchedulerPollOutcome::ActionResult { ok, message } => {
+                        // Action results aren't polls — don't touch the
+                        // in-flight flag.
+                        app.note_scheduler_action_result(ok, message);
                     }
                 }
             }
@@ -253,6 +307,15 @@ async fn run_app(
             }
         }
 
+        // Check if user wants to open a file in $PAGER (R action on
+        // Drafts/Workflows tabs).
+        if let Some(path) = app.take_pending_pager_path() {
+            if let Err(e) = open_pager(terminal, &path) {
+                app.status_message =
+                    Some((format!("Pager error: {e}"), std::time::Instant::now()));
+            }
+        }
+
         if app.should_quit {
             // TUI disconnects — daemon keeps running, workers continue
             return Ok(());
@@ -273,6 +336,40 @@ fn needs_scheduler_poll(app: &App) -> bool {
         None => true,
         Some(t) => Instant::now().duration_since(t) >= SCHEDULER_POLL_INTERVAL,
     }
+}
+
+/// Suspend the TUI, run `$PAGER <path>` (falling back to `less`/`more`),
+/// then restore the terminal. Errors only on terminal-state failures —
+/// a missing pager binary surfaces as a non-zero exit code, which is
+/// reported through `status_message` by the caller.
+fn open_pager(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    path: &std::path::Path,
+) -> io::Result<()> {
+    let pager = std::env::var("PAGER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "less".to_string());
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
+
+    let _ = std::process::Command::new(&pager).arg(path).status();
+
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
+    enable_raw_mode()?;
+    terminal.clear()?;
+    Ok(())
 }
 
 fn open_editor(

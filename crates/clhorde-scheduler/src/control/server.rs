@@ -126,14 +126,17 @@ pub fn dispatch_request(
     orch: &mut Orchestrator,
     req: ControlRequest,
 ) -> ControlResponse {
+    let root = Some(orch.root().to_string_lossy().into_owned());
     match req {
         ControlRequest::Ping => ControlResponse::Pong,
         ControlRequest::Status { name: None } => ControlResponse::Status {
             workflows: orch.summaries(),
+            root,
         },
         ControlRequest::Status { name: Some(n) } => match orch.summary(&n) {
             Some(s) => ControlResponse::Status {
                 workflows: vec![s],
+                root,
             },
             None => ControlResponse::Error {
                 message: format!("no such workflow: {n}"),
@@ -149,6 +152,14 @@ pub fn dispatch_request(
             match orch.retry_section(&name, &section) {
                 Ok(()) => ControlResponse::Ok {
                     message: format!("retry dispatched: {name} section {section}"),
+                },
+                Err(e) => map_err_to_response(e),
+            }
+        }
+        ControlRequest::Queue { name, priority } => {
+            match orch.queue_workflow(&name, priority) {
+                Ok(()) => ControlResponse::Ok {
+                    message: format!("queued: {name}"),
                 },
                 Err(e) => map_err_to_response(e),
             }
@@ -227,7 +238,7 @@ mod tests {
         let mut g = orch.lock().unwrap();
         let resp = dispatch_request(&mut g, ControlRequest::Status { name: None });
         match resp {
-            ControlResponse::Status { workflows } => assert!(workflows.is_empty()),
+            ControlResponse::Status { workflows, .. } => assert!(workflows.is_empty()),
             other => panic!("expected Status, got {other:?}"),
         }
     }
@@ -250,7 +261,7 @@ mod tests {
         let mut g = orch.lock().unwrap();
         let resp = dispatch_request(&mut g, ControlRequest::Status { name: None });
         match resp {
-            ControlResponse::Status { workflows } => {
+            ControlResponse::Status { workflows, .. } => {
                 assert_eq!(workflows.len(), 1);
                 assert_eq!(workflows[0].name, "x");
                 assert_eq!(workflows[0].status, "queued");
@@ -392,6 +403,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dispatch_queue_writes_marker_and_reports_ok() {
+        let (tmp, orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        let mut g = orch.lock().unwrap();
+        let resp = dispatch_request(
+            &mut g,
+            ControlRequest::Queue {
+                name: "x".into(),
+                priority: Some(7),
+            },
+        );
+        match resp {
+            ControlResponse::Ok { message } => assert!(message.contains("queued: x")),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        let marker = tmp.path().join("openspec/changes/x/.clhorde-ready");
+        let body = fs::read_to_string(&marker).unwrap();
+        assert!(body.contains("priority = 7"));
+        // Workflow snapshot now reports "queued".
+        let summaries = g.summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].name, "x");
+        assert_eq!(summaries[0].status, "queued");
+    }
+
+    #[test]
+    fn dispatch_queue_unknown_change_errors() {
+        let (_tmp, orch, _rx) = fixture();
+        let mut g = orch.lock().unwrap();
+        let resp = dispatch_request(
+            &mut g,
+            ControlRequest::Queue {
+                name: "ghost".into(),
+                priority: None,
+            },
+        );
+        match resp {
+            ControlResponse::Error { message } => assert!(message.contains("ghost")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_status_carries_root_path() {
+        // The TUI/web bridge uses the root field to resolve
+        // openspec/changes/<name>/proposal.md and to seed cwd for the
+        // "continue exploring" action — make sure the server populates
+        // it on every Status reply.
+        let (tmp, orch, _rx) = fixture();
+        let mut g = orch.lock().unwrap();
+        let resp = dispatch_request(&mut g, ControlRequest::Status { name: None });
+        match resp {
+            ControlResponse::Status { root, .. } => {
+                let r = root.expect("root must be present");
+                assert_eq!(std::path::PathBuf::from(r), tmp.path());
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
     // ── duplex framing path ──
 
     #[tokio::test]
@@ -479,7 +551,7 @@ mod tests {
             other => panic!("expected Pong, got {other:?}"),
         }
         match read_response(&mut client).await {
-            ControlResponse::Status { workflows } => {
+            ControlResponse::Status { workflows, .. } => {
                 assert_eq!(workflows.len(), 1);
             }
             other => panic!("expected Status, got {other:?}"),

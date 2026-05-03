@@ -24,11 +24,11 @@ Tracked on branch `feat/prompt-dependencies`.
 | 2.6 CLI subcommands wired to daemon | ✅ shipped | every stub replaced; one-shot `Ping`/`Pong` fence; 23 new tests |
 | 3   `clhorde-cli flow` wrappers + scheduler control socket | ✅ shipped | `~/.local/share/clhorde/scheduler.sock`, live remote-control; 25 new tests |
 | 4.1 TUI tabs (foundation, read-only) | ✅ shipped | `RootView`, tab bar, scheduler-control client, polled Drafts/Workflows panes; 13 new tests |
-| 4.2 TUI tabs (actions: Q/X/T/E/R) | ⏳ next | |
+| 4.2 TUI tabs (actions: Q/X/T/E/R) | ✅ shipped | `Queue` control variant + `root` on `Status`; pager suspend/restore; retry-section inline prompt; 24 new tests |
 | 4.3 TUI workflow detail view + auto-refresh polish | ⏳ pending | |
 | 5   Advanced / web | ⏳ pending | |
 
-Workspace tests: **652 passing**, none ignored.
+Workspace tests: **682 passing**, none ignored.
 
 ## Vision
 
@@ -447,8 +447,23 @@ Delivered:
 Sub-sliced like Phase 2:
 
 - **4.1 — Foundation** (✅ shipped). Tab bar, `RootView { Prompts, Drafts, Workflows }`, scheduler-control client in the TUI, read-only Drafts/Workflows panes that poll the scheduler control socket every 2s while active. The Prompts tab is unchanged.
-- **4.2 — Actions** (⏳ next). `Q` queue draft, `E` continue exploring (relaunch a PTY prompt against the change), `R` open `proposal.md`/`design.md` in `$PAGER`, `X` cancel workflow, `T` retry section.
+- **4.2 — Actions** (✅ shipped). `Q` queues the selected draft, `X` cancels the selected workflow, `T` opens an inline section prompt and dispatches a retry, `R` opens `proposal.md` (falling back to `design.md`) in `$PAGER`, `E` jumps back to Prompts in Insert mode with the scheduler root pre-filled as the cwd prefix.
 - **4.3 — Detail view** (⏳ pending). On Enter against a workflow, show the DAG and per-section prompt status. Auto-refresh polish (push-based subscribe rather than poll, backpressure, staleness indicator).
+
+### 4.2 Delivered
+
+- **Protocol:** `clhorde_core::control::ControlRequest::Queue { name, priority }` joins `Cancel` and `Retry`. `ControlResponse::Status` grew an optional `root: Option<String>` (back-compat: missing field deserializes to `None`) so the TUI can resolve `openspec/changes/<name>/...` and seed prompt cwds without a separate round-trip.
+- **Scheduler:** `Orchestrator::queue_workflow(name, priority)` writes the marker (refusing if the change directory is missing) then re-uses `on_marker_created` so the state-machine path is identical to the watcher route. `dispatch_request` plumbs `Queue` to it and stamps `root` on every `Status` reply.
+- **TUI:** `App` learned `scheduler_root`, `pending_scheduler_actions`, `retry_section_input`, `pending_pager_path` and a `take_pending_*` drain pair the main loop polls each iteration. `handle_root_view_key` now dispatches Shift-Q/X/T/E/R; the tab-switch digit shortcut is gated on `retry_section_input.is_none()` so dotted decimals starting with `1`/`2`/`3` aren't eaten.
+- **Inline retry prompt:** Shift-T opens a centered popup capturing dotted decimals only (`[0-9.]+`); Enter dispatches `ControlRequest::Retry`, Esc closes it without firing. Empty submit warns via the status bar and closes the prompt so the user can re-open with one keystroke.
+- **R / pager:** Shift-R picks `proposal.md` (fallback `design.md`); main.rs leaves the alt screen, runs `$PAGER` (default `less`), and restores. Missing files surface as a status message; pager binary failures don't crash the TUI.
+- **E / explore:** Shift-E switches to Prompts + Insert mode and seeds the input with `<scheduler_root>: ` so the existing cwd-prefix parser routes the next prompt to the watched repo. Without a known root, the action no-ops with an explanatory toast.
+- **Action results:** every dispatched request goes through the existing `sched_rx` channel as a new `ActionResult { ok, message }` outcome. `note_scheduler_action_result` flashes the message and clears `scheduler_last_poll` on success so the next 100ms tick refetches immediately.
+
+24 new tests (workspace 652 → 682):
+- 4 in `clhorde-core` (Queue round-trips with/without priority; `Status.root` round-trip + back-compat for the rootless legacy shape).
+- 7 in `clhorde-scheduler` (3 `dispatch_request` cases for Queue happy/error and `root` propagation; 4 orchestrator cases for `queue_workflow` happy/empty-priority/missing-change/queue-then-cancel).
+- 13 in `clhorde-tui` (Shift-Q/X happy paths and tab-mismatch noops; unreachable-scheduler guard; retry prompt collect/submit/cancel/empty + non-digit rejection; Shift-E with/without root; Shift-R picks proposal/design or warns; `apply_scheduler_status` keeps a known root when a later poll omits it; action-result toast forces a repoll on success).
 
 ### 4.1 Delivered
 
@@ -533,7 +548,7 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 | **2.6** | ✅ shipped | One-shot CLI subcommands implemented | Scriptable usage end-to-end; 23 new tests. |
 | **3**   | ✅ shipped | `clhorde-cli flow` wrappers + scheduler control socket | Single CLI entrypoint; live remote-control of a long-lived scheduler; 25 new tests. |
 | **4.1** | ✅ shipped | TUI tabs foundation (read-only Drafts/Workflows) | First-class UX, no actions yet; 13 new tests. |
-| **4.2** | ⏳ next | Tab actions: Q/E/R/X/T | Queue, explore, review, cancel, retry. |
+| **4.2** | ✅ shipped | Tab actions: Q/E/R/X/T (+ scheduler `Queue` + `Status.root`) | Queue, explore, review, cancel, retry — 24 new tests. |
 | **4.3** | ⏳ pending | Workflow detail view + auto-refresh polish | Per-section DAG, push-based updates. |
 | **5**   | ⏳ pending | Web routes + advanced (parallel safety, hooks, multi-repo) | Polish. |
 

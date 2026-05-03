@@ -65,6 +65,67 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.show_help_overlay {
         render_help_overlay(f, app, f.area());
     }
+
+    if app.retry_section_input.is_some() {
+        render_retry_section_prompt(f, app, f.area());
+    }
+}
+
+/// Centered popup for the inline retry-section prompt fired by `T` on
+/// the Workflows tab. Captures dotted decimal section ids; Enter
+/// submits, Esc cancels.
+fn render_retry_section_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let Some(input) = app.retry_section_input.as_ref() else {
+        return;
+    };
+    let popup_w = 50.min(area.width.saturating_sub(4));
+    let popup_h = 7.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup = Rect::new(x, y, popup_w, popup_h);
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Retry section ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let body = vec![
+        Line::from(vec![
+            Span::styled(
+                "  workflow: ",
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                input.workflow.as_str(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  section:  ",
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                if input.buffer.is_empty() {
+                    "_"
+                } else {
+                    input.buffer.as_str()
+                },
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter to submit, Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(body).block(block), popup);
 }
 
 fn render_main_area_dispatch(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1716,14 +1777,36 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             RootView::Workflows => "workflows",
             RootView::Prompts => "prompts",
         };
-        let bindings: Vec<(String, &str)> = vec![
-            ("j/k".to_string(), "navigate"),
-            ("r".to_string(), "refresh"),
-            ("1/2/3".to_string(), "switch tab"),
-            ("Esc".to_string(), "→ Prompts"),
-            ("?".to_string(), "help"),
-            ("q".to_string(), "quit"),
-        ];
+        // Tab-specific action keys: Drafts get Q+E+R, Workflows get
+        // X+T+R. Both share the navigation/quit/refresh row.
+        let bindings: Vec<(String, &str)> = match app.root_view {
+            RootView::Drafts => vec![
+                ("j/k".to_string(), "navigate"),
+                ("Q".to_string(), "queue"),
+                ("E".to_string(), "explore"),
+                ("R".to_string(), "read"),
+                ("r".to_string(), "refresh"),
+                ("Esc".to_string(), "→ Prompts"),
+                ("q".to_string(), "quit"),
+            ],
+            RootView::Workflows => vec![
+                ("j/k".to_string(), "navigate"),
+                ("X".to_string(), "cancel"),
+                ("T".to_string(), "retry §"),
+                ("R".to_string(), "read"),
+                ("r".to_string(), "refresh"),
+                ("Esc".to_string(), "→ Prompts"),
+                ("q".to_string(), "quit"),
+            ],
+            RootView::Prompts => vec![
+                ("j/k".to_string(), "navigate"),
+                ("r".to_string(), "refresh"),
+                ("1/2/3".to_string(), "switch tab"),
+                ("Esc".to_string(), "→ Prompts"),
+                ("?".to_string(), "help"),
+                ("q".to_string(), "quit"),
+            ],
+        };
         let mut spans: Vec<Span> = vec![
             Span::raw(" "),
             Span::styled(

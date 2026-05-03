@@ -278,6 +278,36 @@ impl Orchestrator {
         Ok(kind)
     }
 
+    /// Queue a draft change by writing
+    /// `openspec/changes/<name>/.clhorde-ready` with optional metadata,
+    /// then transition the workflow through `on_marker_created` so the
+    /// state machine matches what an external `touch` would produce.
+    /// Errors if the change directory is missing — without this, a
+    /// typo would silently create an orphan marker.
+    pub fn queue_workflow(
+        &mut self,
+        name: &str,
+        priority: Option<i32>,
+    ) -> Result<(), OrchestratorError> {
+        let change_dir = self
+            .root
+            .join("openspec")
+            .join("changes")
+            .join(name);
+        if !change_dir.is_dir() {
+            return Err(OrchestratorError::NotFound(format!(
+                "no such change: {name}"
+            )));
+        }
+        let marker_path = change_dir.join(".clhorde-ready");
+        let body = match priority {
+            Some(p) => format!("priority = {p}\n"),
+            None => String::new(),
+        };
+        fs::write(&marker_path, body).map_err(OrchestratorError::Io)?;
+        self.on_marker_created(name.to_string())
+    }
+
     /// Re-dispatch a single apply-phase node by its `tasks.md` id. If the
     /// workflow is `Failed`, it is reset to `Implementing` so the next
     /// `WorkerFinished` advances it. The dispatch goes through the usual
@@ -1991,6 +2021,65 @@ mod tests {
         assert_eq!(
             orch2.workflow("x").unwrap().metadata.priority,
             Some(99)
+        );
+    }
+
+    // ── queue_workflow ──
+
+    #[test]
+    fn queue_workflow_writes_marker_and_transitions() {
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        orch.queue_workflow("x", Some(3)).unwrap();
+        // Marker landed on disk with the expected priority body.
+        let body = fs::read_to_string(
+            tmp.path().join("openspec/changes/x/.clhorde-ready"),
+        )
+        .unwrap();
+        assert_eq!(body, "priority = 3\n");
+        // Workflow is now Queued in memory.
+        assert_eq!(
+            orch.workflow("x").unwrap().status,
+            WorkflowStatus::Queued
+        );
+        assert_eq!(orch.workflow("x").unwrap().metadata.priority, Some(3));
+    }
+
+    #[test]
+    fn queue_workflow_without_priority_writes_empty_marker() {
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        orch.queue_workflow("x", None).unwrap();
+        let body = fs::read_to_string(
+            tmp.path().join("openspec/changes/x/.clhorde-ready"),
+        )
+        .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn queue_workflow_rejects_missing_change_dir() {
+        let (_tmp, mut orch, _rx) = fixture();
+        let err = orch.queue_workflow("ghost", None).unwrap_err();
+        assert!(matches!(err, OrchestratorError::NotFound(_)));
+    }
+
+    #[test]
+    fn queue_workflow_then_cancel_unqueues() {
+        // Round-trip: Q action → X action puts the workflow back to
+        // Drafted and removes the marker.
+        let (tmp, mut orch, _rx) = fixture();
+        change_dir(&tmp, "x");
+        orch.queue_workflow("x", None).unwrap();
+        let kind = orch.cancel_workflow("x").unwrap();
+        assert_eq!(kind, "unqueued");
+        assert!(!tmp
+            .path()
+            .join("openspec/changes/x/.clhorde-ready")
+            .exists());
+        assert_eq!(
+            orch.workflow("x").unwrap().status,
+            WorkflowStatus::Drafted
         );
     }
 }

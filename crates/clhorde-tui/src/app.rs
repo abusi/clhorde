@@ -11,7 +11,7 @@ use crate::editor::TextBuffer;
 use crate::key_encoding;
 use crate::keymap::{FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction};
 use crate::pty_renderer::PtyRenderer;
-use clhorde_core::control::WorkflowSummary;
+use clhorde_core::control::{ControlRequest, WorkflowSummary};
 use clhorde_core::prompt::{PromptMode, PromptStatus};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent, DaemonState, PromptInfo};
 
@@ -151,6 +151,29 @@ pub struct App {
     /// Last time the Drafts/Workflows data was refreshed; used by the
     /// main loop to throttle polling.
     pub scheduler_last_poll: Option<Instant>,
+    /// Project root the scheduler is watching. Populated from the
+    /// `Status` response. The R/E actions need it to resolve
+    /// `openspec/changes/<name>/...` paths and prompt cwds.
+    pub scheduler_root: Option<PathBuf>,
+    /// Pending scheduler control requests the main loop should dispatch
+    /// on the next tick. Drained by `take_pending_scheduler_actions`.
+    pending_scheduler_actions: Vec<ControlRequest>,
+    /// When `Some`, the user is composing a section id for the Retry
+    /// action. All keys are routed to it until Enter (submit) or Esc
+    /// (cancel).
+    pub retry_section_input: Option<RetrySectionInput>,
+    /// When `Some`, main.rs should suspend the terminal and run
+    /// `$PAGER <path>` on this file before resuming.
+    pub pending_pager_path: Option<PathBuf>,
+}
+
+/// Buffered state for the "press T to retry section" inline prompt.
+#[derive(Debug, Clone)]
+pub struct RetrySectionInput {
+    /// Workflow the retry is targeting.
+    pub workflow: String,
+    /// Section id the user is composing.
+    pub buffer: String,
 }
 
 impl App {
@@ -216,7 +239,28 @@ impl App {
             workflows_selected: 0,
             scheduler_reachable: false,
             scheduler_last_poll: None,
+            scheduler_root: None,
+            pending_scheduler_actions: Vec::new(),
+            retry_section_input: None,
+            pending_pager_path: None,
         }
+    }
+
+    /// Drain the queue of scheduler control requests the user has
+    /// composed since the last call. Called from the main loop to
+    /// dispatch them through the scheduler control socket.
+    pub fn take_pending_scheduler_actions(&mut self) -> Vec<ControlRequest> {
+        std::mem::take(&mut self.pending_scheduler_actions)
+    }
+
+    /// Take the path the user asked us to open in `$PAGER`, if any.
+    pub fn take_pending_pager_path(&mut self) -> Option<PathBuf> {
+        self.pending_pager_path.take()
+    }
+
+    /// Push a status message that fades after 3 seconds.
+    fn set_status_message(&mut self, msg: impl Into<String>) {
+        self.status_message = Some((msg.into(), Instant::now()));
     }
 
     // ── Helper: send request to daemon ──
@@ -583,10 +627,15 @@ impl App {
         }
     }
 
-    /// Handle a key while the active tab is Drafts or Workflows. Phase
-    /// 4.1 ships only navigation + refresh + tab switching + quit;
-    /// actions (Q queue, X cancel, T retry, …) come in Phase 4.2.
+    /// Handle a key while the active tab is Drafts or Workflows.
+    /// Phase 4.1 added navigation + refresh + tab switching + quit.
+    /// Phase 4.2 layers Q/X/T/E/R action keys on top.
     fn handle_root_view_key(&mut self, key: KeyEvent) {
+        // The retry-section inline prompt steals all keys while open.
+        if self.retry_section_input.is_some() {
+            self.handle_retry_section_input_key(key);
+            return;
+        }
         // Esc returns to the Prompts tab so the user can always bail
         // back to the familiar view with one keystroke.
         if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
@@ -612,6 +661,33 @@ impl App {
             self.show_help_overlay = true;
             return;
         }
+        // ── Phase 4.2: action keys ──
+        // Q queues the selected draft (Drafts tab only).
+        if key.code == KeyCode::Char('Q') && key.modifiers == KeyModifiers::SHIFT {
+            self.queue_selected_draft();
+            return;
+        }
+        // X cancels the selected workflow (Workflows tab only).
+        if key.code == KeyCode::Char('X') && key.modifiers == KeyModifiers::SHIFT {
+            self.cancel_selected_workflow();
+            return;
+        }
+        // T opens the retry-section inline prompt (Workflows tab only).
+        if key.code == KeyCode::Char('T') && key.modifiers == KeyModifiers::SHIFT {
+            self.start_retry_section_prompt();
+            return;
+        }
+        // E "continue exploring": switch back to Prompts + Insert
+        // mode with cwd prefilled to the scheduler root.
+        if key.code == KeyCode::Char('E') && key.modifiers == KeyModifiers::SHIFT {
+            self.start_explore_selected();
+            return;
+        }
+        // R opens proposal.md (or design.md fallback) in $PAGER.
+        if key.code == KeyCode::Char('R') && key.modifiers == KeyModifiers::SHIFT {
+            self.start_pager_for_selected();
+            return;
+        }
         // j / Down — move selection down; k / Up — move up.
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.root_view_select_next(),
@@ -620,6 +696,185 @@ impl App {
             KeyCode::Char('G') => self.root_view_select_last(),
             _ => {}
         }
+    }
+
+    fn handle_retry_section_input_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.retry_section_input = None;
+            }
+            KeyCode::Enter => {
+                if let Some(input) = self.retry_section_input.take() {
+                    let section = input.buffer.trim().to_string();
+                    if section.is_empty() {
+                        self.set_status_message("retry: section id required");
+                    } else {
+                        self.pending_scheduler_actions
+                            .push(ControlRequest::Retry {
+                                name: input.workflow.clone(),
+                                section: section.clone(),
+                            });
+                        self.set_status_message(format!(
+                            "retry {} section {section}…",
+                            input.workflow
+                        ));
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(input) = &mut self.retry_section_input {
+                    input.buffer.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(input) = &mut self.retry_section_input {
+                    // tasks.md ids are dotted decimals (e.g. "3", "3.2"),
+                    // so accept digits + dot only.
+                    if c.is_ascii_digit() || c == '.' {
+                        input.buffer.push(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── Phase 4.2 actions ──
+
+    fn queue_selected_draft(&mut self) {
+        if self.root_view != RootView::Drafts {
+            return;
+        }
+        if !self.scheduler_reachable {
+            self.set_status_message("scheduler not reachable");
+            return;
+        }
+        let Some(name) = self.drafts.get(self.drafts_selected).cloned() else {
+            self.set_status_message("no draft selected");
+            return;
+        };
+        self.pending_scheduler_actions
+            .push(ControlRequest::Queue {
+                name: name.clone(),
+                priority: None,
+            });
+        self.set_status_message(format!("queueing {name}…"));
+    }
+
+    fn cancel_selected_workflow(&mut self) {
+        if self.root_view != RootView::Workflows {
+            return;
+        }
+        if !self.scheduler_reachable {
+            self.set_status_message("scheduler not reachable");
+            return;
+        }
+        let Some(wf) = self.workflows.get(self.workflows_selected) else {
+            self.set_status_message("no workflow selected");
+            return;
+        };
+        let name = wf.name.clone();
+        self.pending_scheduler_actions
+            .push(ControlRequest::Cancel { name: name.clone() });
+        self.set_status_message(format!("cancelling {name}…"));
+    }
+
+    fn start_retry_section_prompt(&mut self) {
+        if self.root_view != RootView::Workflows {
+            return;
+        }
+        if !self.scheduler_reachable {
+            self.set_status_message("scheduler not reachable");
+            return;
+        }
+        let Some(wf) = self.workflows.get(self.workflows_selected) else {
+            self.set_status_message("no workflow selected");
+            return;
+        };
+        self.retry_section_input = Some(RetrySectionInput {
+            workflow: wf.name.clone(),
+            buffer: String::new(),
+        });
+    }
+
+    /// Resolve the directory of the currently selected change (draft or
+    /// workflow). Returns None if no scheduler root is known yet or no
+    /// row is selected.
+    fn selected_change_dir(&self) -> Option<PathBuf> {
+        let root = self.scheduler_root.as_ref()?;
+        let name = match self.root_view {
+            RootView::Drafts => self.drafts.get(self.drafts_selected).cloned(),
+            RootView::Workflows => self
+                .workflows
+                .get(self.workflows_selected)
+                .map(|w| w.name.clone()),
+            RootView::Prompts => None,
+        }?;
+        Some(root.join("openspec").join("changes").join(name))
+    }
+
+    fn start_pager_for_selected(&mut self) {
+        let Some(dir) = self.selected_change_dir() else {
+            self.set_status_message(
+                "scheduler root unknown (waiting for first poll)",
+            );
+            return;
+        };
+        // Prefer proposal.md, fall back to design.md so the user gets
+        // something useful even on early-stage drafts that haven't grown
+        // a design doc yet.
+        let proposal = dir.join("proposal.md");
+        let design = dir.join("design.md");
+        let path = if proposal.is_file() {
+            proposal
+        } else if design.is_file() {
+            design
+        } else {
+            self.set_status_message(format!(
+                "no proposal.md or design.md in {}",
+                dir.display()
+            ));
+            return;
+        };
+        self.pending_pager_path = Some(path);
+    }
+
+    fn start_explore_selected(&mut self) {
+        let Some(root) = self.scheduler_root.clone() else {
+            self.set_status_message(
+                "scheduler root unknown (waiting for first poll)",
+            );
+            return;
+        };
+        let name = match self.root_view {
+            RootView::Drafts => self.drafts.get(self.drafts_selected).cloned(),
+            RootView::Workflows => self
+                .workflows
+                .get(self.workflows_selected)
+                .map(|w| w.name.clone()),
+            RootView::Prompts => None,
+        };
+        let Some(name) = name else {
+            self.set_status_message("nothing selected");
+            return;
+        };
+        // Switch to Prompts tab + Insert mode, prefilled with the cwd
+        // prefix the existing parser understands. The user types their
+        // refinement and submits — the change name lands in the toast
+        // so they don't lose context.
+        self.set_root_view(RootView::Prompts);
+        self.mode = AppMode::Insert;
+        self.input.set(&format!("{}: ", root.to_string_lossy()));
+        self.input.move_end();
+        self.open_external_editor = false;
+        self.history_index = None;
+        self.history_stash.clear();
+        self.template_suggestions.clear();
+        self.template_suggestion_index = 0;
+        self.suggestions.clear();
+        self.suggestion_index = 0;
+        self.worktree_pending = false;
+        self.set_status_message(format!("explore: {name}"));
     }
 
     fn root_view_select_next(&mut self) {
@@ -675,11 +930,16 @@ impl App {
     /// Apply the result of a `ControlRequest::Status { name: None }`
     /// poll: split the returned workflows into drafts (status == drafted)
     /// and the rest, while preserving the user's current selection on
-    /// each list when possible.
+    /// each list when possible. Also stashes the scheduler `root` (if
+    /// the response carried one) so the R/E actions can resolve paths.
     ///
     /// This is the single entry point both Drafts and Workflows tabs
     /// feed off — we only ever issue one scheduler request per poll.
-    pub fn apply_scheduler_status(&mut self, summaries: Vec<WorkflowSummary>) {
+    pub fn apply_scheduler_status(
+        &mut self,
+        summaries: Vec<WorkflowSummary>,
+        root: Option<PathBuf>,
+    ) {
         let prev_draft = self.drafts.get(self.drafts_selected).cloned();
         let prev_workflow = self
             .workflows
@@ -725,6 +985,9 @@ impl App {
                 .min(self.workflows.len().saturating_sub(1));
         }
 
+        if let Some(r) = root {
+            self.scheduler_root = Some(r);
+        }
         self.scheduler_reachable = true;
         self.scheduler_last_poll = Some(Instant::now());
     }
@@ -734,6 +997,18 @@ impl App {
     pub fn note_scheduler_unreachable(&mut self) {
         self.scheduler_reachable = false;
         self.scheduler_last_poll = Some(Instant::now());
+    }
+
+    /// Note the result of a scheduler control mutation (Q/X/T). Surfaces
+    /// the message as a transient toast and forces an immediate refresh
+    /// on success so the Drafts/Workflows lists reflect the change.
+    pub fn note_scheduler_action_result(&mut self, ok: bool, message: String) {
+        let prefix = if ok { "" } else { "scheduler: " };
+        self.set_status_message(format!("{prefix}{message}"));
+        if ok {
+            // Force the next tick to refetch state.
+            self.scheduler_last_poll = None;
+        }
     }
 
     // ── Key handling ──
@@ -782,8 +1057,13 @@ impl App {
         // per-mode dispatch so it works even from Insert (where '1'
         // would otherwise just type a character) — but only when no
         // input is being composed. In Insert/Filter/Interact/PtyInteract
-        // the digits remain available as text.
-        if self.mode == AppMode::Normal && key.modifiers == KeyModifiers::NONE {
+        // the digits remain available as text. Skip while the
+        // retry-section inline prompt is open: section ids are dotted
+        // decimals and we'd otherwise eat their leading "1"/"2"/"3".
+        if self.mode == AppMode::Normal
+            && key.modifiers == KeyModifiers::NONE
+            && self.retry_section_input.is_none()
+        {
             match key.code {
                 KeyCode::Char('1') => {
                     self.set_root_view(RootView::Prompts);
@@ -2203,6 +2483,10 @@ mod tests {
             workflows_selected: 0,
             scheduler_reachable: false,
             scheduler_last_poll: None,
+            scheduler_root: None,
+            pending_scheduler_actions: Vec::new(),
+            retry_section_input: None,
+            pending_pager_path: None,
         };
         app.list_state.select(None);
         (app, daemon_rx)
@@ -3018,12 +3302,15 @@ mod tests {
     #[test]
     fn apply_scheduler_status_splits_drafts_from_workflows() {
         let (mut app, _rx) = new_test_app();
-        app.apply_scheduler_status(vec![
-            summary("a-draft", "drafted"),
-            summary("running-flow", "implementing"),
-            summary("b-draft", "drafted"),
-            summary("done-flow", "archived"),
-        ]);
+        app.apply_scheduler_status(
+            vec![
+                summary("a-draft", "drafted"),
+                summary("running-flow", "implementing"),
+                summary("b-draft", "drafted"),
+                summary("done-flow", "archived"),
+            ],
+            None,
+        );
         assert_eq!(app.drafts, vec!["a-draft", "b-draft"]); // sorted
         assert_eq!(
             app.workflows.iter().map(|w| w.name.clone()).collect::<Vec<_>>(),
@@ -3036,19 +3323,25 @@ mod tests {
     fn apply_scheduler_status_preserves_selection_by_name() {
         let (mut app, _rx) = new_test_app();
         // Initial poll: 3 workflows, select the middle one.
-        app.apply_scheduler_status(vec![
-            summary("a", "queued"),
-            summary("b", "implementing"),
-            summary("c", "verifying"),
-        ]);
+        app.apply_scheduler_status(
+            vec![
+                summary("a", "queued"),
+                summary("b", "implementing"),
+                summary("c", "verifying"),
+            ],
+            None,
+        );
         app.workflows_selected = 1;
         // Refresh: reorder + add. The selection should follow "b".
-        app.apply_scheduler_status(vec![
-            summary("c", "verifying"),
-            summary("b", "implementing"),
-            summary("a", "queued"),
-            summary("d", "queued"),
-        ]);
+        app.apply_scheduler_status(
+            vec![
+                summary("c", "verifying"),
+                summary("b", "implementing"),
+                summary("a", "queued"),
+                summary("d", "queued"),
+            ],
+            None,
+        );
         assert_eq!(
             app.workflows[app.workflows_selected].name,
             "b".to_string()
@@ -3067,10 +3360,10 @@ mod tests {
     fn navigation_clamped_to_list_bounds() {
         let (mut app, _rx) = new_test_app();
         app.set_root_view(RootView::Drafts);
-        app.apply_scheduler_status(vec![
-            summary("x", "drafted"),
-            summary("y", "drafted"),
-        ]);
+        app.apply_scheduler_status(
+            vec![summary("x", "drafted"), summary("y", "drafted")],
+            None,
+        );
         // j past end → stays at last index.
         app.handle_key(key_press(KeyCode::Char('j')));
         app.handle_key(key_press(KeyCode::Char('j')));
@@ -3091,5 +3384,272 @@ mod tests {
         assert_eq!(app.root_view, RootView::Prompts);
         app.handle_key(key_press(KeyCode::Char('i')));
         assert_eq!(app.mode, AppMode::Insert);
+    }
+
+    // ── Phase 4.2: action keys ──
+
+    fn key_shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    /// Set up an app already on Drafts with a populated list, a known
+    /// scheduler root, and `scheduler_reachable = true`.
+    fn drafts_app() -> (App, mpsc::UnboundedReceiver<ClientRequest>) {
+        let (mut app, rx) = new_test_app();
+        app.set_root_view(RootView::Drafts);
+        app.apply_scheduler_status(
+            vec![summary("alpha", "drafted"), summary("beta", "drafted")],
+            Some(PathBuf::from("/repo")),
+        );
+        (app, rx)
+    }
+
+    /// Set up an app already on Workflows with a populated list and a
+    /// known scheduler root.
+    fn workflows_app() -> (App, mpsc::UnboundedReceiver<ClientRequest>) {
+        let (mut app, rx) = new_test_app();
+        app.set_root_view(RootView::Workflows);
+        app.apply_scheduler_status(
+            vec![
+                summary("running", "implementing"),
+                summary("waiting", "queued"),
+            ],
+            Some(PathBuf::from("/repo")),
+        );
+        (app, rx)
+    }
+
+    #[test]
+    fn apply_scheduler_status_stores_root() {
+        let (mut app, _rx) = new_test_app();
+        app.apply_scheduler_status(vec![], Some(PathBuf::from("/abs/repo")));
+        assert_eq!(app.scheduler_root, Some(PathBuf::from("/abs/repo")));
+    }
+
+    #[test]
+    fn apply_scheduler_status_keeps_root_when_response_is_rootless() {
+        // Older scheduler builds may omit `root`; we must not clobber a
+        // previously-known value (otherwise R/E would briefly fail).
+        let (mut app, _rx) = new_test_app();
+        app.apply_scheduler_status(vec![], Some(PathBuf::from("/abs/repo")));
+        app.apply_scheduler_status(vec![], None);
+        assert_eq!(app.scheduler_root, Some(PathBuf::from("/abs/repo")));
+    }
+
+    #[test]
+    fn shift_q_on_drafts_queues_selected_via_pending_action() {
+        let (mut app, _rx) = drafts_app();
+        app.drafts_selected = 1; // beta
+        app.handle_key(key_shift(KeyCode::Char('Q')));
+        let actions = app.take_pending_scheduler_actions();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ControlRequest::Queue { name, priority } => {
+                assert_eq!(name, "beta");
+                assert!(priority.is_none());
+            }
+            other => panic!("expected Queue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shift_q_when_unreachable_does_not_emit_action() {
+        let (mut app, _rx) = drafts_app();
+        app.scheduler_reachable = false;
+        app.handle_key(key_shift(KeyCode::Char('Q')));
+        assert!(app.take_pending_scheduler_actions().is_empty());
+        // Status message tells the user why nothing happened.
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("not reachable"));
+    }
+
+    #[test]
+    fn shift_q_on_workflows_is_a_noop() {
+        // Q is a Drafts-tab action; pressing it on Workflows must not
+        // fire — otherwise we'd send a Queue request for the wrong name.
+        let (mut app, _rx) = workflows_app();
+        app.handle_key(key_shift(KeyCode::Char('Q')));
+        assert!(app.take_pending_scheduler_actions().is_empty());
+    }
+
+    #[test]
+    fn shift_x_on_workflows_cancels_selected_via_pending_action() {
+        let (mut app, _rx) = workflows_app();
+        app.workflows_selected = 1; // waiting
+        app.handle_key(key_shift(KeyCode::Char('X')));
+        let actions = app.take_pending_scheduler_actions();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ControlRequest::Cancel { name } => assert_eq!(name, "waiting"),
+            other => panic!("expected Cancel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shift_x_on_drafts_is_a_noop() {
+        let (mut app, _rx) = drafts_app();
+        app.handle_key(key_shift(KeyCode::Char('X')));
+        assert!(app.take_pending_scheduler_actions().is_empty());
+    }
+
+    #[test]
+    fn shift_t_opens_retry_section_prompt() {
+        let (mut app, _rx) = workflows_app();
+        app.workflows_selected = 0; // running
+        app.handle_key(key_shift(KeyCode::Char('T')));
+        let inp = app.retry_section_input.as_ref().unwrap();
+        assert_eq!(inp.workflow, "running");
+        assert!(inp.buffer.is_empty());
+    }
+
+    #[test]
+    fn retry_prompt_collects_section_id_and_emits_retry_on_enter() {
+        let (mut app, _rx) = workflows_app();
+        app.handle_key(key_shift(KeyCode::Char('T')));
+        // Type "3.2".
+        app.handle_key(key_press(KeyCode::Char('3')));
+        app.handle_key(key_press(KeyCode::Char('.')));
+        app.handle_key(key_press(KeyCode::Char('2')));
+        // Submit.
+        app.handle_key(key_press(KeyCode::Enter));
+        assert!(app.retry_section_input.is_none());
+        let actions = app.take_pending_scheduler_actions();
+        match &actions[..] {
+            [ControlRequest::Retry { name, section }] => {
+                assert_eq!(name, "running");
+                assert_eq!(section, "3.2");
+            }
+            other => panic!("expected one Retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_prompt_rejects_non_digit_chars() {
+        // Section ids are dotted decimals — accidental keystrokes (like
+        // typing the workflow name) shouldn't pollute the buffer.
+        let (mut app, _rx) = workflows_app();
+        app.handle_key(key_shift(KeyCode::Char('T')));
+        for c in ['1', 'a', '.', 'b', '2'] {
+            app.handle_key(key_press(KeyCode::Char(c)));
+        }
+        let inp = app.retry_section_input.as_ref().unwrap();
+        assert_eq!(inp.buffer, "1.2");
+    }
+
+    #[test]
+    fn retry_prompt_esc_cancels_without_dispatch() {
+        let (mut app, _rx) = workflows_app();
+        app.handle_key(key_shift(KeyCode::Char('T')));
+        app.handle_key(key_press(KeyCode::Esc));
+        assert!(app.retry_section_input.is_none());
+        assert!(app.take_pending_scheduler_actions().is_empty());
+    }
+
+    #[test]
+    fn retry_prompt_empty_submit_keeps_user_in_loop() {
+        let (mut app, _rx) = workflows_app();
+        app.handle_key(key_shift(KeyCode::Char('T')));
+        app.handle_key(key_press(KeyCode::Enter));
+        // No request was queued, but the prompt is closed so the user
+        // can re-open it. The status message warns them.
+        assert!(app.retry_section_input.is_none());
+        assert!(app.take_pending_scheduler_actions().is_empty());
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("section id"));
+    }
+
+    #[test]
+    fn shift_e_switches_to_prompts_insert_with_root_prefix() {
+        let (mut app, _rx) = drafts_app();
+        app.drafts_selected = 0; // alpha
+        app.handle_key(key_shift(KeyCode::Char('E')));
+        assert_eq!(app.root_view, RootView::Prompts);
+        assert_eq!(app.mode, AppMode::Insert);
+        assert_eq!(app.input.to_string(), "/repo: ");
+    }
+
+    #[test]
+    fn shift_e_without_known_root_warns() {
+        let (mut app, _rx) = new_test_app();
+        app.set_root_view(RootView::Drafts);
+        app.drafts = vec!["alpha".into()];
+        // No scheduler_root yet.
+        app.handle_key(key_shift(KeyCode::Char('E')));
+        // Did not switch tabs.
+        assert_eq!(app.root_view, RootView::Drafts);
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("scheduler root unknown"));
+    }
+
+    #[test]
+    fn shift_r_picks_proposal_md_when_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let change = tmp.path().join("openspec").join("changes").join("alpha");
+        std::fs::create_dir_all(&change).unwrap();
+        std::fs::write(change.join("proposal.md"), "x").unwrap();
+
+        let (mut app, _rx) = new_test_app();
+        app.set_root_view(RootView::Drafts);
+        app.apply_scheduler_status(
+            vec![summary("alpha", "drafted")],
+            Some(tmp.path().to_path_buf()),
+        );
+        app.handle_key(key_shift(KeyCode::Char('R')));
+        let p = app.take_pending_pager_path().unwrap();
+        assert_eq!(p, change.join("proposal.md"));
+    }
+
+    #[test]
+    fn shift_r_falls_back_to_design_md() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let change = tmp.path().join("openspec").join("changes").join("alpha");
+        std::fs::create_dir_all(&change).unwrap();
+        std::fs::write(change.join("design.md"), "x").unwrap();
+
+        let (mut app, _rx) = new_test_app();
+        app.set_root_view(RootView::Drafts);
+        app.apply_scheduler_status(
+            vec![summary("alpha", "drafted")],
+            Some(tmp.path().to_path_buf()),
+        );
+        app.handle_key(key_shift(KeyCode::Char('R')));
+        let p = app.take_pending_pager_path().unwrap();
+        assert_eq!(p, change.join("design.md"));
+    }
+
+    #[test]
+    fn shift_r_with_no_files_warns_and_does_not_open() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let change = tmp.path().join("openspec").join("changes").join("alpha");
+        std::fs::create_dir_all(&change).unwrap();
+
+        let (mut app, _rx) = new_test_app();
+        app.set_root_view(RootView::Drafts);
+        app.apply_scheduler_status(
+            vec![summary("alpha", "drafted")],
+            Some(tmp.path().to_path_buf()),
+        );
+        app.handle_key(key_shift(KeyCode::Char('R')));
+        assert!(app.take_pending_pager_path().is_none());
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("no proposal.md or design.md"));
+    }
+
+    #[test]
+    fn note_action_result_ok_forces_repoll() {
+        let (mut app, _rx) = drafts_app();
+        // The poll timer was just set by `apply_scheduler_status`.
+        assert!(app.scheduler_last_poll.is_some());
+        app.note_scheduler_action_result(true, "queued: alpha".into());
+        // Success forces an immediate refetch so the list updates.
+        assert!(app.scheduler_last_poll.is_none());
+    }
+
+    #[test]
+    fn note_action_result_err_keeps_poll_timer() {
+        let (mut app, _rx) = drafts_app();
+        let before = app.scheduler_last_poll;
+        app.note_scheduler_action_result(false, "boom".into());
+        assert_eq!(app.scheduler_last_poll, before);
     }
 }
