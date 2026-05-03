@@ -23,10 +23,12 @@ Tracked on branch `feat/prompt-dependencies`.
 | 2.5 openspec/changes/ snapshot in scheduler | ✅ shipped | content-hash snapshot/diff + `SetAnnotation` writes on every observed worker; 21 new tests |
 | 2.6 CLI subcommands wired to daemon | ✅ shipped | every stub replaced; one-shot `Ping`/`Pong` fence; 23 new tests |
 | 3   `clhorde-cli flow` wrappers + scheduler control socket | ✅ shipped | `~/.local/share/clhorde/scheduler.sock`, live remote-control; 25 new tests |
-| 4   TUI restructure (tabs) | ⏳ next | |
+| 4.1 TUI tabs (foundation, read-only) | ✅ shipped | `RootView`, tab bar, scheduler-control client, polled Drafts/Workflows panes; 13 new tests |
+| 4.2 TUI tabs (actions: Q/X/T/E/R) | ⏳ next | |
+| 4.3 TUI workflow detail view + auto-refresh polish | ⏳ pending | |
 | 5   Advanced / web | ⏳ pending | |
 
-Workspace tests: **639 passing**, none ignored.
+Workspace tests: **652 passing**, none ignored.
 
 ## Vision
 
@@ -442,6 +444,25 @@ Delivered:
 
 ## Phase 4 — TUI restructure
 
+Sub-sliced like Phase 2:
+
+- **4.1 — Foundation** (✅ shipped). Tab bar, `RootView { Prompts, Drafts, Workflows }`, scheduler-control client in the TUI, read-only Drafts/Workflows panes that poll the scheduler control socket every 2s while active. The Prompts tab is unchanged.
+- **4.2 — Actions** (⏳ next). `Q` queue draft, `E` continue exploring (relaunch a PTY prompt against the change), `R` open `proposal.md`/`design.md` in `$PAGER`, `X` cancel workflow, `T` retry section.
+- **4.3 — Detail view** (⏳ pending). On Enter against a workflow, show the DAG and per-section prompt status. Auto-refresh polish (push-based subscribe rather than poll, backpressure, staleness indicator).
+
+### 4.1 Delivered
+
+- **`clhorde_core::control` module** — moved the scheduler control protocol shapes (`ControlRequest`, `ControlResponse`, `WorkflowSummary`) here so the TUI doesn't have to depend on the scheduler crate (and pull in tera/notify/clap) just to decode wire types. The scheduler's `control::protocol` module re-exports for back-compat with the in-crate server/client. `chrono` in core gained the `serde` feature.
+- **`scheduler_client`** in the TUI — one-shot async helper: connect to `~/.local/share/clhorde/scheduler.sock`, send one request, read one response, drop. 800ms timeout per call; failures map to `SchedulerError::Unreachable`/`Timeout`/etc. Mirrors the pattern of the existing `ipc_client.rs` rather than depending on the scheduler-side client.
+- **`App` extension** — new fields `root_view`, `drafts`, `workflows`, per-tab selection indices, `scheduler_reachable`, `scheduler_last_poll`. New methods: `set_root_view`, `apply_scheduler_status` (one request feeds both tabs by splitting status `drafted` vs the rest), `note_scheduler_unreachable`, plus per-tab navigation helpers.
+- **Key dispatch** — digit keys `1`/`2`/`3` switch tabs from Normal mode (only when no modifier is pressed; the digits remain available as text input in Insert/Filter/Interact). On Drafts/Workflows tabs, the prompt-list shortcuts are bypassed in favor of `j`/`k`/`g`/`G` navigation, `r` force-refresh, `Esc` to return to Prompts, `?` for help, `q` to quit (with worker confirmation).
+- **UI rendering** — new top-of-screen tab bar (`[1] Prompts  [2] Drafts  [3] Workflows`). The main area is dispatched by `root_view`. Drafts/Workflows panes show empty-state and unreachable-scheduler hints. Workflow lines are color-coded by status (`drafted/queued/implementing/verifying/archiving/archived/cancelled/failed`). The input bar collapses to zero height on non-Prompts tabs. The bottom help bar swaps to a tab-specific hint set.
+- **Polling** — main-loop `tick_interval` (100ms) checks `needs_scheduler_poll(&app)`. When the user is on a scheduler-backed tab and ≥2s elapsed since the last poll (or `scheduler_last_poll` is `None`, set on tab switch), a single `ControlRequest::Status { name: None }` fires fire-and-forget on a `tokio::spawn`; the result lands on a dedicated mpsc channel that the same `select!` consumes. Only one poll is in flight at a time.
+
+13 new tests (workspace 639 → 652): 3 `scheduler_client` round-trips against a `tokio::net::UnixListener` (Pong, Status decode, Unreachable on missing socket), and 10 `App` tests (default `RootView`, digit-key switching, Esc returns to Prompts, `r` force-repolls, switching clears the poll timer, `apply_scheduler_status` splits + sorts + preserves selection by name across refreshes, navigation clamping, Prompts-tab shortcuts unaffected).
+
+### Original sketch (reference)
+
 Introduce a top-level tab bar above the existing list/output panels:
 
 ```
@@ -511,7 +532,9 @@ The web UI mirrors this with `/api/workflows`, `/api/drafts` routes proxied thro
 | **2.5** | ✅ shipped | `openspec/changes/` snapshot in scheduler → `SetAnnotation` writes | User-visible auto-link, agnostic-daemon-friendly; 21 new tests. |
 | **2.6** | ✅ shipped | One-shot CLI subcommands implemented | Scriptable usage end-to-end; 23 new tests. |
 | **3**   | ✅ shipped | `clhorde-cli flow` wrappers + scheduler control socket | Single CLI entrypoint; live remote-control of a long-lived scheduler; 25 new tests. |
-| **4**   | ⏳ next | TUI tabs (`Drafts`, `Workflows`) | First-class UX. |
+| **4.1** | ✅ shipped | TUI tabs foundation (read-only Drafts/Workflows) | First-class UX, no actions yet; 13 new tests. |
+| **4.2** | ⏳ next | Tab actions: Q/E/R/X/T | Queue, explore, review, cancel, retry. |
+| **4.3** | ⏳ pending | Workflow detail view + auto-refresh polish | Per-section DAG, push-based updates. |
 | **5**   | ⏳ pending | Web routes + advanced (parallel safety, hooks, multi-repo) | Polish. |
 
 Each phase is independently shippable. Phase 0 alone is already a feature win; Phase 2.4 already produces value for users who want a scriptable workflow runner.
