@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use clhorde_core::pty::PtyDimensions;
 
-use crate::worker::{WorkerInput, WorkerMessage};
+use crate::worker::{WorkerInput, WorkerMessage, WorkerSpawn};
 
 /// Fixed-size circular buffer for PTY output bytes (for late-join replay).
 pub struct PtyRingBuffer {
@@ -77,18 +77,20 @@ pub struct PtyHandle {
     pub ring_buffer: Arc<Mutex<PtyRingBuffer>>,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_pty_worker(
-    prompt_id: usize,
-    prompt_text: String,
-    cwd: Option<String>,
+    req: WorkerSpawn,
     cols: u16,
     rows: u16,
-    tx: mpsc::Sender<WorkerMessage>,
-    resume_session_id: Option<String>,
-    session_id: Option<String>,
-    pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
 ) -> Result<(mpsc::UnboundedSender<WorkerInput>, PtyHandle), String> {
+    let WorkerSpawn {
+        prompt_id,
+        prompt_text,
+        cwd,
+        tx,
+        resume_session_id,
+        session_id,
+        pty_byte_tx,
+    } = req;
     let pty_system = native_pty_system();
 
     let pair = pty_system

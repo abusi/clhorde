@@ -14,6 +14,7 @@
       <div class="nav-links">
         <a href="guide.html">Guide</a>
         <a href="features.html">Features</a>
+        <a href="scheduler.html">Scheduler</a>
         <a href="keybindings.html">Keys</a>
         <a href="configuration.html">Config</a>
         <a href="cli.html">CLI</a>
@@ -42,13 +43,18 @@
       <p>Submit a prompt to the running daemon. Requires <code>clhorded</code>.</p>
 
       <h3>Synopsis</h3>
-      <pre><code><span class="tok-prompt">$ </span>clhorde-cli submit "prompt text" [--mode interactive|one-shot] [--cwd path] [--worktree]</code></pre>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli submit "prompt text" \
+    [--mode interactive|one-shot] [--cwd path] \
+    [--worktree] [--worktree-id &lt;id&gt;] \
+    [--depends-on 1,2,3]</code></pre>
 
       <h3>Options</h3>
       <table>
         <tr><td><code>--mode &lt;mode&gt;</code></td><td>Prompt mode: <code>interactive</code> (default) or <code>one-shot</code></td></tr>
         <tr><td><code>--cwd &lt;path&gt;</code></td><td>Working directory for the prompt</td></tr>
         <tr><td><code>--worktree</code></td><td>Enable git worktree isolation</td></tr>
+        <tr><td><code>--worktree-id &lt;id&gt;</code></td><td>Share a worktree with other prompts that pass the same id (refcount-cleaned). Requires <code>--worktree</code>.</td></tr>
+        <tr><td><code>--depends-on &lt;ids&gt;</code> (alias <code>--after</code>)</td><td>Comma-separated prompt IDs that must reach <code>Completed</code> first. The submitted prompt enters the <code>Blocked</code> state until then. Cycles rejected.</td></tr>
       </table>
 
       <h3>Examples</h3>
@@ -59,7 +65,15 @@ Submitted prompt #1
 Submitted prompt #2
 
 <span class="tok-prompt">$ </span>clhorde-cli submit "Explain this code" --cwd /path/to/project
-Submitted prompt #3</code></pre>
+Submitted prompt #3
+
+<span class="tok-cmt"># Wait until prompts 1 and 2 complete, then run.</span>
+<span class="tok-prompt">$ </span>clhorde-cli submit "Land it" --depends-on 1,2
+Submitted prompt #4 (blocked)
+
+<span class="tok-cmt"># Two prompts share one worktree; daemon creates it once.</span>
+<span class="tok-prompt">$ </span>clhorde-cli submit "Step 1" --worktree --worktree-id flow-42
+<span class="tok-prompt">$ </span>clhorde-cli submit "Step 2" --worktree --worktree-id flow-42 --depends-on 1</code></pre>
     </section>
 
     <hr>
@@ -143,6 +157,65 @@ total: 17</code></pre>
   removed: /home/user/projects/myrepo-wt-3/
   skip (already gone): /home/user/projects/myrepo-wt-5/
 Cleaned 1 worktree(s), 1 already gone, 0 error(s).</code></pre>
+    </section>
+
+    <hr>
+
+    <!-- ── flow ── -->
+    <section id="flow">
+      <h2><code>clhorde-cli flow</code></h2>
+      <p>Drive <a href="https://openspec.dev/">OpenSpec</a> changes via the scheduler. <code>clhorde-cli flow &lt;subcommand&gt; [args]</code> is a verbatim wrapper that forwards to the <code>clhorde-scheduler</code> binary &mdash; you get one CLI entrypoint while the scheduler binary stays usable independently for scripting.</p>
+
+      <p>See the dedicated <a href="scheduler.html">Scheduler &amp; Workflows</a> page for the full conceptual model.</p>
+
+      <h3>Subcommands</h3>
+      <table>
+        <thead><tr><th>Subcommand</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td><code>flow daemon [--root PATH]</code></td><td>Run the long-lived watcher (binds <code>~/.local/share/clhorde/scheduler.sock</code>).</td></tr>
+          <tr><td><code>flow propose &lt;idea...&gt;</code></td><td>Spawn one PTY prompt running <code>/opsx:propose &lt;idea&gt;</code>.</td></tr>
+          <tr><td><code>flow queue &lt;name&gt; [--priority N]</code></td><td>Write <code>openspec/changes/&lt;name&gt;/.clhorde-ready</code>.</td></tr>
+          <tr><td><code>flow unqueue &lt;name&gt;</code></td><td>Remove the marker. Idempotent.</td></tr>
+          <tr><td><code>flow drafts</code></td><td>List unqueued OpenSpec changes.</td></tr>
+          <tr><td><code>flow status [name]</code></td><td>List every workflow, or dump a single one with priority, deps, timestamps, prompt UUIDs, and <code>blocked_by</code>.</td></tr>
+          <tr><td><code>flow apply &lt;name&gt;</code></td><td>One-shot dispatch of the next ready section &mdash; works without a watcher.</td></tr>
+          <tr><td><code>flow archive &lt;name&gt;</code></td><td>Run the archive template for a verified change.</td></tr>
+          <tr><td><code>flow cancel &lt;name&gt;</code></td><td>Remove the marker and update persisted state.</td></tr>
+          <tr><td><code>flow retry &lt;name&gt; --section N</code></td><td>Re-dispatch a failed section (accepts dotted ids like <code>3.2</code>).</td></tr>
+          <tr><td><code>flow templates path</code></td><td>Print the user template directory.</td></tr>
+          <tr><td><code>flow templates edit</code></td><td>Open the user template directory in <code>$EDITOR</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <p>A global <code>--log &lt;filter&gt;</code> flag overrides the default tracing filter, e.g. <code>--log debug</code> or <code>--log info,clhorde_scheduler=debug</code>.</p>
+
+      <h3>Examples</h3>
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli flow daemon <span class="tok-flag">--root</span> ~/code/myrepo &amp;
+
+<span class="tok-prompt">$ </span>clhorde-cli flow drafts
+add-billing-dashboard
+add-oauth-login
+
+<span class="tok-prompt">$ </span>clhorde-cli flow queue add-oauth-login <span class="tok-flag">--priority</span> 5
+queued: add-oauth-login
+
+<span class="tok-prompt">$ </span>clhorde-cli flow status add-oauth-login
+status: implementing
+priority: 5
+section_progress: 2/5
+prompts: 47, 48 (active)
+depends_on: add-base-auth (archived)
+
+<span class="tok-prompt">$ </span>clhorde-cli flow retry add-oauth-login <span class="tok-flag">--section</span> 3.2
+retried section 3.2 (prompt #51)
+
+<span class="tok-prompt">$ </span>clhorde-cli flow cancel add-oauth-login
+cancelled: add-oauth-login</code></pre>
+
+      <div class="callout info">
+        <div class="callout-title">FS-only vs. daemon-coupled</div>
+        <p>FS-only commands (<code>queue</code>, <code>unqueue</code>, <code>drafts</code>, <code>status</code>, <code>templates</code>) work without a running scheduler &mdash; they touch <code>openspec/changes/</code> and <code>~/.local/share/clhorde/workflows/</code> directly. Daemon-coupled commands (<code>apply</code>, <code>archive</code>, <code>cancel</code>, <code>retry</code>, <code>propose</code>) need <code>clhorded</code> running.</p>
+      </div>
     </section>
 
     <hr>

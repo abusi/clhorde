@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Scheduler &amp; Workflows — clhorde</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a href="index.html" class="nav-brand"><span>&gt;_ </span>clhorde</a>
+      <button class="hamburger" aria-label="Menu">&#9776;</button>
+      <div class="nav-links">
+        <a href="guide.html">Guide</a>
+        <a href="features.html">Features</a>
+        <a href="scheduler.html">Scheduler</a>
+        <a href="keybindings.html">Keys</a>
+        <a href="configuration.html">Config</a>
+        <a href="cli.html">CLI</a>
+        <a href="web.html">Web</a>
+        <a href="cheatsheet.html">Cheatsheet</a>
+        <a href="https://github.com/abusi/clhorde" class="github-link">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <h1>Scheduler &amp; Workflows</h1>
+    <p class="lead">Drive <a href="https://openspec.dev/">OpenSpec</a> changes to completion with a DAG of dependent prompts. The TUI stays your <em>workshop</em> for exploring ideas; the scheduler is the <em>conductor</em> that implements them while you keep working.</p>
+
+    <div class="callout info">
+      <div class="callout-title">New in this release</div>
+      <p>The scheduler is a separate long-lived binary (<code>clhorde-scheduler</code>) that runs alongside <code>clhorded</code>. It is a thin client of the daemon &mdash; everything it does goes through the same IPC the TUI and CLI use. The daemon itself stays workflow-agnostic.</p>
+    </div>
+
+    <ul>
+      <li><a href="#two-modes">Two modes of working</a></li>
+      <li><a href="#install">Install &amp; run the scheduler</a></li>
+      <li><a href="#marker">The <code>.clhorde-ready</code> marker</a></li>
+      <li><a href="#lifecycle">Workflow lifecycle</a></li>
+      <li><a href="#tasks">tasks.md syntax</a></li>
+      <li><a href="#annotations">DAG annotations</a></li>
+      <li><a href="#dependencies">Inter-workflow dependencies</a></li>
+      <li><a href="#templates">Prompt templates</a></li>
+      <li><a href="#flow-cli">CLI: <code>clhorde-cli flow</code></a></li>
+      <li><a href="#tui-tabs">TUI: Drafts &amp; Workflows tabs</a></li>
+      <li><a href="#web-tabs">Web dashboard tabs</a></li>
+      <li><a href="#daemon-primitives">Daemon primitives (deps, shared worktrees, annotations)</a></li>
+      <li><a href="#end-to-end">End-to-end recipe</a></li>
+    </ul>
+
+    <hr>
+
+    <!-- ── Two modes ── -->
+    <section id="two-modes" class="feature-section">
+      <h2>Two modes of working</h2>
+
+      <div class="card-grid">
+        <div class="card">
+          <h3>Exploration (you &harr; Claude)</h3>
+          <p>Long-lived interactive PTY. You iterate with Claude on a proposal until <code>openspec/changes/&lt;name&gt;/</code> is in shape.</p>
+          <p>Lives in the existing <strong>Prompts</strong> tab.</p>
+        </div>
+        <div class="card">
+          <h3>Execution (scheduler &harr; Claude &times; N)</h3>
+          <p>A DAG of dependent prompts dispatched to <code>clhorded</code>. Each section of <code>tasks.md</code> becomes a prompt; sections share a worktree, run in dependency order, and tick off their checkboxes.</p>
+          <p>Lives in the new <strong>Drafts</strong> and <strong>Workflows</strong> tabs.</p>
+        </div>
+      </div>
+
+      <p>You explore <em>N</em> ideas in parallel in the TUI. When an idea matures, you queue it &mdash; the scheduler picks it up and implements it while you keep exploring the next one. Both modes share the same worker pool bounded by <code>max_workers</code>.</p>
+    </section>
+
+    <!-- ── Install ── -->
+    <section id="install" class="feature-section">
+      <h2>Install &amp; run the scheduler</h2>
+
+      <p>The scheduler is built as part of <code>cargo build --release</code>. It is a separate process from <code>clhorded</code>:</p>
+
+      <pre><code><span class="tok-cmt"># 1. Daemon must be running</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">clhorded</span> &amp;
+
+<span class="tok-cmt"># 2. Run the scheduler watcher in the repo you want to drive</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">cd</span> /path/to/repo
+<span class="tok-prompt">$ </span><span class="tok-cmd">clhorde-scheduler</span> daemon
+
+<span class="tok-cmt"># Or watch a different root explicitly:</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">clhorde-scheduler</span> daemon <span class="tok-flag">--root</span> /path/to/repo</code></pre>
+
+      <p>The scheduler:</p>
+      <ul>
+        <li>Connects to <code>clhorded</code> over its Unix socket.</li>
+        <li>Watches <code>&lt;root&gt;/openspec/changes/</code> for <code>.clhorde-ready</code> markers.</li>
+        <li>Opens its own control socket at <code>~/.local/share/clhorde/scheduler.sock</code> for the TUI, web bridge, and <code>clhorde-cli flow</code> commands.</li>
+        <li>Persists workflow state to <code>~/.local/share/clhorde/workflows/&lt;name&gt;.json</code>.</li>
+      </ul>
+
+      <div class="callout">
+        <div class="callout-title">Two daemons, one CLI</div>
+        <p>You can run <code>clhorde-cli flow daemon</code> as a shorthand for <code>clhorde-scheduler daemon</code>. The <code>flow</code> sub-command is a verbatim wrapper that forwards every argument to the scheduler binary.</p>
+      </div>
+    </section>
+
+    <!-- ── Marker ── -->
+    <section id="marker" class="feature-section">
+      <h2>The <code>.clhorde-ready</code> marker</h2>
+
+      <p>A change in <code>openspec/changes/&lt;name&gt;/</code> is picked up by the scheduler if and only if a <code>.clhorde-ready</code> file sits next to its <code>tasks.md</code>. This is the explicit hand-off contract between exploration and execution &mdash; the scheduler never auto-promotes a draft.</p>
+
+      <p>The file is plain <strong>TOML</strong>. All fields are optional and unknown fields are silently ignored:</p>
+
+      <pre><code><span class="tok-cmt"># openspec/changes/&lt;name&gt;/.clhorde-ready</span>
+<span class="tok-key">priority</span> = <span class="tok-val">5</span>                       <span class="tok-cmt"># higher runs first when workers free up</span>
+<span class="tok-key">depends_on</span> = [<span class="tok-str">"add-base-auth"</span>]      <span class="tok-cmt"># other change names that must reach Archived first</span>
+<span class="tok-key">worktree_branch</span> = <span class="tok-str">"feature/oauth"</span>   <span class="tok-cmt"># default: detached HEAD</span>
+<span class="tok-key">parallel_sections</span> = [<span class="tok-str">"3"</span>]           <span class="tok-cmt"># section ids safe to run in parallel</span>
+<span class="tok-key">max_section_retries</span> = <span class="tok-val">2</span>            <span class="tok-cmt"># override default retry budget for this workflow</span></code></pre>
+
+      <h3>How the marker gets there</h3>
+      <ul>
+        <li><strong>TUI:</strong> press <kbd>Q</kbd> on a draft in the Drafts tab.</li>
+        <li><strong>CLI:</strong> <code>clhorde-cli flow queue &lt;name&gt; [--priority N]</code></li>
+        <li><strong>By hand:</strong> <code>touch openspec/changes/&lt;name&gt;/.clhorde-ready</code></li>
+        <li><strong>Claude itself:</strong> at the end of <code>/opsx:propose</code>, the agent can write the marker if you confirmed.</li>
+      </ul>
+
+      <p>The scheduler removes the marker after archiving (the change leaves the queue naturally) or via <code>clhorde-cli flow unqueue &lt;name&gt;</code>. The marker is normal Git, so check it in or <code>.gitignore</code> it &mdash; both patterns are fine.</p>
+    </section>
+
+    <!-- ── Lifecycle ── -->
+    <section id="lifecycle" class="feature-section">
+      <h2>Workflow lifecycle</h2>
+
+      <p>A change moves through this state machine. Most transitions are automatic; the user controls only the <em>queue</em> boundary.</p>
+
+      <pre><code><span class="tok-section">[Drafted]</span>     &mdash; user reviews / refines &mdash;&gt; <span class="tok-section">[Drafted]</span>     <span class="tok-cmt">(loops while exploring)</span>
+<span class="tok-section">[Drafted]</span>     &mdash; queue (marker file) &mdash;&mdash;&mdash;&mdash;&mdash;&gt; <span class="tok-section">[Queued]</span>
+<span class="tok-section">[Queued]</span>      &mdash; scheduler picks up &mdash;&mdash;&mdash;&mdash;&mdash;&gt; <span class="tok-section">[Implementing]</span>  <span class="tok-cmt">(apply phase, DAG dispatch)</span>
+<span class="tok-section">[Implementing]</span> &mdash; all sections done &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&gt; <span class="tok-section">[Verifying]</span>
+<span class="tok-section">[Verifying]</span>   &mdash; ok &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&gt; <span class="tok-section">[Archiving]</span>
+<span class="tok-section">[Archiving]</span>   &mdash; done &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&gt; <span class="tok-section">[Archived]</span>
+<span class="tok-section">[*]</span>           &mdash; user cancels &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&gt; <span class="tok-section">[Cancelled]</span>
+<span class="tok-section">[*]</span>           &mdash; failure &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&gt; <span class="tok-section">[Failed]</span>     <span class="tok-cmt">(retry possible)</span></code></pre>
+
+      <p>State labels render in the Drafts/Workflows tabs (TUI &amp; web) with consistent colors:</p>
+      <ul>
+        <li><code>drafted</code>, <code>queued</code> &mdash; gray / amber</li>
+        <li><code>implementing</code>, <code>verifying</code>, <code>archiving</code> &mdash; cyan / blue</li>
+        <li><code>archived</code> &mdash; green</li>
+        <li><code>cancelled</code> &mdash; magenta</li>
+        <li><code>failed</code> &mdash; red</li>
+      </ul>
+
+      <p>A <code>queued</code> workflow whose dependencies haven't all archived shows an additional yellow <strong>&middot; blocked</strong> annotation &mdash; see <a href="#dependencies">Inter-workflow dependencies</a>.</p>
+    </section>
+
+    <!-- ── tasks.md ── -->
+    <section id="tasks" class="feature-section">
+      <h2><code>tasks.md</code> syntax</h2>
+
+      <p>The scheduler parses <code>openspec/changes/&lt;name&gt;/tasks.md</code> after every worker run to figure out what's done and what runs next. The recognized syntax is a small, OpenSpec-friendly subset of Markdown:</p>
+
+      <pre><code><span class="tok-cmt"># Plan title (free-form prose, ignored)</span>
+
+<span class="tok-section">## 1. Theme Infrastructure</span>
+- [ ] 1.1 Create ThemeContext
+- [ ] 1.2 Add CSS variables
+
+<span class="tok-section">## 2. UI Components</span>
+- [ ] 2.1 Build toggle component
+- [x] 2.2 Wire it into the navbar    <span class="tok-cmt"># already done</span>
+
+<span class="tok-section">### 2.3 Sub-section example</span>
+- [ ] 2.3.1 Nested task</code></pre>
+
+      <h3>What the parser recognizes</h3>
+      <ul>
+        <li><code>## N. Title</code> &mdash; numbered top-level section.</li>
+        <li><code>### N.M Title</code> &mdash; sub-section with dotted id.</li>
+        <li><code>- [ ]</code>, <code>- [x]</code>, <code>- [X]</code> &mdash; tasks. <code>*</code> and <code>+</code> work too as list markers.</li>
+        <li>Free-form prose between items is fine and ignored.</li>
+        <li>Fenced code blocks (<code>```</code> or <code>~~~</code>) are skipped, so task-like lines inside code samples never accidentally enter the DAG.</li>
+        <li>Inline <code>&lt;!-- ... --&gt;</code> comments are stripped from titles &amp; task text but preserved on the source line for the annotations pass.</li>
+        <li>Tasks before the first heading and headings without a leading dotted id are dropped.</li>
+      </ul>
+
+      <p>The default <strong>granularity</strong> is one prompt per leaf section. Sections run sequentially in source order: section <em>N</em> depends on section <em>N&minus;1</em>. Override this with annotations.</p>
+    </section>
+
+    <!-- ── Annotations ── -->
+    <section id="annotations" class="feature-section">
+      <h2>DAG annotations</h2>
+
+      <p>HTML comments on a heading or task line let you customize the DAG without leaving Markdown. The general form is:</p>
+
+      <pre><code><span class="tok-cmt">&lt;!-- clhorde: key value; key2 value2 --&gt;</span></code></pre>
+
+      <p>Multiple directives are separated by <code>;</code>. Multi-value lists can be separated by <code>,</code> or whitespace. Unknown keys are silently ignored.</p>
+
+      <pre><code><span class="tok-section">## 3. Tests</span> <span class="tok-cmt">&lt;!-- clhorde: depends 2; parallel-with 4 --&gt;</span>
+- [ ] 3.1 Unit tests
+- [ ] 3.2 E2E suite <span class="tok-cmt">&lt;!-- clhorde: needs 2.1 --&gt;</span>
+
+<span class="tok-section">## 4. Docs</span> <span class="tok-cmt">&lt;!-- clhorde: prompt-template apply-section-quiet --&gt;</span>
+- [ ] 4.1 Update README</code></pre>
+
+      <h3>Recognized keys</h3>
+      <table>
+        <thead><tr><th>Key</th><th>Where</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>depends</code></td><td>section heading</td><td>Section ids this section runs <em>after</em>. Replaces the default sequential edge.</td></tr>
+          <tr><td><code>parallel-with</code></td><td>section heading</td><td>Section ids that may run concurrently with this one. Recorded as a hint without removing existing edges.</td></tr>
+          <tr><td><code>needs</code></td><td>task line</td><td>Dotted task ids the annotated task depends on (used when granularity is <code>task</code>).</td></tr>
+          <tr><td><code>granularity</code></td><td>any heading (first wins)</td><td><code>section</code> (default), <code>task</code>, or <code>phase</code>. See below.</td></tr>
+          <tr><td><code>prompt-template</code></td><td>section heading</td><td>Override the template name for this section.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Granularity</h3>
+      <ul>
+        <li><strong><code>section</code></strong> (default) &mdash; one prompt per leaf section. Best balance of context vs. parallelism.</li>
+        <li><strong><code>task</code></strong> &mdash; one prompt per <code>- [ ]</code> task. Use sparingly &mdash; context overhead is steep.</li>
+        <li><strong><code>phase</code></strong> &mdash; collapses everything into one big <code>apply</code> prompt. Falls back to OpenSpec's native flow.</li>
+      </ul>
+    </section>
+
+    <!-- ── Dependencies ── -->
+    <section id="dependencies" class="feature-section">
+      <h2>Inter-workflow dependencies</h2>
+
+      <p><code>depends_on = ["other-change-name", ...]</code> in a <code>.clhorde-ready</code> marker holds a workflow in <code>queued</code> until every named dependency reaches <code>Archived</code>. There is no separate <em>blocked</em> status &mdash; a held workflow is just <code>queued</code> with a non-empty <code>blocked_by</code> list.</p>
+
+      <h3>What blocks</h3>
+      <table>
+        <thead><tr><th>Dependency state</th><th>Outcome</th></tr></thead>
+        <tbody>
+          <tr><td><code>Drafted</code> / <code>Queued</code> / <code>Implementing</code> / <code>Verifying</code> / <code>Archiving</code></td><td>Stays <code>Queued</code>, surfaced in <code>blocked_by</code>.</td></tr>
+          <tr><td><code>Archived</code> (all deps)</td><td>Transitions to <code>Implementing</code>.</td></tr>
+          <tr><td><code>Cancelled</code></td><td>Dependent <strong>fails</strong> with <em>"dependency '&lt;name&gt;' was cancelled"</em>.</td></tr>
+          <tr><td><code>Failed</code></td><td>Dependent <strong>fails</strong> with <em>"dependency '&lt;name&gt;' failed: &lt;reason&gt;"</em>.</td></tr>
+          <tr><td>Missing change directory</td><td>Dependent <strong>fails</strong> with <em>"dependency '&lt;name&gt;' not found"</em>.</td></tr>
+          <tr><td>Cycle reachable</td><td>Every workflow in the cycle <strong>fails</strong> with <em>"dependency cycle: A &rarr; B &rarr; A"</em>.</td></tr>
+        </tbody>
+      </table>
+
+      <p>When a workflow archives, the orchestrator sweeps every dependent and re-evaluates &mdash; a previously-stuck workflow picks up automatically without an FS event.</p>
+
+      <h3>Where you see it</h3>
+      <ul>
+        <li><strong>CLI:</strong> <code>clhorde-cli flow status &lt;name&gt;</code> annotates each dep with its current state and adds a <code>blocked_by:</code> line:
+          <pre><code><span class="tok-prompt">$ </span>clhorde-cli flow status add-oauth-login
+status: queued
+priority: 5
+depends_on: add-base-auth (archived), shared-tokens (queued), ghost-change (not found)
+blocked_by: shared-tokens, ghost-change</code></pre>
+        </li>
+        <li><strong>TUI:</strong> Workflows pane row gets a yellow <code>&middot; blocked</code> suffix; the detail overlay header gains a <code>Blocked by: A, B</code> line.</li>
+        <li><strong>Web:</strong> same suffix on the row (with a tooltip listing the deps); the expanded card header has a full-width <code>Blocked by: ...</code> line.</li>
+      </ul>
+
+      <p>The <code>blocked_by</code> field is wire-back-compat: older clients that don't know about it simply don't render the suffix.</p>
+    </section>
+
+    <!-- ── Templates ── -->
+    <section id="templates" class="feature-section">
+      <h2>Prompt templates</h2>
+
+      <p>Each phase of a workflow renders a prompt from a <a href="https://keats.github.io/tera/">Tera</a> template. Four template names are reserved:</p>
+
+      <table>
+        <thead><tr><th>Name</th><th>Used by</th></tr></thead>
+        <tbody>
+          <tr><td><code>propose</code></td><td><code>clhorde-scheduler propose &lt;idea&gt;</code></td></tr>
+          <tr><td><code>apply-section</code></td><td>Each section in the apply phase</td></tr>
+          <tr><td><code>verify</code></td><td>Single verify-phase prompt</td></tr>
+          <tr><td><code>archive</code></td><td>Single archive-phase prompt (<code>/opsx:archive</code>)</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Override layering</h3>
+      <p>Resolution order, first match wins:</p>
+      <ol>
+        <li><strong>Per-project:</strong> <code>&lt;root&gt;/openspec/.clhorde-scheduler/templates/&lt;name&gt;.md</code></li>
+        <li><strong>User:</strong> <code>~/.config/clhorde/scheduler/templates/&lt;name&gt;.md</code></li>
+        <li><strong>Built-in:</strong> compiled into the binary, exists for every name above.</li>
+      </ol>
+
+      <p>Malformed or unreadable overrides log a warning and fall through to the next layer. Only the four known names are renderable, so a stray file with a typo can't accidentally route a prompt.</p>
+
+      <pre><code><span class="tok-prompt">$ </span>clhorde-scheduler templates path
+/home/user/.config/clhorde/scheduler/templates
+
+<span class="tok-prompt">$ </span>clhorde-scheduler templates edit   <span class="tok-cmt"># opens dir in $EDITOR</span></code></pre>
+    </section>
+
+    <!-- ── flow CLI ── -->
+    <section id="flow-cli" class="feature-section">
+      <h2>CLI: <code>clhorde-cli flow</code></h2>
+
+      <p><code>clhorde-cli flow &lt;subcommand&gt;</code> is a thin wrapper that forwards to the <code>clhorde-scheduler</code> binary. You get one CLI entrypoint; the scheduler binary stays usable independently for scripting.</p>
+
+      <table>
+        <thead><tr><th>Subcommand</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>flow daemon [--root PATH]</code></td><td>Run the long-lived watcher.</td></tr>
+          <tr><td><code>flow propose &lt;idea...&gt;</code></td><td>Spawn one PTY prompt running <code>/opsx:propose &lt;idea&gt;</code> and wait for a new <code>openspec/changes/&lt;X&gt;/</code> directory.</td></tr>
+          <tr><td><code>flow queue &lt;name&gt; [--priority N]</code></td><td>Write the <code>.clhorde-ready</code> marker. Refuses if the change directory is missing.</td></tr>
+          <tr><td><code>flow unqueue &lt;name&gt;</code></td><td>Remove the marker. Idempotent.</td></tr>
+          <tr><td><code>flow drafts</code></td><td>List unqueued OpenSpec changes.</td></tr>
+          <tr><td><code>flow status [name]</code></td><td>List every workflow, or dump a single one with priority, deps, timestamps, prompt UUIDs, and <code>blocked_by</code>.</td></tr>
+          <tr><td><code>flow apply &lt;name&gt;</code></td><td>One-shot dispatch of the next ready section &mdash; works even without a long-lived watcher.</td></tr>
+          <tr><td><code>flow archive &lt;name&gt;</code></td><td>Run <code>/opsx:archive</code> for a verified change.</td></tr>
+          <tr><td><code>flow cancel &lt;name&gt;</code></td><td>Remove the marker and update persisted state. A running watcher cancels through the orchestrator.</td></tr>
+          <tr><td><code>flow retry &lt;name&gt; --section N</code></td><td>Re-dispatch a failed section (accepts dotted ids like <code>3.2</code>).</td></tr>
+          <tr><td><code>flow templates path|edit</code></td><td>Show or open the user template directory in <code>$EDITOR</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <p>Add <code>--log debug</code> (a global flag) for verbose logs.</p>
+
+      <div class="callout tip">
+        <div class="callout-title">Standalone or watched</div>
+        <p>FS-only commands (<code>queue</code>, <code>unqueue</code>, <code>drafts</code>, <code>status</code>, <code>templates</code>) work without a running scheduler &mdash; they touch <code>openspec/changes/</code> and <code>~/.local/share/clhorde/workflows/</code> directly. Daemon-coupled commands (<code>apply</code>, <code>archive</code>, <code>cancel</code>, <code>retry</code>, <code>propose</code>) need <code>clhorded</code> running.</p>
+      </div>
+    </section>
+
+    <!-- ── TUI tabs ── -->
+    <section id="tui-tabs" class="feature-section">
+      <h2>TUI: Drafts &amp; Workflows tabs</h2>
+
+      <p>The TUI gained a top-of-screen tab bar:</p>
+
+      <pre><code> [1] Prompts   [2] Drafts   [3] Workflows </code></pre>
+
+      <p>Press <kbd>1</kbd>, <kbd>2</kbd>, <kbd>3</kbd> from Normal mode to switch. The Prompts tab is unchanged.</p>
+
+      <h3>Drafts tab</h3>
+      <p>Lists every <code>openspec/changes/&lt;X&gt;/</code> without a <code>.clhorde-ready</code> marker. Useful as your "ideas in flight" view.</p>
+
+      <table>
+        <thead><tr><th>Key</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Navigate</td></tr>
+          <tr><td><kbd>g</kbd> / <kbd>G</kbd></td><td>Top / bottom</td></tr>
+          <tr><td><kbd>r</kbd></td><td>Force a refresh from the scheduler</td></tr>
+          <tr><td><kbd>Q</kbd></td><td>Queue this draft (writes the marker)</td></tr>
+          <tr><td><kbd>E</kbd></td><td>Continue exploring &mdash; jumps to Prompts + Insert with <code>&lt;scheduler-root&gt;: </code> seeded</td></tr>
+          <tr><td><kbd>R</kbd></td><td>Open <code>proposal.md</code> (or <code>design.md</code>) in <code>$PAGER</code></td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>Back to Prompts</td></tr>
+          <tr><td><kbd>?</kbd></td><td>Help overlay</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Workflows tab</h3>
+      <p>Queued + active + recently-finished workflows, color-coded by status. A yellow <code>&middot; blocked</code> suffix tags any workflow held by an unmet inter-workflow dep.</p>
+
+      <table>
+        <thead><tr><th>Key</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Navigate</td></tr>
+          <tr><td><kbd>Enter</kbd></td><td>Open the detail overlay (per-section DAG)</td></tr>
+          <tr><td><kbd>X</kbd></td><td>Cancel this workflow</td></tr>
+          <tr><td><kbd>T</kbd></td><td>Open the inline retry-section prompt (dotted decimals, e.g. <code>3.2</code>)</td></tr>
+          <tr><td><kbd>R</kbd></td><td>Open <code>proposal.md</code> / <code>design.md</code> in <code>$PAGER</code></td></tr>
+          <tr><td><kbd>r</kbd></td><td>Force a refresh</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Detail overlay</h3>
+      <p>Press <kbd>Enter</kbd> on a workflow to zoom in. The overlay shows each apply-DAG node (id, label, state, prompt id, exit code, deps) plus the verify and archive singletons.</p>
+
+      <table>
+        <thead><tr><th>Key</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Scroll</td></tr>
+          <tr><td><kbd>gg</kbd> / <kbd>G</kbd></td><td>Top / bottom</td></tr>
+          <tr><td><kbd>r</kbd></td><td>Force-refresh detail (push events keep it live on their own)</td></tr>
+          <tr><td><kbd>X</kbd> / <kbd>T</kbd> / <kbd>R</kbd></td><td>Cancel / retry section / open in pager &mdash; targets the open workflow</td></tr>
+          <tr><td><kbd>Esc</kbd> / <kbd>Enter</kbd></td><td>Close overlay</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout info">
+        <div class="callout-title">Push, not poll</div>
+        <p>The TUI subscribes to <code>SchedulerEvent</code> over the scheduler control socket. Both the workflow lists <em>and</em> the detail overlay update reactively as the orchestrator emits diffs &mdash; no 2-second polling. Title bars carry a freshness suffix (<code>fresh</code>, <code>12s</code>, <code>3m</code>, <code>1h</code>) so you can see at a glance how stale the view is. If the scheduler isn't reachable, the panes show a <em>"scheduler not reachable &mdash; start with: clhorde-scheduler daemon"</em> banner.</p>
+      </div>
+    </section>
+
+    <!-- ── Web tabs ── -->
+    <section id="web-tabs" class="feature-section">
+      <h2>Web dashboard tabs</h2>
+
+      <p>The web SPA gets two new top-nav tabs that mirror the TUI:</p>
+      <ul>
+        <li><strong>Drafts</strong> &mdash; list of unqueued changes. Each row has a <code>[Queue]</code> button.</li>
+        <li><strong>Workflows</strong> &mdash; status-coloured rows. <code>[Open]</code> zooms into a detail block fetched on demand. <code>[Cancel]</code> runs a confirmed cancel. The detail block has an inline <code>[Retry section]</code> control. Blocked workflows show the same <code>&middot; blocked</code> suffix and a <strong>Blocked by: ...</strong> line in the detail.</li>
+      </ul>
+
+      <p>The browser stays live via WebSocket: the existing <code>/api/ws</code> endpoint now multiplexes <code>SchedulerEvent</code> frames alongside the daemon broadcasts. New REST routes back the SPA actions:</p>
+
+      <table>
+        <thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET</code></td><td><code>/api/scheduler/status</code></td><td>List every known workflow + the watched root + a <code>connected</code> flag.</td></tr>
+          <tr><td><code>GET</code></td><td><code>/api/scheduler/workflow/{name}</code></td><td>Per-workflow detail (DAG nodes + per-phase dispatch state).</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/scheduler/workflow/{name}/queue</code></td><td>Body: <code>{ "priority"?: int }</code>. Writes the marker.</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/scheduler/workflow/{name}/cancel</code></td><td>Removes the marker and transitions.</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/scheduler/workflow/{name}/retry</code></td><td>Body: <code>{ "section": "3.2" }</code>. Re-dispatches one apply node.</td></tr>
+        </tbody>
+      </table>
+
+      <p>Error mapping: <code>503</code> when the scheduler isn't running, <code>504</code> on timeout, <code>502</code> on bridge IO error, <code>404</code> for unknown workflow on detail, <code>400</code> for malformed mutations.</p>
+
+      <p>WebSocket envelope:</p>
+      <pre><code>{
+  <span class="tok-key">"type"</span>: <span class="tok-str">"SchedulerEvent"</span>,
+  <span class="tok-key">"event"</span>: {
+    <span class="tok-key">"type"</span>: <span class="tok-str">"WorkflowUpdated"</span>,
+    <span class="tok-key">"summary"</span>: { <span class="tok-key">"name"</span>: <span class="tok-str">"add-oauth-login"</span>, <span class="tok-key">"status"</span>: <span class="tok-str">"implementing"</span>, ... }
+  }
+}</code></pre>
+
+      <p>Variants: <code>Snapshot</code>, <code>WorkflowUpdated</code>, <code>DetailSnapshot</code>, <code>DetailUpdated</code>. The bridge starts even when the scheduler is offline &mdash; the daemon-only views (Prompts/Store) keep working &mdash; and reconnects in the background.</p>
+
+      <div class="callout">
+        <div class="callout-title">Auth</div>
+        <p>The <code>--auth-token</code> middleware on <code>clhorde-web</code> gates the new routes too. The scheduler control socket itself has no built-in auth and relies on filesystem permissions, exactly like the daemon socket.</p>
+      </div>
+    </section>
+
+    <!-- ── Daemon primitives ── -->
+    <section id="daemon-primitives" class="feature-section">
+      <h2>Daemon primitives</h2>
+
+      <p>Three new primitives in <code>clhorded</code> make the scheduler possible &mdash; and are useful on their own. They are workflow-agnostic; the daemon knows nothing about OpenSpec.</p>
+
+      <h3>Prompt dependencies</h3>
+      <p>A prompt can name other prompts as deps. It enters the new <code>Blocked</code> state until every dep reaches <code>Completed</code>. If a dep <code>Failed</code>, the dependent stays <code>Blocked</code> indefinitely (no auto-cascade; you decide what to do).</p>
+      <ul>
+        <li><strong>CLI:</strong> <code>clhorde-cli submit "..." --depends-on 1,2,3</code> (alias <code>--after</code>).</li>
+        <li><strong>Web:</strong> <code>POST /api/prompts</code> body field <code>"depends_on": [1, 2]</code>.</li>
+        <li>Cycles are rejected with a clear error.</li>
+        <li>Deletion purges the dead UUID from any other prompt's <code>depends_on</code>.</li>
+      </ul>
+
+      <h3>Shared worktrees</h3>
+      <p>Two prompts can share a single git worktree by carrying the same <code>worktree_id</code>. The daemon creates the worktree once on the first dispatch, broadcasts the resolved path to every sibling, and refcount-cleans it when the last sibling reaches a terminal state.</p>
+      <ul>
+        <li><strong>CLI:</strong> <code>clhorde-cli submit "..." --worktree --worktree-id flow-42</code></li>
+        <li><strong>Web:</strong> <code>POST /api/prompts</code> body field <code>"worktree_id": "flow-42"</code>.</li>
+        <li>Retried prompts rejoin their original worktree.</li>
+        <li>Worktree directory layout: <code>&lt;repo&gt;-wt-&lt;sanitized-id&gt;/</code> &mdash; sanitization keeps <code>[A-Za-z0-9._-]</code> only.</li>
+      </ul>
+
+      <h3>Generic prompt annotations</h3>
+      <p>Each prompt now carries an opaque <code>annotations: { string &rarr; JSON }</code> bag the daemon stores, persists, and broadcasts but never interprets. Anyone can write keys via <code>SetAnnotation { prompt_id, key, value }</code>; <code>value: null</code> removes the key.</p>
+      <p>The well-known key <code>openspec.affected_changes</code> is written by the scheduler on every <code>WorkerFinished</code> &mdash; it lists OpenSpec changes whose files the worker touched. The TUI's Drafts tab uses this to suggest "queue this change?". Other workflow sources (Linear, GitHub Issues) can claim their own keys without touching the daemon.</p>
+    </section>
+
+    <!-- ── End-to-end ── -->
+    <section id="end-to-end" class="feature-section">
+      <h2>End-to-end recipe</h2>
+
+      <pre><code><span class="tok-cmt"># 0. Have the daemon and the scheduler running</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">clhorded</span> &amp;
+<span class="tok-prompt">$ </span><span class="tok-cmd">clhorde-scheduler</span> daemon <span class="tok-flag">--root</span> ~/code/myrepo &amp;
+
+<span class="tok-cmt"># 1. Explore in the TUI &mdash; drafts a change.</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">clhorde</span>
+<span class="tok-cmt">#   (in TUI) press i, type: /opsx:propose Add OAuth login</span>
+<span class="tok-cmt">#   Claude creates ~/code/myrepo/openspec/changes/add-oauth-login/</span>
+
+<span class="tok-cmt"># 2. Queue it (TUI: press 2 then Q on the row, or:)</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">clhorde-cli</span> flow queue add-oauth-login --priority 5
+
+<span class="tok-cmt"># 3. Watch progress.</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">clhorde-cli</span> flow status add-oauth-login
+status: implementing
+priority: 5
+section_progress: 2/5
+prompts: 47, 48 (active)
+
+<span class="tok-cmt"># 4. Keep exploring something else in parallel.</span>
+<span class="tok-cmt">#   (in TUI) press 1, then i, new prompt: /opsx:propose Add billing dashboard</span>
+
+<span class="tok-cmt"># 5. Eventually:</span>
+<span class="tok-prompt">$ </span><span class="tok-cmd">clhorde-cli</span> flow status add-oauth-login
+status: archived
+duration: 18m
+sections: 5
+retries: 3</code></pre>
+
+      <p>If a section fails:</p>
+      <pre><code><span class="tok-prompt">$ </span><span class="tok-cmd">clhorde-cli</span> flow retry add-oauth-login <span class="tok-flag">--section</span> 3.2</code></pre>
+
+      <p>If you want to chain workflows, point one's marker at another:</p>
+      <pre><code><span class="tok-cmt"># openspec/changes/add-oauth-ui/.clhorde-ready</span>
+<span class="tok-key">depends_on</span> = [<span class="tok-str">"add-oauth-login"</span>]</code></pre>
+
+      <p>The <code>add-oauth-ui</code> workflow stays <code>queued</code> with <code>blocked_by: ["add-oauth-login"]</code> until <code>add-oauth-login</code> archives, then transitions automatically.</p>
+    </section>
+
+  </main>
+
+  <footer>
+    <span>MIT License</span>
+    <a href="https://github.com/abusi/clhorde">Source</a>
+    <a href="https://github.com/abusi/clhorde/issues">Issues</a>
+  </footer>
+
+  <script src="js/main.js"></script>
+</body>
+</html>

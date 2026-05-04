@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Serialize, Deserialize)]
 pub struct PromptFile {
@@ -14,6 +16,11 @@ pub struct PromptFile {
     pub worktree_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// Opaque client-managed annotations (see `Prompt::annotations`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -22,6 +29,8 @@ pub struct PromptOptions {
     pub context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
 }
 
 pub fn default_prompts_dir() -> Option<PathBuf> {
@@ -108,6 +117,7 @@ impl PromptFile {
         let mode = prompt.mode.label();
         let state = match prompt.status {
             crate::prompt::PromptStatus::Pending => "pending",
+            crate::prompt::PromptStatus::Blocked => "blocked",
             crate::prompt::PromptStatus::Running => "running",
             crate::prompt::PromptStatus::Idle => "running",
             crate::prompt::PromptStatus::Completed => "completed",
@@ -119,12 +129,15 @@ impl PromptFile {
                 mode: mode.to_string(),
                 context: prompt.cwd.clone(),
                 worktree: if prompt.worktree { Some(true) } else { None },
+                worktree_id: prompt.worktree_id.clone(),
             },
             state: state.to_string(),
             queue_rank: prompt.queue_rank,
             session_id: prompt.session_id.clone(),
             worktree_path: prompt.worktree_path.clone(),
             tags: prompt.tags.clone(),
+            depends_on: prompt.depends_on.clone(),
+            annotations: prompt.annotations.clone(),
         }
     }
 }
@@ -152,12 +165,15 @@ mod tests {
                 mode: "interactive".to_string(),
                 context: Some("/tmp".to_string()),
                 worktree: None,
+                worktree_id: None,
             },
             state: "completed".to_string(),
             queue_rank: 1.0,
             session_id: Some("sess-123".to_string()),
             worktree_path: None,
             tags: Vec::new(),
+            depends_on: Vec::new(),
+            annotations: BTreeMap::new(),
         };
 
         save_prompt(&dir, &uuid1, &data);
@@ -201,12 +217,15 @@ mod tests {
                     mode: "interactive".to_string(),
                     context: None,
                     worktree: None,
+                    worktree_id: None,
                 },
                 state: "completed".to_string(),
                 queue_rank: rank,
                 session_id: None,
                 worktree_path: None,
                 tags: Vec::new(),
+                depends_on: Vec::new(),
+                annotations: BTreeMap::new(),
             };
             save_prompt(&dir, &uuid, &data);
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -258,12 +277,15 @@ mod tests {
                     mode: "interactive".to_string(),
                     context: None,
                     worktree: None,
+                    worktree_id: None,
                 },
                 state: "completed".to_string(),
                 queue_rank: i as f64,
                 session_id: None,
                 worktree_path: None,
                 tags: Vec::new(),
+                depends_on: Vec::new(),
+                annotations: BTreeMap::new(),
             };
             save_prompt(&dir, &uuid, &data);
             uuids.push(uuid);
@@ -294,12 +316,15 @@ mod tests {
                 mode: "interactive".to_string(),
                 context: None,
                 worktree: None,
+                worktree_id: None,
             },
             state: "completed".to_string(),
             queue_rank: 1.0,
             session_id: None,
             worktree_path: None,
             tags: Vec::new(),
+            depends_on: Vec::new(),
+            annotations: BTreeMap::new(),
         };
         save_prompt(&dir, &uuid, &data);
 
@@ -320,12 +345,15 @@ mod tests {
                 mode: "one_shot".to_string(), // legacy format
                 context: None,
                 worktree: None,
+                worktree_id: None,
             },
             state: "completed".to_string(),
             queue_rank: 1.0,
             session_id: None,
             worktree_path: None,
             tags: Vec::new(),
+            depends_on: Vec::new(),
+            annotations: BTreeMap::new(),
         };
         save_prompt(&dir, &uuid, &data);
         let loaded = load_all_prompts(&dir);
@@ -356,6 +384,129 @@ mod tests {
     }
 
     #[test]
+    fn persistence_backward_compat_no_depends_on_field() {
+        // Old files (pre-dependencies) lack the depends_on field — verify they load.
+        let dir = temp_prompts_dir();
+        let uuid = uuid::Uuid::now_v7().to_string();
+        let path = dir.join(format!("{uuid}.json"));
+        let legacy_json = r#"{
+            "prompt": "legacy",
+            "options": { "mode": "interactive", "context": null },
+            "state": "completed",
+            "queue_rank": 1.0,
+            "session_id": null
+        }"#;
+        std::fs::write(&path, legacy_json).unwrap();
+        let loaded = load_all_prompts(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].1.depends_on.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_roundtrip_with_depends_on() {
+        let dir = temp_prompts_dir();
+        let uuid = uuid::Uuid::now_v7().to_string();
+        let data = PromptFile {
+            prompt: "with deps".to_string(),
+            options: PromptOptions {
+                mode: "interactive".to_string(),
+                context: None,
+                worktree: None,
+                worktree_id: None,
+            },
+            state: "pending".to_string(),
+            queue_rank: 1.0,
+            session_id: None,
+            worktree_path: None,
+            tags: Vec::new(),
+            depends_on: vec!["uuid-a".to_string(), "uuid-b".to_string()],
+            annotations: BTreeMap::new(),
+        };
+        save_prompt(&dir, &uuid, &data);
+        let loaded = load_all_prompts(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1.depends_on, vec!["uuid-a", "uuid-b"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_backward_compat_no_annotations_field() {
+        // Pre-0.3 files lack the annotations field — verify they load with
+        // an empty BTreeMap.
+        let dir = temp_prompts_dir();
+        let uuid = uuid::Uuid::now_v7().to_string();
+        let path = dir.join(format!("{uuid}.json"));
+        let legacy_json = r#"{
+            "prompt": "legacy",
+            "options": { "mode": "interactive", "context": null },
+            "state": "completed",
+            "queue_rank": 1.0,
+            "session_id": null
+        }"#;
+        std::fs::write(&path, legacy_json).unwrap();
+        let loaded = load_all_prompts(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].1.annotations.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_roundtrip_with_annotations() {
+        let dir = temp_prompts_dir();
+        let uuid = uuid::Uuid::now_v7().to_string();
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            "openspec.affected_changes".to_string(),
+            serde_json::json!(["add-oauth", "refactor-auth"]),
+        );
+        annotations.insert("priority".to_string(), serde_json::json!(5));
+        let data = PromptFile {
+            prompt: "with annotations".to_string(),
+            options: PromptOptions {
+                mode: "interactive".to_string(),
+                context: None,
+                worktree: None,
+                worktree_id: None,
+            },
+            state: "completed".to_string(),
+            queue_rank: 1.0,
+            session_id: None,
+            worktree_path: None,
+            tags: Vec::new(),
+            depends_on: Vec::new(),
+            annotations,
+        };
+        save_prompt(&dir, &uuid, &data);
+        let loaded = load_all_prompts(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1.annotations.len(), 2);
+        assert_eq!(
+            loaded[0].1.annotations["openspec.affected_changes"],
+            serde_json::json!(["add-oauth", "refactor-auth"])
+        );
+        assert_eq!(loaded[0].1.annotations["priority"], serde_json::json!(5));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_omits_empty_annotations() {
+        // skip_serializing_if = "BTreeMap::is_empty" keeps old files clean.
+        let prompt = crate::prompt::Prompt::new(
+            1,
+            "hello".to_string(),
+            None,
+            crate::prompt::PromptMode::Interactive,
+        );
+        let file = PromptFile::from_prompt(&prompt);
+        let json = serde_json::to_string(&file).unwrap();
+        assert!(
+            !json.contains("\"annotations\""),
+            "empty annotations should be skipped, got: {json}"
+        );
+    }
+
+    #[test]
     fn delete_prompt() {
         let dir = temp_prompts_dir();
 
@@ -366,12 +517,15 @@ mod tests {
                 mode: "interactive".to_string(),
                 context: None,
                 worktree: None,
+                worktree_id: None,
             },
             state: "completed".to_string(),
             queue_rank: 1.0,
             session_id: None,
             worktree_path: None,
             tags: Vec::new(),
+            depends_on: Vec::new(),
+            annotations: BTreeMap::new(),
         };
         save_prompt(&dir, &uuid, &data);
         assert_eq!(load_all_prompts(&dir).len(), 1);

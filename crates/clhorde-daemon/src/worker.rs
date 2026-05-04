@@ -8,14 +8,10 @@ use crate::pty_worker::PtyHandle;
 use clhorde_core::prompt::PromptMode;
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum WorkerMessage {
     OutputChunk {
         prompt_id: usize,
         text: String,
-    },
-    TurnComplete {
-        prompt_id: usize,
     },
     Finished {
         prompt_id: usize,
@@ -26,7 +22,6 @@ pub enum WorkerMessage {
         error: String,
     },
     PtyUpdate {
-        #[allow(dead_code)]
         prompt_id: usize,
     },
     SessionId {
@@ -63,35 +58,30 @@ pub enum SpawnResult {
     Error(String),
 }
 
+/// Fields common to spawning either a PTY or one-shot worker.
+pub struct WorkerSpawn {
+    pub prompt_id: usize,
+    pub prompt_text: String,
+    pub cwd: Option<String>,
+    pub tx: mpsc::Sender<WorkerMessage>,
+    pub resume_session_id: Option<String>,
+    pub session_id: Option<String>,
+    pub pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
+}
+
 /// Spawns a claude worker. For interactive mode, uses PTY when `pty_size` is
 /// provided. For one-shot mode, uses stream-json as before.
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_worker(
-    prompt_id: usize,
-    prompt_text: String,
-    cwd: Option<String>,
+    req: WorkerSpawn,
     mode: PromptMode,
-    tx: mpsc::Sender<WorkerMessage>,
     pty_size: Option<(u16, u16)>,
-    resume_session_id: Option<String>,
-    session_id: Option<String>,
-    pty_byte_tx: tokio::sync::broadcast::Sender<(usize, Vec<u8>)>,
 ) -> SpawnResult {
+    let prompt_id = req.prompt_id;
     match mode {
         PromptMode::Interactive => {
             debug!(prompt_id, "spawning PTY worker");
             let (cols, rows) = pty_size.unwrap_or((80, 24));
-            match crate::pty_worker::spawn_pty_worker(
-                prompt_id,
-                prompt_text,
-                cwd,
-                cols,
-                rows,
-                tx,
-                resume_session_id,
-                session_id,
-                pty_byte_tx,
-            ) {
+            match crate::pty_worker::spawn_pty_worker(req, cols, rows) {
                 Ok((input_sender, pty_handle)) => SpawnResult::Pty {
                     input_sender,
                     pty_handle,
@@ -101,20 +91,22 @@ pub fn spawn_worker(
         }
         PromptMode::OneShot => {
             debug!(prompt_id, "spawning one-shot worker");
-            spawn_oneshot(prompt_id, prompt_text, cwd, tx, resume_session_id, session_id);
+            spawn_oneshot(req);
             SpawnResult::OneShot
         }
     }
 }
 
-fn spawn_oneshot(
-    prompt_id: usize,
-    prompt_text: String,
-    cwd: Option<String>,
-    tx: mpsc::Sender<WorkerMessage>,
-    resume_session_id: Option<String>,
-    session_id: Option<String>,
-) {
+fn spawn_oneshot(req: WorkerSpawn) {
+    let WorkerSpawn {
+        prompt_id,
+        prompt_text,
+        cwd,
+        tx,
+        resume_session_id,
+        session_id,
+        pty_byte_tx: _,
+    } = req;
     std::thread::spawn(move || {
         let mut cmd = Command::new("claude");
         cmd.args(["-p"])

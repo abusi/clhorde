@@ -16,6 +16,7 @@ use serde_json::json;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+use clhorde_core::control::{ControlRequest, ControlResponse, SchedulerEvent};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent};
 
 use crate::bridge::PtyFrame;
@@ -38,6 +39,18 @@ fn pty_message(frame: &PtyFrame) -> Option<Message> {
         "type": "PtyBytes",
         "prompt_id": frame.prompt_id,
         "data": BASE64_STANDARD.encode(&frame.data),
+    });
+    serde_json::to_string(&envelope)
+        .ok()
+        .map(Message::text)
+}
+
+/// Envelope for scheduler push events. Mirrors the daemon's
+/// `DaemonEvent` envelope so the SPA can route on `type` alone.
+fn scheduler_message(event: &SchedulerEvent) -> Option<Message> {
+    let envelope = json!({
+        "type": "SchedulerEvent",
+        "event": event,
     });
     serde_json::to_string(&envelope)
         .ok()
@@ -72,6 +85,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
 
     let mut event_rx = state.bridge.subscribe_events();
     let mut pty_rx = state.bridge.subscribe_pty();
+    let mut sched_rx = state.scheduler.subscribe_events();
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Per-client PTY subscription set. Empty = no PTY bytes forwarded.
@@ -85,6 +99,27 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                 let count = state.ws_disconnect();
                 debug!(ws_connections = count, "WebSocket client disconnected during init");
                 return;
+            }
+        }
+    }
+
+    // Bootstrap scheduler state: if the bridge is alive, request a
+    // one-shot Status so the client has something to show before the
+    // next push event arrives. Wrapped in a Snapshot envelope so the
+    // SPA dispatch code is identical for bootstrap and push paths.
+    if state.scheduler.is_connected() {
+        if let Ok(ControlResponse::Status { workflows, root }) = state
+            .scheduler
+            .request(ControlRequest::Status { name: None })
+            .await
+        {
+            let snapshot = SchedulerEvent::Snapshot { workflows, root };
+            if let Some(msg) = scheduler_message(&snapshot) {
+                if ws_tx.send(msg).await.is_err() {
+                    let count = state.ws_disconnect();
+                    debug!(ws_connections = count, "WebSocket client disconnected during scheduler init");
+                    return;
+                }
             }
         }
     }
@@ -121,6 +156,29 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                         if let Ok(text) = serde_json::to_string(&err_msg) {
                             let _ = ws_tx.send(Message::text(text)).await;
                         }
+                        break;
+                    }
+                }
+            }
+
+            // Forward scheduler events to the WebSocket client.
+            // Lag is non-fatal: the scheduler-side server re-emits a
+            // Snapshot when it detects a slow subscriber, so we just
+            // skip and let the next event arrive.
+            sched_event = sched_rx.recv() => {
+                match sched_event {
+                    Ok(event) => {
+                        if let Some(msg) = scheduler_message(&event) {
+                            if ws_tx.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        debug!(missed = n, "WebSocket client lagged on scheduler events");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Bridge dropped — clhorde-web shutting down.
                         break;
                     }
                 }
@@ -483,6 +541,125 @@ mod tests {
         let encoded = json["data"].as_str().unwrap();
         let decoded = BASE64_STANDARD.decode(encoded).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    // -----------------------------------------------------------------------
+    // scheduler_message — SchedulerEvent → JSON envelope (Phase 5.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scheduler_message_wraps_snapshot() {
+        let event = SchedulerEvent::Snapshot {
+            workflows: vec![],
+            root: Some("/tmp/repo".into()),
+        };
+        let msg = scheduler_message(&event).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["type"], "SchedulerEvent");
+        assert_eq!(json["event"]["type"], "snapshot");
+        assert_eq!(json["event"]["root"], "/tmp/repo");
+    }
+
+    #[test]
+    fn scheduler_message_wraps_workflow_updated() {
+        let summary = clhorde_core::control::WorkflowSummary {
+            name: "x".into(),
+            status: "implementing".into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            prompt_ids: vec![],
+            blocked_by: vec![],
+        };
+        let event = SchedulerEvent::WorkflowUpdated { summary };
+        let msg = scheduler_message(&event).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["type"], "SchedulerEvent");
+        assert_eq!(json["event"]["type"], "workflow_updated");
+        assert_eq!(json["event"]["summary"]["name"], "x");
+        assert_eq!(json["event"]["summary"]["status"], "implementing");
+    }
+
+    #[test]
+    fn scheduler_message_workflow_updated_carries_blocked_by_when_populated() {
+        // SPA reads detail.blocked_by directly off the WS frame to render
+        // the "· blocked" suffix and the "Blocked by:" detail line. Make
+        // sure the field lands in the envelope as a JSON array, not a
+        // serialized inner string or a stringified vec.
+        let summary = clhorde_core::control::WorkflowSummary {
+            name: "x".into(),
+            status: "queued".into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            prompt_ids: vec![],
+            blocked_by: vec!["base".into(), "shared".into()],
+        };
+        let event = SchedulerEvent::WorkflowUpdated { summary };
+        let msg = scheduler_message(&event).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let blocked = &json["event"]["summary"]["blocked_by"];
+        assert_eq!(blocked, &serde_json::json!(["base", "shared"]));
+    }
+
+    fn detail_for_envelope(name: &str, status: &str) -> clhorde_core::control::WorkflowDetail {
+        clhorde_core::control::WorkflowDetail {
+            name: name.into(),
+            status: status.into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            apply: vec![],
+            verify: None,
+            archive: None,
+            blocked_by: vec![],
+        }
+    }
+
+    #[test]
+    fn scheduler_message_wraps_detail_snapshot() {
+        // SubscribeAllDetails emits no snapshots, but the WS envelope
+        // must still encode the variant correctly so per-WS-client
+        // SubscribeDetail can land on this path later if introduced.
+        let event = SchedulerEvent::DetailSnapshot {
+            detail: detail_for_envelope("alpha", "queued"),
+        };
+        let msg = scheduler_message(&event).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["type"], "SchedulerEvent");
+        assert_eq!(json["event"]["type"], "detail_snapshot");
+        assert_eq!(json["event"]["detail"]["name"], "alpha");
+        assert_eq!(json["event"]["detail"]["status"], "queued");
+    }
+
+    #[test]
+    fn scheduler_message_wraps_detail_updated() {
+        // The bridge's SubscribeAllDetails stream is the primary
+        // producer of DetailUpdated frames the SPA dispatches on.
+        let event = SchedulerEvent::DetailUpdated {
+            detail: detail_for_envelope("alpha", "implementing"),
+        };
+        let msg = scheduler_message(&event).unwrap();
+        let text = msg.into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["type"], "SchedulerEvent");
+        assert_eq!(json["event"]["type"], "detail_updated");
+        assert_eq!(json["event"]["detail"]["name"], "alpha");
+        assert_eq!(json["event"]["detail"]["status"], "implementing");
     }
 
     // -----------------------------------------------------------------------

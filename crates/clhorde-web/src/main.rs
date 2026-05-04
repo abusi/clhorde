@@ -6,11 +6,12 @@ use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use clhorde_core::ipc::daemon_socket_path;
+use clhorde_core::ipc::{daemon_socket_path, scheduler_socket_path};
 
 mod auth;
 mod bridge;
 mod routes;
+mod scheduler_bridge;
 mod state;
 mod static_files;
 mod ws;
@@ -34,6 +35,12 @@ struct Cli {
     /// Override path to daemon Unix socket
     #[arg(long)]
     daemon_socket: Option<PathBuf>,
+
+    /// Override path to scheduler Unix socket. The bridge stays
+    /// alive even when the scheduler isn't running — REST handlers
+    /// return 503 in that case, the SPA shows an "unreachable" hint.
+    #[arg(long)]
+    scheduler_socket: Option<PathBuf>,
 
     /// Require this token for API access (Bearer auth). Also reads CLHORDE_WEB_AUTH_TOKEN env var.
     #[arg(long, env = "CLHORDE_WEB_AUTH_TOKEN")]
@@ -62,6 +69,12 @@ impl Cli {
             .clone()
             .unwrap_or_else(daemon_socket_path)
     }
+
+    fn scheduler_socket_path(&self) -> PathBuf {
+        self.scheduler_socket
+            .clone()
+            .unwrap_or_else(scheduler_socket_path)
+    }
 }
 
 fn init_tracing(level: tracing::Level) {
@@ -81,8 +94,10 @@ async fn main() {
     init_tracing(cli.log_level());
 
     let socket_path = cli.socket_path();
+    let scheduler_socket = cli.scheduler_socket_path();
     info!(
         daemon_socket = %socket_path.display(),
+        scheduler_socket = %scheduler_socket.display(),
         static_dir = ?cli.static_dir,
         "starting clhorde-web"
     );
@@ -98,6 +113,11 @@ async fn main() {
         }
     };
 
+    // The scheduler is optional — start the bridge in the background
+    // and let the REST handlers / WS surface return 503 until it's
+    // up. We don't gate web startup on the scheduler running.
+    let scheduler_bridge = scheduler_bridge::SchedulerBridge::start(scheduler_socket).await;
+
     let static_source = match cli.static_dir {
         Some(dir) => {
             info!(path = %dir.display(), "serving static files from filesystem");
@@ -109,7 +129,7 @@ async fn main() {
         }
     };
 
-    let app_state = state::AppState::new(bridge);
+    let app_state = state::AppState::new(bridge, scheduler_bridge);
     let app = routes::router(
         app_state,
         static_source,

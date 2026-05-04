@@ -203,6 +203,17 @@ class AppState {
         this.activeWorkers = 0;
         this.defaultMode = "interactive";
         this.connected = false;
+        // Scheduler-driven state (Phase 5.2). Empty until the WS
+        // delivers a SchedulerEvent::Snapshot or the bridge is offline.
+        /** @type {Array<string>} */
+        this.drafts = [];
+        /** @type {Array<Object>} */ // WorkflowSummary[]
+        this.workflows = [];
+        /** @type {string|null} */
+        this.schedulerRoot = null;
+        // Whether the *server* says the scheduler bridge is currently
+        // connected. Distinct from `connected` (daemon WS).
+        this.schedulerSeen = false;
         this._changeListeners = [];
     }
 
@@ -220,6 +231,9 @@ class AppState {
             case "DaemonEvent":
                 this._applyEvent(msg.event);
                 break;
+            case "SchedulerEvent":
+                this._applySchedulerEvent(msg.event);
+                break;
             case "ConnectionStatus":
                 this.connected = msg.status === "connected";
                 this._notify();
@@ -228,6 +242,77 @@ class AppState {
                 console.warn("[state] daemon error:", msg.error);
                 break;
         }
+    }
+
+    /**
+     * Apply one SchedulerEvent. Mirrors the TUI's
+     * `App::apply_scheduler_event`:
+     * - Snapshot rebuilds drafts/workflows from scratch.
+     * - WorkflowUpdated upserts a single summary by name, migrating
+     *   between drafts and workflows when the status crosses the
+     *   `drafted` boundary.
+     * - DetailSnapshot/DetailUpdated (Phase 5.3.3) replace
+     *   `expandedWorkflowDetail` when the event's name matches the
+     *   currently open card. Other workflows' detail events are
+     *   ignored — payloads are small but rendering would be wasted
+     *   work since only one card is open at a time.
+     */
+    _applySchedulerEvent(event) {
+        if (!event || !event.type) return;
+        this.schedulerSeen = true;
+
+        switch (event.type) {
+            case "snapshot": {
+                const all = event.workflows || [];
+                this.drafts = all
+                    .filter(w => w.status === "drafted")
+                    .map(w => w.name)
+                    .sort();
+                this.workflows = all
+                    .filter(w => w.status !== "drafted")
+                    .sort((a, b) => a.name.localeCompare(b.name));
+                this.schedulerRoot = event.root || null;
+                break;
+            }
+
+            case "workflow_updated": {
+                const s = event.summary;
+                if (!s || !s.name) return;
+                // Remove existing entry from both lists; status may
+                // have crossed the drafted boundary.
+                this.drafts = this.drafts.filter(n => n !== s.name);
+                this.workflows = this.workflows.filter(w => w.name !== s.name);
+                if (s.status === "drafted") {
+                    this.drafts.push(s.name);
+                    this.drafts.sort();
+                } else {
+                    this.workflows.push(s);
+                    this.workflows.sort((a, b) => a.name.localeCompare(b.name));
+                }
+                break;
+            }
+
+            case "detail_snapshot":
+            case "detail_updated": {
+                const d = event.detail;
+                if (!d || !d.name) return;
+                // Filter to the currently expanded card. Bridge fans
+                // out every workflow's detail to every WS client; the
+                // SPA prunes here so we don't render off-screen.
+                if (expandedWorkflow !== d.name) return;
+                expandedWorkflowDetail = d;
+                renderWorkflowDetail();
+                // No need to _notify — the listing renderers depend on
+                // schedulerSeen / drafts / workflows, none of which
+                // changed. Detail re-render is targeted above.
+                return;
+            }
+
+            default:
+                return;
+        }
+
+        this._notify();
     }
 
     /** Hydrate from a full state snapshot (GET /api/state or initial WS message). */
@@ -1311,16 +1396,269 @@ function switchView(view) {
     const content = document.getElementById("content");
     const storeView = document.getElementById("store-view");
 
+    const draftsView = document.getElementById("drafts-view");
+    const workflowsView = document.getElementById("workflows-view");
+
+    const all = [sidebar, content, storeView, draftsView, workflowsView];
+    all.forEach(el => { if (el) el.hidden = true; });
+
     if (view === "dashboard") {
         if (sidebar) sidebar.hidden = false;
         if (content) content.hidden = false;
-        if (storeView) storeView.hidden = true;
     } else if (view === "store") {
-        if (sidebar) sidebar.hidden = true;
-        if (content) content.hidden = true;
         if (storeView) storeView.hidden = false;
         loadStoreData();
+    } else if (view === "drafts") {
+        if (draftsView) draftsView.hidden = false;
+        renderDrafts();
+    } else if (view === "workflows") {
+        if (workflowsView) workflowsView.hidden = false;
+        renderWorkflows();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler views (Phase 5.2)
+// ---------------------------------------------------------------------------
+
+/** Currently-expanded workflow name, or null when no detail is shown. */
+let expandedWorkflow = null;
+/** @type {Object|null} */ // WorkflowDetail
+let expandedWorkflowDetail = null;
+
+/** Render the Drafts pane from current `state.drafts`. */
+function renderDrafts() {
+    const listEl = document.getElementById("drafts-list");
+    const statusEl = document.getElementById("drafts-status");
+    if (!listEl) return;
+
+    if (statusEl) {
+        if (!appState.schedulerSeen) {
+            statusEl.textContent = "scheduler not reachable";
+        } else if (appState.schedulerRoot) {
+            statusEl.textContent = appState.schedulerRoot;
+        } else {
+            statusEl.textContent = "";
+        }
+    }
+
+    if (appState.drafts.length === 0) {
+        if (appState.schedulerSeen) {
+            listEl.innerHTML = `<div class="empty-state">No drafts yet</div>`;
+        } else {
+            listEl.innerHTML = `<div class="empty-state">scheduler not reachable — start <code>clhorde-scheduler daemon</code></div>`;
+        }
+        return;
+    }
+
+    listEl.innerHTML = appState.drafts.map(name => `
+        <div class="scheduler-row">
+            <span class="scheduler-name">${escapeHtml(name)}</span>
+            <button class="btn btn-sm btn-primary" data-draft-action="queue" data-name="${escapeHtml(name)}">Queue</button>
+        </div>
+    `).join("");
+}
+
+/** Render the Workflows pane from current `state.workflows`. */
+function renderWorkflows() {
+    const listEl = document.getElementById("workflows-list");
+    const statusEl = document.getElementById("workflows-status");
+    if (!listEl) return;
+
+    if (statusEl) {
+        if (!appState.schedulerSeen) {
+            statusEl.textContent = "scheduler not reachable";
+        } else {
+            statusEl.textContent = `${appState.workflows.length} workflows`;
+        }
+    }
+
+    if (appState.workflows.length === 0) {
+        if (appState.schedulerSeen) {
+            listEl.innerHTML = `<div class="empty-state">No active workflows</div>`;
+        } else {
+            listEl.innerHTML = `<div class="empty-state">scheduler not reachable — start <code>clhorde-scheduler daemon</code></div>`;
+        }
+        renderWorkflowDetail();
+        return;
+    }
+
+    listEl.innerHTML = appState.workflows.map(w => {
+        const isOpen = expandedWorkflow === w.name;
+        const blocked = (w.blocked_by && w.blocked_by.length)
+            ? `<span class="blocked-suffix" title="Blocked by: ${escapeHtml(w.blocked_by.join(", "))}">· blocked</span>`
+            : "";
+        return `
+            <div class="scheduler-row ${isOpen ? "scheduler-row-open" : ""}" data-workflow="${escapeHtml(w.name)}">
+                <span class="scheduler-name">${escapeHtml(w.name)}</span>
+                <span class="badge badge-workflow-${w.status}">${w.status}</span>
+                ${blocked}
+                ${w.priority ? `<span class="footer-label">prio ${w.priority}</span>` : ""}
+                <button class="btn btn-sm" data-workflow-action="toggle" data-name="${escapeHtml(w.name)}">${isOpen ? "Close" : "Open"}</button>
+                <button class="btn btn-sm btn-danger" data-workflow-action="cancel" data-name="${escapeHtml(w.name)}">Cancel</button>
+            </div>
+        `;
+    }).join("");
+    renderWorkflowDetail();
+}
+
+/** Render the detail block for the currently-expanded workflow. */
+function renderWorkflowDetail() {
+    const wrap = document.getElementById("workflow-detail");
+    const header = document.getElementById("workflow-detail-header");
+    const body = document.getElementById("workflow-detail-body");
+    const actions = document.getElementById("workflow-detail-actions");
+    if (!wrap || !header || !body || !actions) return;
+
+    if (!expandedWorkflow) {
+        wrap.hidden = true;
+        return;
+    }
+
+    wrap.hidden = false;
+    const detail = expandedWorkflowDetail;
+
+    if (!detail) {
+        header.innerHTML = `<strong>${escapeHtml(expandedWorkflow)}</strong> <span class="footer-label">loading...</span>`;
+        body.innerHTML = "";
+        actions.innerHTML = "";
+        return;
+    }
+
+    const failureBadge = detail.failure_reason
+        ? `<span class="badge badge-failed" title="${escapeHtml(detail.failure_reason)}">${escapeHtml(detail.failure_reason)}</span>`
+        : "";
+    const blockedLine = (detail.blocked_by && detail.blocked_by.length)
+        ? `<div class="workflow-blocked-line"><strong>Blocked by:</strong> ${escapeHtml(detail.blocked_by.join(", "))}</div>`
+        : "";
+
+    header.innerHTML = `
+        <strong>${escapeHtml(detail.name)}</strong>
+        <span class="badge badge-workflow-${detail.status}">${detail.status}</span>
+        ${failureBadge}
+        ${blockedLine}
+    `;
+
+    const renderNode = (node, label) => {
+        const stateClass = `node-state-${node.state}`;
+        const idLabel = label || node.id;
+        const promptLink = node.prompt_id != null
+            ? `<span class="footer-label">prompt #${node.prompt_id}</span>`
+            : "";
+        const exitBadge = node.exit_code != null
+            ? `<span class="footer-label">exit ${node.exit_code}</span>`
+            : "";
+        const deps = (node.depends_on && node.depends_on.length)
+            ? `<span class="footer-label">deps: ${node.depends_on.map(escapeHtml).join(",")}</span>`
+            : "";
+        return `
+            <div class="workflow-node ${stateClass}">
+                <span class="workflow-node-id">${escapeHtml(idLabel)}</span>
+                <span class="workflow-node-label">${escapeHtml(node.label || "")}</span>
+                <span class="badge badge-node-${node.state}">${node.state}</span>
+                ${promptLink}
+                ${exitBadge}
+                ${deps}
+            </div>
+        `;
+    };
+
+    let html = "";
+    if (detail.apply && detail.apply.length) {
+        html += `<h3 class="workflow-phase-header">Apply</h3>`;
+        html += detail.apply.map(n => renderNode(n)).join("");
+    }
+    if (detail.verify) {
+        html += `<h3 class="workflow-phase-header">Verify</h3>`;
+        html += renderNode(detail.verify, "verify");
+    }
+    if (detail.archive) {
+        html += `<h3 class="workflow-phase-header">Archive</h3>`;
+        html += renderNode(detail.archive, "archive");
+    }
+    if (!html) {
+        html = `<div class="empty-state">No DAG yet — workflow hasn't started.</div>`;
+    }
+    body.innerHTML = html;
+
+    actions.innerHTML = `
+        <input type="text" class="input" id="retry-section-input" placeholder="Section id (e.g. 1, 3.2)" style="max-width:200px">
+        <button class="btn btn-sm" id="retry-section-btn">Retry section</button>
+        <button class="btn btn-sm btn-danger" data-workflow-action="cancel" data-name="${escapeHtml(detail.name)}">Cancel workflow</button>
+    `;
+}
+
+async function fetchWorkflowDetail(name) {
+    const res = await fetch(`/api/scheduler/workflow/${encodeURIComponent(name)}`, {
+        headers: authHeaders(),
+    }).catch(() => null);
+    if (!res) {
+        showToast("scheduler not reachable", "error");
+        return null;
+    }
+    if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        showToast(data?.error || `detail fetch failed (${res.status})`, "error");
+        return null;
+    }
+    return res.json();
+}
+
+async function schedulerAction(label, url, body) {
+    try {
+        const res = await fetch(url, {
+            method: "POST",
+            headers: authHeaders(body ? { "Content-Type": "application/json" } : {}),
+            body: body ? JSON.stringify(body) : undefined,
+        });
+        const data = await res.json().catch(() => null);
+        if (res.ok) {
+            showToast(data?.message || `${label} ok`, "success");
+            return true;
+        }
+        showToast(data?.error || `${label} failed (${res.status})`, "error");
+    } catch (e) {
+        showToast(`${label}: ${e.message}`, "error");
+    }
+    return false;
+}
+
+async function queueDraft(name) {
+    if (await schedulerAction("queue", `/api/scheduler/workflow/${encodeURIComponent(name)}/queue`, {})) {
+        // Push event will refresh state automatically.
+    }
+}
+
+async function cancelWorkflow(name) {
+    if (!confirm(`Cancel workflow ${name}?`)) return;
+    await schedulerAction("cancel", `/api/scheduler/workflow/${encodeURIComponent(name)}/cancel`, null);
+    // The orchestrator emits DetailUpdated within ms of the cancel
+    // committing — the SPA's _applySchedulerEvent handler picks it
+    // up and re-renders the expanded card. No manual refetch.
+}
+
+async function retrySection(name, section) {
+    const trimmed = (section || "").trim();
+    if (!trimmed) {
+        showToast("section id required", "error");
+        return;
+    }
+    // Same push-driven refresh as cancel above — DetailUpdated for
+    // this workflow lands shortly and re-renders the card.
+    await schedulerAction("retry", `/api/scheduler/workflow/${encodeURIComponent(name)}/retry`, { section: trimmed });
+}
+
+async function toggleWorkflow(name) {
+    if (expandedWorkflow === name) {
+        expandedWorkflow = null;
+        expandedWorkflowDetail = null;
+    } else {
+        expandedWorkflow = name;
+        expandedWorkflowDetail = null;
+        renderWorkflows(); // show "loading..." while we fetch
+        expandedWorkflowDetail = await fetchWorkflowDetail(name);
+    }
+    renderWorkflows();
 }
 
 // ---------------------------------------------------------------------------
@@ -1436,6 +1774,45 @@ document.querySelectorAll(".nav-tab").forEach(tab => {
 document.querySelector(".store-actions")?.addEventListener("click", (e) => {
     const btn = e.target.closest("[data-store]");
     if (btn) storeAction(btn.dataset.store);
+});
+
+// Drafts pane: Queue button.
+document.getElementById("drafts-list")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-draft-action]");
+    if (!btn) return;
+    const name = btn.dataset.name;
+    if (btn.dataset.draftAction === "queue") queueDraft(name);
+});
+
+// Workflows pane: Open/Close + Cancel + workflow detail actions.
+document.getElementById("workflows-list")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-workflow-action]");
+    if (!btn) return;
+    const name = btn.dataset.name;
+    const action = btn.dataset.workflowAction;
+    if (action === "toggle") toggleWorkflow(name);
+    else if (action === "cancel") cancelWorkflow(name);
+});
+
+document.getElementById("workflow-detail-actions")?.addEventListener("click", (e) => {
+    const cancelBtn = e.target.closest("[data-workflow-action='cancel']");
+    if (cancelBtn) {
+        cancelWorkflow(cancelBtn.dataset.name);
+        return;
+    }
+    if (e.target.id === "retry-section-btn") {
+        const input = document.getElementById("retry-section-input");
+        if (input && expandedWorkflow) {
+            retrySection(expandedWorkflow, input.value);
+        }
+    }
+});
+
+// Re-render scheduler views on every state change so push events
+// land without a manual refresh.
+appState.onChange(() => {
+    if (currentView === "drafts") renderDrafts();
+    else if (currentView === "workflows") renderWorkflows();
 });
 
 // Login form handler

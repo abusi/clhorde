@@ -1,4 +1,5 @@
 pub mod config;
+pub mod control;
 pub mod ipc;
 pub mod keymap;
 pub mod persistence;

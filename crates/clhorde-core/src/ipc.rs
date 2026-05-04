@@ -17,6 +17,17 @@ pub fn daemon_pid_path() -> PathBuf {
         .join("daemon.pid")
 }
 
+/// Default scheduler control-socket path:
+/// `~/.local/share/clhorde/scheduler.sock`. Mirrors `daemon_socket_path`
+/// so a `clhorde-scheduler daemon` process can be remote-controlled by
+/// `clhorde-cli flow status` (and the TUI in Phase 4) without re-reading
+/// every persisted workflow file.
+pub fn scheduler_socket_path() -> PathBuf {
+    crate::config::data_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp/clhorde"))
+        .join("scheduler.sock")
+}
+
 /// Maximum frame payload size (16 MiB).
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
@@ -146,5 +157,17 @@ mod tests {
     fn non_pty_frame_not_binary() {
         let payload = b"{\"type\":\"json\"}";
         assert!(!is_binary_frame(payload));
+    }
+
+    #[test]
+    fn scheduler_socket_lives_alongside_daemon_socket() {
+        // Both helpers should resolve to the same parent directory; only
+        // the leaf differs. This catches accidental drift in the path
+        // logic — e.g. someone adding a `scheduler/` subdir.
+        let daemon = daemon_socket_path();
+        let scheduler = scheduler_socket_path();
+        assert_eq!(daemon.parent(), scheduler.parent());
+        assert_eq!(scheduler.file_name().unwrap(), "scheduler.sock");
+        assert_eq!(daemon.file_name().unwrap(), "daemon.sock");
     }
 }

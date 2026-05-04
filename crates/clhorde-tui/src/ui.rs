@@ -8,13 +8,20 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, AppMode};
+use crate::app::{App, AppMode, RootView};
 use crate::keymap::{NormalAction, ViewAction};
 use crate::pty_renderer::PtyRenderer;
+use clhorde_core::control::{DetailNode, WorkflowSummary};
 use clhorde_core::prompt::{PromptMode, PromptStatus};
 
 pub fn render(f: &mut Frame, app: &mut App) {
-    let input_bar_height = if app.mode == AppMode::Insert && app.input.is_multiline() {
+    // Drafts and Workflows tabs don't have an input bar — they're
+    // navigation views with no text composition. Reclaim the space so
+    // the list fills the panel.
+    let on_prompts_tab = app.root_view == RootView::Prompts;
+    let input_bar_height = if !on_prompts_tab {
+        0
+    } else if app.mode == AppMode::Insert && app.input.is_multiline() {
         (app.input.line_count() as u16 + 2).clamp(3, 10) // +2 for borders
     } else {
         3
@@ -23,6 +30,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),                // status bar (1 content + bottom border)
+            Constraint::Length(1),                // tab bar (Phase 4)
             Constraint::Min(5),                   // main area
             Constraint::Length(input_bar_height), // input bar
             Constraint::Length(1),                // help bar
@@ -30,16 +38,20 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     render_status_bar(f, app, chunks[0]);
-    render_main_area(f, app, chunks[1]);
-    render_input_bar(f, app, chunks[2]);
-    render_help_bar(f, app, chunks[3]);
-    render_suggestions(f, app, chunks[2]);
-    render_template_suggestions(f, app, chunks[2]);
+    render_tab_bar(f, app, chunks[1]);
+    render_main_area_dispatch(f, app, chunks[2]);
+    if on_prompts_tab {
+        render_input_bar(f, app, chunks[3]);
+        render_suggestions(f, app, chunks[3]);
+        render_template_suggestions(f, app, chunks[3]);
+    }
+    render_help_bar(f, app, chunks[4]);
 
     if app.show_quick_prompts_popup
+        && on_prompts_tab
         && (app.mode == AppMode::ViewOutput || app.mode == AppMode::PtyInteract)
     {
-        render_quick_prompts_popup(f, app, chunks[1]);
+        render_quick_prompts_popup(f, app, chunks[2]);
     }
 
     if app.confirm_quit {
@@ -52,6 +64,526 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     if app.show_help_overlay {
         render_help_overlay(f, app, f.area());
+    }
+
+    if app.retry_section_input.is_some() {
+        render_retry_section_prompt(f, app, f.area());
+    }
+}
+
+/// Centered popup for the inline retry-section prompt fired by `T` on
+/// the Workflows tab. Captures dotted decimal section ids; Enter
+/// submits, Esc cancels.
+fn render_retry_section_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let Some(input) = app.retry_section_input.as_ref() else {
+        return;
+    };
+    let popup_w = 50.min(area.width.saturating_sub(4));
+    let popup_h = 7.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup = Rect::new(x, y, popup_w, popup_h);
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Retry section ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let body = vec![
+        Line::from(vec![
+            Span::styled(
+                "  workflow: ",
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                input.workflow.as_str(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  section:  ",
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                if input.buffer.is_empty() {
+                    "_"
+                } else {
+                    input.buffer.as_str()
+                },
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter to submit, Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(body).block(block), popup);
+}
+
+fn render_main_area_dispatch(f: &mut Frame, app: &mut App, area: Rect) {
+    // The detail overlay lives inside the Workflows tab — render it
+    // instead of the list whenever it is open. We keep the same area
+    // so the tab bar / status line don't shift around.
+    if app.root_view == RootView::Workflows && app.workflow_detail.is_some() {
+        render_workflow_detail_view(f, app, area);
+        return;
+    }
+    match app.root_view {
+        RootView::Prompts => render_main_area(f, app, area),
+        RootView::Drafts => render_drafts_view(f, app, area),
+        RootView::Workflows => render_workflows_view(f, app, area),
+    }
+}
+
+fn render_workflow_detail_view(f: &mut Frame, app: &App, area: Rect) {
+    let Some(detail) = app.workflow_detail.as_ref() else {
+        return;
+    };
+    let (color, label) = workflow_status_style(&detail.status);
+    let title = format!(
+        " {} · {label}{} ",
+        detail.name,
+        freshness_suffix(app.detail_last_refresh_age_secs())
+    );
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color));
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // ── Header (priority + timestamps + failure reason) ──
+    let mut header_spans: Vec<Span> = Vec::new();
+    if detail.priority != 0 {
+        header_spans.push(Span::styled(
+            format!("priority={}  ", detail.priority),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    if let Some(t) = detail.queued_at {
+        header_spans.push(Span::styled(
+            format!("queued {}  ", t.format("%H:%M:%S")),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(t) = detail.started_at {
+        header_spans.push(Span::styled(
+            format!("started {}  ", t.format("%H:%M:%S")),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(t) = detail.finished_at {
+        header_spans.push(Span::styled(
+            format!("finished {}  ", t.format("%H:%M:%S")),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if !header_spans.is_empty() {
+        lines.push(Line::from(header_spans));
+    }
+    if let Some(reason) = &detail.failure_reason {
+        lines.push(Line::from(Span::styled(
+            format!("  reason: {reason}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if !detail.blocked_by.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "Blocked by: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                detail.blocked_by.join(", "),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    // ── Apply phase (DAG nodes) ──
+    lines.push(Line::from(Span::styled(
+        "  Apply",
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
+    if detail.apply.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    (no DAG yet — tasks.md not parsed)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for node in &detail.apply {
+            lines.push(detail_node_line(node, "    "));
+        }
+    }
+    lines.push(Line::from(""));
+
+    // ── Verify phase ──
+    lines.push(Line::from(Span::styled(
+        "  Verify",
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
+    if let Some(node) = &detail.verify {
+        lines.push(detail_node_line(node, "    "));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "    (not dispatched)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+
+    // ── Archive phase ──
+    lines.push(Line::from(Span::styled(
+        "  Archive",
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
+    if let Some(node) = &detail.archive {
+        lines.push(detail_node_line(node, "    "));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "    (not dispatched)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+
+    // ── Footer hint ──
+    lines.push(Line::from(Span::styled(
+        "  Esc / Enter: back  ·  j/k: scroll  ·  r: refresh  ·  X cancel  T retry  R read",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // Clamp scroll so `G` doesn't overshoot.
+    let max_scroll = lines.len().saturating_sub(1) as u16;
+    let scroll = app.detail_scroll.min(max_scroll);
+
+    let para = Paragraph::new(lines).block(block).scroll((scroll, 0));
+    f.render_widget(para, area);
+}
+
+fn detail_node_line<'a>(node: &'a DetailNode, indent: &'a str) -> Line<'a> {
+    let (icon, color) = detail_state_style(&node.state);
+    let mut spans: Vec<Span> = vec![
+        Span::raw(indent),
+        Span::styled(icon, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:<6}", node.id),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(node.label.as_str(), Style::default().fg(Color::Gray)),
+    ];
+    if let Some(pid) = node.prompt_id {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("#{pid}"),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if let Some(code) = node.exit_code {
+        let exit_color = if code == 0 { Color::Green } else { Color::Red };
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("exit={code}"),
+            Style::default().fg(exit_color),
+        ));
+    }
+    if !node.depends_on.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("← {}", node.depends_on.join(", ")),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Format a "(updated Ns ago)" badge for titles. Empty when no
+/// successful refresh has happened yet so the header doesn't lie.
+/// 0–1s renders as "fresh" since the human eye can't tell the
+/// difference and the constant churn is distracting.
+fn freshness_suffix(age: Option<u64>) -> String {
+    match age {
+        None => String::new(),
+        Some(0) | Some(1) => " · fresh".to_string(),
+        Some(s) if s < 60 => format!(" · {s}s"),
+        Some(s) if s < 3600 => format!(" · {}m", s / 60),
+        Some(s) => format!(" · {}h", s / 3600),
+    }
+}
+
+fn detail_state_style(state: &str) -> (&'static str, Color) {
+    match state {
+        "pending" => ("○", Color::DarkGray),
+        "running" => ("▶", Color::Cyan),
+        "completed" => ("✓", Color::Green),
+        "failed" => ("✗", Color::Red),
+        _ => ("?", Color::Gray),
+    }
+}
+
+/// Top-of-screen tab bar: `[1] Prompts  [2] Drafts  [3] Workflows`.
+/// The active tab is highlighted; the digit prefix doubles as a visible
+/// reminder of the keybinding.
+fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+    let mut spans = Vec::with_capacity(7);
+    let pad = Span::raw("  ");
+    for (i, (digit, label, view)) in [
+        ('1', "Prompts", RootView::Prompts),
+        ('2', "Drafts", RootView::Drafts),
+        ('3', "Workflows", RootView::Workflows),
+    ]
+    .iter()
+    .enumerate()
+    {
+        if i > 0 {
+            spans.push(pad.clone());
+        }
+        let active = app.root_view == *view;
+        let fg = if active { Color::Black } else { Color::Gray };
+        let bg = if active {
+            Color::Cyan
+        } else {
+            Color::Rgb(30, 30, 40)
+        };
+        let modifier = if active {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        };
+        spans.push(Span::styled(
+            format!(" [{digit}] {label} "),
+            Style::default().fg(fg).bg(bg).add_modifier(modifier),
+        ));
+    }
+    let para = Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+    f.render_widget(para, area);
+}
+
+/// Drafts tab: list of `openspec/changes/<X>/` directories without a
+/// `.clhorde-ready` marker. Polled from the scheduler control socket.
+fn render_drafts_view(f: &mut Frame, app: &App, area: Rect) {
+    let title = format!(
+        " Drafts ({}){} ",
+        app.drafts.len(),
+        freshness_suffix(app.scheduler_last_refresh_age_secs())
+    );
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    if !app.scheduler_reachable {
+        let body = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  scheduler not reachable",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Start it with: clhorde-scheduler daemon",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  (press 'r' to retry)",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(body).block(block), area);
+        return;
+    }
+
+    if app.drafts.is_empty() {
+        let body = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  no drafts",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Drafts appear when openspec/changes/<X>/ exists",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "  without a .clhorde-ready marker.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(body).block(block), area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .drafts
+        .iter()
+        .map(|n| ListItem::new(Line::from(Span::raw(format!("  {n}")))))
+        .collect();
+    let mut state = ListState::default();
+    if !app.drafts.is_empty() {
+        state.select(Some(app.drafts_selected.min(app.drafts.len() - 1)));
+    }
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(50, 50, 80))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▌ ");
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+/// Workflows tab: queued + running + recent terminal workflows. One
+/// line per workflow showing status and (if present) a short suffix.
+fn render_workflows_view(f: &mut Frame, app: &App, area: Rect) {
+    let title = format!(
+        " Workflows ({}){} ",
+        app.workflows.len(),
+        freshness_suffix(app.scheduler_last_refresh_age_secs())
+    );
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    if !app.scheduler_reachable {
+        let body = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  scheduler not reachable",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Start it with: clhorde-scheduler daemon",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  (press 'r' to retry)",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(body).block(block), area);
+        return;
+    }
+
+    if app.workflows.is_empty() {
+        let body = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  no workflows",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  A workflow is created when a change is queued",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "  (writing openspec/changes/<X>/.clhorde-ready).",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(body).block(block), area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .workflows
+        .iter()
+        .map(|w| ListItem::new(workflow_line(w)))
+        .collect();
+    let mut state = ListState::default();
+    if !app.workflows.is_empty() {
+        state.select(Some(
+            app.workflows_selected.min(app.workflows.len() - 1),
+        ));
+    }
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(50, 50, 80))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▌ ");
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn workflow_line(w: &WorkflowSummary) -> Line<'static> {
+    let (color, label) = workflow_status_style(&w.status);
+    let mut spans: Vec<Span> = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<24}", w.name),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{label:<13}"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    // Surface the inter-workflow dep gate alongside the status badge.
+    // Kept outside the padded label so the rest of the row stays aligned.
+    if !w.blocked_by.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            "· blocked",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(reason) = &w.failure_reason {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            reason.clone(),
+            Style::default().fg(Color::Red),
+        ));
+    } else if w.priority != 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("p={}", w.priority),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn workflow_status_style(status: &str) -> (Color, &'static str) {
+    match status {
+        "drafted" => (Color::DarkGray, "drafted"),
+        "queued" => (Color::Yellow, "queued"),
+        "implementing" => (Color::Cyan, "implementing"),
+        "verifying" => (Color::Blue, "verifying"),
+        "archiving" => (Color::Magenta, "archiving"),
+        "archived" => (Color::Green, "archived"),
+        "cancelled" => (Color::DarkGray, "cancelled"),
+        "failed" => (Color::Red, "failed"),
+        _ => (Color::Gray, "?"),
     }
 }
 
@@ -88,6 +620,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let status = prompt.status_enum();
         let (status_char, status_color) = match status {
             PromptStatus::Pending => ("·", Color::DarkGray),
+            PromptStatus::Blocked => ("⊘", Color::DarkGray),
             PromptStatus::Running => ("▶", Color::Cyan),
             PromptStatus::Idle => ("◆", Color::Magenta),
             PromptStatus::Completed => ("✓", Color::Green),
@@ -326,6 +859,7 @@ fn render_prompt_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect)
 
             let status_style = match status {
                 PromptStatus::Pending => Style::default().fg(Color::Yellow),
+                PromptStatus::Blocked => Style::default().fg(Color::DarkGray),
                 PromptStatus::Running => Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -787,6 +1321,13 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
             let title = format!(" Output: #{} [{}]{wt_tag} ", prompt.id, cwd_str);
             let content = match status {
                 PromptStatus::Pending => "(pending)".to_string(),
+                PromptStatus::Blocked => {
+                    if prompt.blocked_by.is_empty() {
+                        "(blocked)".to_string()
+                    } else {
+                        format!("(blocked — waiting on {} dependency(ies))", prompt.blocked_by.len())
+                    }
+                }
                 PromptStatus::Running => {
                     let elapsed = prompt.elapsed_display().unwrap_or_else(|| "0.0s".into());
                     match &prompt.output {
@@ -875,6 +1416,7 @@ fn render_text_output_viewer(f: &mut Frame, app: &mut App, area: ratatui::layout
             PromptStatus::Completed => Color::Green,
             PromptStatus::Failed => Color::Red,
             PromptStatus::Pending => Color::Yellow,
+            PromptStatus::Blocked => Color::DarkGray,
         }
     } else {
         Color::Rgb(80, 80, 100)
@@ -1448,6 +1990,96 @@ fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    // On Drafts / Workflows tabs the keymap is much smaller — the
+    // existing per-mode hints don't apply. Surface the navigation +
+    // refresh + tab-switch keys instead.
+    if app.mode == AppMode::Normal && app.root_view != RootView::Prompts {
+        let label = match app.root_view {
+            RootView::Drafts => "drafts",
+            RootView::Workflows => {
+                if app.workflow_detail.is_some() {
+                    "detail"
+                } else {
+                    "workflows"
+                }
+            }
+            RootView::Prompts => "prompts",
+        };
+        // Tab-specific action keys: Drafts get Q+E+R, Workflows get
+        // X+T+R + Enter to zoom. Both share the navigation/quit/refresh
+        // row. The detail overlay swaps in its own hints.
+        let bindings: Vec<(String, &str)> = match (app.root_view, app.workflow_detail.is_some()) {
+            (RootView::Workflows, true) => vec![
+                ("j/k".to_string(), "scroll"),
+                ("X".to_string(), "cancel"),
+                ("T".to_string(), "retry §"),
+                ("R".to_string(), "read"),
+                ("r".to_string(), "refresh"),
+                ("Esc".to_string(), "back"),
+                ("q".to_string(), "quit"),
+            ],
+            (RootView::Drafts, _) => vec![
+                ("j/k".to_string(), "navigate"),
+                ("Q".to_string(), "queue"),
+                ("E".to_string(), "explore"),
+                ("R".to_string(), "read"),
+                ("r".to_string(), "refresh"),
+                ("Esc".to_string(), "→ Prompts"),
+                ("q".to_string(), "quit"),
+            ],
+            (RootView::Workflows, false) => vec![
+                ("j/k".to_string(), "navigate"),
+                ("Enter".to_string(), "detail"),
+                ("X".to_string(), "cancel"),
+                ("T".to_string(), "retry §"),
+                ("R".to_string(), "read"),
+                ("r".to_string(), "refresh"),
+                ("Esc".to_string(), "→ Prompts"),
+                ("q".to_string(), "quit"),
+            ],
+            (RootView::Prompts, _) => vec![
+                ("j/k".to_string(), "navigate"),
+                ("r".to_string(), "refresh"),
+                ("1/2/3".to_string(), "switch tab"),
+                ("Esc".to_string(), "→ Prompts"),
+                ("?".to_string(), "help"),
+                ("q".to_string(), "quit"),
+            ],
+        };
+        let mut spans: Vec<Span> = vec![
+            Span::raw(" "),
+            Span::styled(
+                format!("{label:<10}"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ];
+        for (i, (key, desc)) in bindings.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(
+                    "  ",
+                    Style::default().fg(Color::Rgb(60, 60, 60)),
+                ));
+            }
+            spans.push(Span::styled(
+                key.as_str(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                *desc,
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        let para = Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(Color::Rgb(20, 20, 30)));
+        f.render_widget(para, area);
+        return;
+    }
+
     let bindings: Vec<(String, &str)> = match app.mode {
         AppMode::Normal if app.visual_select_active => {
             vec![
@@ -1604,4 +2236,50 @@ fn render_help_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let paragraph = Paragraph::new(Line::from(spans));
     f.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clhorde_core::control::WorkflowSummary;
+
+    fn summary(name: &str, status: &str, blocked_by: Vec<String>) -> WorkflowSummary {
+        WorkflowSummary {
+            name: name.into(),
+            status: status.into(),
+            failure_reason: None,
+            priority: 0,
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            prompt_ids: vec![],
+            blocked_by,
+        }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn workflow_line_appends_blocked_suffix_when_blocked_by_non_empty() {
+        let s = summary("alpha", "queued", vec!["base".into()]);
+        let line = workflow_line(&s);
+        let text = line_text(&line);
+        assert!(
+            text.contains("· blocked"),
+            "expected blocked suffix in: {text}"
+        );
+    }
+
+    #[test]
+    fn workflow_line_omits_blocked_suffix_when_blocked_by_empty() {
+        let s = summary("alpha", "queued", vec![]);
+        let line = workflow_line(&s);
+        let text = line_text(&line);
+        assert!(
+            !text.contains("blocked"),
+            "blocked suffix should not appear for unblocked queued workflow: {text}"
+        );
+    }
 }

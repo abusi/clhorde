@@ -4,19 +4,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::bridge::DaemonBridge;
+use crate::scheduler_bridge::SchedulerBridge;
 
 /// Shared state available to all axum handlers via `State<AppState>`.
 #[derive(Clone)]
 pub struct AppState {
     pub bridge: Arc<DaemonBridge>,
+    /// Long-lived bridge to `clhorde-scheduler`. Always present even
+    /// when the scheduler isn't running — handlers use
+    /// `is_connected()` / `request()` to surface the appropriate
+    /// HTTP status.
+    pub scheduler: Arc<SchedulerBridge>,
     /// Number of active WebSocket connections.
     pub ws_connections: Arc<AtomicUsize>,
 }
 
 impl AppState {
-    pub fn new(bridge: Arc<DaemonBridge>) -> Self {
+    pub fn new(bridge: Arc<DaemonBridge>, scheduler: Arc<SchedulerBridge>) -> Self {
         Self {
             bridge,
+            scheduler,
             ws_connections: Arc::new(AtomicUsize::new(0)),
         }
     }

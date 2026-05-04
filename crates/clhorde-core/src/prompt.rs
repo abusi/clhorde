@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PromptMode {
@@ -36,6 +39,8 @@ impl PromptMode {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PromptStatus {
     Pending,
+    /// Awaiting completion of one or more dependencies.
+    Blocked,
     Running,
     /// Turn complete, process alive, waiting for follow-up input.
     Idle,
@@ -47,6 +52,7 @@ impl PromptStatus {
     pub fn symbol(&self) -> &str {
         match self {
             PromptStatus::Pending => "⏳",
+            PromptStatus::Blocked => "🔒",
             PromptStatus::Running => "🔄",
             PromptStatus::Idle => "💬",
             PromptStatus::Completed => "✅",
@@ -83,8 +89,20 @@ pub struct Prompt {
     pub worktree: bool,
     /// Path to the created worktree directory (for cleanup).
     pub worktree_path: Option<String>,
+    /// Optional shared worktree key. When two prompts share the same
+    /// `worktree_id`, the daemon creates the worktree once and reuses its
+    /// path for all of them (used by the scheduler to keep a workflow's
+    /// prompts coherent on the same branch).
+    pub worktree_id: Option<String>,
     /// User-defined tags for grouping/filtering (e.g. `@frontend`).
     pub tags: Vec<String>,
+    /// UUIDs of prompts that must be Completed before this one can dispatch.
+    pub depends_on: Vec<String>,
+    /// Opaque key/value bag for clients to attach domain-specific metadata
+    /// (e.g. the scheduler stores `openspec.affected_changes` here). The
+    /// daemon stores, persists, and broadcasts this map but never interprets
+    /// its contents. `BTreeMap` for stable serialization order.
+    pub annotations: BTreeMap<String, Value>,
 }
 
 impl Prompt {
@@ -106,7 +124,10 @@ impl Prompt {
             resume: false,
             worktree: false,
             worktree_path: None,
+            worktree_id: None,
             tags: Vec::new(),
+            depends_on: Vec::new(),
+            annotations: BTreeMap::new(),
         }
     }
 
@@ -258,6 +279,7 @@ mod tests {
     #[test]
     fn status_symbols() {
         assert_eq!(PromptStatus::Pending.symbol(), "⏳");
+        assert_eq!(PromptStatus::Blocked.symbol(), "🔒");
         assert_eq!(PromptStatus::Running.symbol(), "🔄");
         assert_eq!(PromptStatus::Idle.symbol(), "💬");
         assert_eq!(PromptStatus::Completed.symbol(), "✅");
@@ -279,6 +301,8 @@ mod tests {
         assert!(p.started_at_ms.is_none());
         assert!(p.finished_at_ms.is_none());
         assert!(!p.seen);
+        assert!(p.depends_on.is_empty());
+        assert!(p.annotations.is_empty());
     }
 
     #[test]

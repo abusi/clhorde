@@ -14,6 +14,7 @@ fn run(args: &[String]) -> i32 {
         Some("submit") => commands::submit::cmd_submit(&args[2..]),
         Some("status") => commands::status::cmd_status(&args[2..]),
         Some("attach") => commands::attach::cmd_attach(&args[2..]),
+        Some("flow") => commands::flow::cmd_flow(&args[2..]),
         Some("qp") => commands::qp::cmd_qp(&args[2..]),
         Some("keys") => commands::keys::cmd_keys(&args[2..]),
         Some("config") => commands::config::cmd_config(&args[2..]),
@@ -37,6 +38,10 @@ fn cmd_help() -> i32 {
     println!("    --worktree        Enable git worktree isolation");
     println!("  status              Show daemon status and prompt summary");
     println!("  attach <id>         Attach to a prompt and stream output");
+    println!();
+    println!("Workflow commands (forwards to clhorde-scheduler):");
+    println!("  flow <subcommand>   Run a clhorde-scheduler subcommand");
+    println!("                      e.g. queue, status, apply, retry, daemon");
     println!();
     println!("Store commands (requires clhorded):");
     println!("  store               Manage persisted prompts");

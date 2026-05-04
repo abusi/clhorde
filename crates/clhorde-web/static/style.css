@@ -818,6 +818,152 @@ textarea.input {
     margin-left: var(--space-sm);
 }
 
+/* Scheduler views (Phase 5.2) — Drafts + Workflows. Reuse the
+ * store-view layout primitives (full-width pane, scroll, padding)
+ * and add row/badge styling specific to scheduler entries. */
+.scheduler-view {
+    flex: 1;
+    overflow-y: auto;
+    padding: var(--space-lg);
+}
+
+.scheduler-header {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-lg);
+    margin-bottom: var(--space-md);
+}
+
+.scheduler-header h2 {
+    font-size: var(--font-size-lg);
+    font-weight: 600;
+}
+
+.scheduler-hint {
+    color: var(--text-secondary);
+    margin-bottom: var(--space-md);
+    font-size: var(--font-size-sm);
+}
+
+.scheduler-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    margin-bottom: var(--space-lg);
+}
+
+.scheduler-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    padding: var(--space-sm) var(--space-md);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+}
+
+.scheduler-row-open {
+    border-color: var(--accent);
+}
+
+.scheduler-name {
+    font-weight: 600;
+    flex: 1;
+    font-family: var(--font-mono);
+}
+
+/* Workflow status badges. Mirror the prompt-status palette so the
+ * dashboard's mental model carries over. */
+.badge-workflow-drafted     { background: var(--bg-tertiary); color: var(--text-secondary); }
+.badge-workflow-queued      { background: rgba(59, 130, 246, 0.15); color: #60a5fa; }
+.badge-workflow-implementing{ background: rgba(34, 197, 94, 0.15);  color: #4ade80; }
+.badge-workflow-verifying   { background: rgba(168, 85, 247, 0.15); color: #c084fc; }
+.badge-workflow-archiving   { background: rgba(168, 85, 247, 0.15); color: #c084fc; }
+.badge-workflow-archived    { background: var(--bg-tertiary); color: var(--text-secondary); }
+.badge-workflow-failed      { background: rgba(239, 68, 68, 0.15); color: #f87171; }
+.badge-workflow-cancelled   { background: var(--bg-tertiary); color: var(--text-secondary); }
+
+/* Inter-workflow dependency gate annotations (Phase 5.4.3).
+ * Dim warning palette: visible enough to flag the held workflow
+ * without overpowering the status badge it sits next to. */
+.blocked-suffix {
+    color: #fbbf24;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    margin-left: var(--space-xs);
+    cursor: help;
+}
+
+.workflow-blocked-line {
+    color: #fbbf24;
+    font-size: var(--font-size-sm);
+    margin-top: var(--space-xs);
+    flex-basis: 100%;
+}
+
+/* Workflow detail block. */
+.workflow-detail {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: var(--space-md);
+    background: var(--bg-secondary);
+}
+
+.workflow-detail-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    margin-bottom: var(--space-md);
+    font-size: var(--font-size-md);
+}
+
+.workflow-phase-header {
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    margin: var(--space-md) 0 var(--space-xs);
+    letter-spacing: 0.05em;
+}
+
+.workflow-node {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    padding: var(--space-xs) var(--space-sm);
+    border-left: 3px solid var(--border);
+    margin-bottom: 2px;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
+}
+
+.workflow-node.node-state-running   { border-left-color: #60a5fa; }
+.workflow-node.node-state-completed { border-left-color: #4ade80; }
+.workflow-node.node-state-failed    { border-left-color: #f87171; }
+.workflow-node.node-state-pending   { border-left-color: var(--border); }
+
+.workflow-node-id {
+    font-weight: 600;
+    min-width: 3em;
+}
+
+.workflow-node-label {
+    flex: 1;
+}
+
+.badge-node-pending   { background: var(--bg-tertiary); color: var(--text-secondary); }
+.badge-node-running   { background: rgba(59, 130, 246, 0.15); color: #60a5fa; }
+.badge-node-completed { background: rgba(34, 197, 94, 0.15); color: #4ade80; }
+.badge-node-failed    { background: rgba(239, 68, 68, 0.15); color: #f87171; }
+
+.workflow-detail-actions {
+    display: flex;
+    gap: var(--space-sm);
+    margin-top: var(--space-md);
+    align-items: center;
+    flex-wrap: wrap;
+}
+
 /* Responsive: collapse sidebar on narrow screens */
 @media (max-width: 700px) {
     .sidebar {

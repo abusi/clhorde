@@ -15,6 +15,8 @@
 
         <nav class="header-nav">
             <button class="nav-tab active" data-view="dashboard" id="nav-dashboard">Dashboard</button>
+            <button class="nav-tab" data-view="drafts" id="nav-drafts">Drafts</button>
+            <button class="nav-tab" data-view="workflows" id="nav-workflows">Workflows</button>
             <button class="nav-tab" data-view="store" id="nav-store">Store</button>
         </nav>
         <div class="header-right">
@@ -84,6 +86,35 @@
                     <input type="text" class="input" id="followup-input" placeholder="Send follow-up...">
                     <button class="btn btn-sm" id="followup-send">Send</button>
                 </div>
+            </div>
+        </section>
+
+        <section class="scheduler-view" id="drafts-view" hidden>
+            <div class="scheduler-header">
+                <h2>Drafts</h2>
+                <span class="footer-label" id="drafts-status"></span>
+            </div>
+            <p class="scheduler-hint">
+                Changes under <code>openspec/changes/</code> without a <code>.clhorde-ready</code> marker.
+                Press <strong>Queue</strong> to hand a draft off to the scheduler.
+            </p>
+            <div class="scheduler-list" id="drafts-list">
+                <div class="empty-state">Loading...</div>
+            </div>
+        </section>
+
+        <section class="scheduler-view" id="workflows-view" hidden>
+            <div class="scheduler-header">
+                <h2>Workflows</h2>
+                <span class="footer-label" id="workflows-status"></span>
+            </div>
+            <div class="scheduler-list" id="workflows-list">
+                <div class="empty-state">Loading...</div>
+            </div>
+            <div class="workflow-detail" id="workflow-detail" hidden>
+                <div class="workflow-detail-header" id="workflow-detail-header"></div>
+                <div class="workflow-detail-body" id="workflow-detail-body"></div>
+                <div class="workflow-detail-actions" id="workflow-detail-actions"></div>
             </div>
         </section>
 

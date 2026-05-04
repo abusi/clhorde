@@ -13,7 +13,21 @@ use clhorde_core::protocol::{DaemonEvent, DaemonState, PromptInfo};
 
 use crate::pty_worker::{self, PtyHandle};
 use crate::session::SessionManager;
-use crate::worker::{self, SpawnResult, WorkerInput, WorkerMessage};
+use crate::worker::{self, SpawnResult, WorkerInput, WorkerMessage, WorkerSpawn};
+
+/// Parameters for adding a new prompt to the orchestrator.
+///
+/// Mirrors the shape of `ClientRequest::SubmitPrompt` after deps have been
+/// resolved from numeric IDs to UUIDs.
+pub struct AddPrompt {
+    pub text: String,
+    pub cwd: Option<String>,
+    pub mode: PromptMode,
+    pub worktree: bool,
+    pub tags: Vec<String>,
+    pub depends_on: Vec<String>,
+    pub worktree_id: Option<String>,
+}
 
 /// Daemon orchestrator: manages prompts, workers, and broadcasts events to clients.
 pub struct Orchestrator {
@@ -91,7 +105,10 @@ impl Orchestrator {
                 prompt.session_id = pf.session_id.clone();
                 prompt.worktree = pf.options.worktree.unwrap_or(false);
                 prompt.worktree_path = pf.worktree_path.clone();
+                prompt.worktree_id = pf.options.worktree_id.clone();
                 prompt.tags = pf.tags.clone();
+                prompt.depends_on = pf.depends_on.clone();
+                prompt.annotations = pf.annotations.clone();
                 prompt.status = status;
                 prompt.seen = true;
                 prompts.push(prompt);
@@ -155,6 +172,17 @@ impl Orchestrator {
     // ── Convert to wire types ──
 
     pub fn to_prompt_info(&self, prompt: &Prompt) -> PromptInfo {
+        let blocked_by: Vec<String> = prompt
+            .depends_on
+            .iter()
+            .filter(|dep_uuid| {
+                !self
+                    .prompts
+                    .iter()
+                    .any(|p| &p.uuid == *dep_uuid && p.status == PromptStatus::Completed)
+            })
+            .cloned()
+            .collect();
         PromptInfo {
             id: prompt.id,
             text: prompt.text.clone(),
@@ -174,6 +202,10 @@ impl Orchestrator {
             elapsed_secs: prompt.elapsed_secs(),
             uuid: prompt.uuid.clone(),
             has_pty: self.pty_handles.contains_key(&prompt.id),
+            depends_on: prompt.depends_on.clone(),
+            blocked_by,
+            worktree_id: prompt.worktree_id.clone(),
+            annotations: prompt.annotations.clone(),
         }
     }
 
@@ -193,17 +225,137 @@ impl Orchestrator {
 
     // ── Prompt lifecycle ──
 
-    pub fn add_prompt(
-        &mut self,
-        text: String,
-        cwd: Option<String>,
-        mode: PromptMode,
-        worktree: bool,
-        tags: Vec<String>,
-    ) {
+    /// Resolve client-facing prompt IDs to internal UUIDs.
+    /// Returns an error listing any IDs that don't exist.
+    fn resolve_dep_ids(&self, ids: &[usize]) -> Result<Vec<String>, String> {
+        let mut uuids = Vec::with_capacity(ids.len());
+        let mut missing = Vec::new();
+        for &id in ids {
+            match self.prompts.iter().find(|p| p.id == id) {
+                Some(p) => uuids.push(p.uuid.clone()),
+                None => missing.push(id),
+            }
+        }
+        if !missing.is_empty() {
+            return Err(format!("Unknown prompt IDs in depends_on: {missing:?}"));
+        }
+        Ok(uuids)
+    }
+
+    /// Detect whether assigning `new_deps` (UUIDs) to the prompt with `target_uuid`
+    /// would introduce a cycle in the dependency graph.
+    fn would_create_cycle(&self, target_uuid: &str, new_deps: &[String]) -> bool {
+        // DFS from each dep; if we can reach `target_uuid`, there is a cycle.
+        for start in new_deps {
+            if start == target_uuid {
+                return true;
+            }
+            let mut stack = vec![start.clone()];
+            let mut seen: HashSet<String> = HashSet::new();
+            while let Some(node) = stack.pop() {
+                if !seen.insert(node.clone()) {
+                    continue;
+                }
+                if let Some(p) = self.prompts.iter().find(|p| p.uuid == node) {
+                    for d in &p.depends_on {
+                        if d == target_uuid {
+                            return true;
+                        }
+                        stack.push(d.clone());
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Path of the shared worktree associated with `wt_id`, if any prompt
+    /// already has it resolved on disk.
+    fn shared_worktree_path(&self, wt_id: &str) -> Option<String> {
+        self.prompts
+            .iter()
+            .find(|p| {
+                p.worktree_id.as_deref() == Some(wt_id) && p.worktree_path.is_some()
+            })
+            .and_then(|p| p.worktree_path.clone())
+    }
+
+    /// Whether a worktree-creation thread is currently running for `wt_id`.
+    fn worktree_id_creation_in_flight(&self, wt_id: &str) -> bool {
+        self.worktree_creating.iter().any(|pid| {
+            self.prompts
+                .iter()
+                .find(|p| p.id == *pid)
+                .and_then(|p| p.worktree_id.as_deref())
+                == Some(wt_id)
+        })
+    }
+
+    /// Number of prompts sharing `wt_id` that are not yet terminal
+    /// (i.e. anything other than Completed or Failed). Used as a refcount
+    /// to decide whether a shared worktree may be cleaned up.
+    fn shared_worktree_active_count(&self, wt_id: &str) -> usize {
+        self.prompts
+            .iter()
+            .filter(|p| {
+                p.worktree_id.as_deref() == Some(wt_id)
+                    && !matches!(p.status, PromptStatus::Completed | PromptStatus::Failed)
+            })
+            .count()
+    }
+
+    /// Whether all of `prompt.depends_on` reference Completed prompts.
+    fn all_deps_completed(&self, prompt: &Prompt) -> bool {
+        prompt.depends_on.iter().all(|dep_uuid| {
+            self.prompts
+                .iter()
+                .any(|p| &p.uuid == dep_uuid && p.status == PromptStatus::Completed)
+        })
+    }
+
+    /// After a prompt completes, re-evaluate Blocked prompts and unblock any
+    /// whose deps are now all Completed. Returns the set of prompt IDs that
+    /// transitioned to Pending.
+    fn unblock_dependents(&mut self) -> Vec<usize> {
+        let to_unblock: Vec<usize> = self
+            .prompts
+            .iter()
+            .filter(|p| p.status == PromptStatus::Blocked && self.all_deps_completed(p))
+            .map(|p| p.id)
+            .collect();
+        for id in &to_unblock {
+            if let Some(p) = self.prompts.iter_mut().find(|p| p.id == *id) {
+                p.status = PromptStatus::Pending;
+            }
+            self.persist_prompt_by_id(*id);
+            if let Some(p) = self.prompts.iter().find(|p| p.id == *id) {
+                let info = self.to_prompt_info(p);
+                self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+            }
+        }
+        to_unblock
+    }
+
+    pub fn add_prompt(&mut self, params: AddPrompt) {
+        let AddPrompt {
+            text,
+            cwd,
+            mode,
+            worktree,
+            tags,
+            depends_on,
+            worktree_id,
+        } = params;
         let mut prompt = Prompt::new(self.next_id, text, cwd, mode);
         prompt.worktree = worktree;
         prompt.tags = tags;
+        prompt.depends_on = depends_on;
+        prompt.worktree_id = worktree_id;
+        // A fresh prompt has no incoming edges, so cycles are impossible here.
+        // The status starts Blocked if any dep is not yet Completed.
+        if !prompt.depends_on.is_empty() && !self.all_deps_completed(&prompt) {
+            prompt.status = PromptStatus::Blocked;
+        }
         let max_rank = self
             .prompts
             .iter()
@@ -214,7 +366,13 @@ impl Orchestrator {
         self.persist_prompt(&prompt);
         self.maybe_prune();
 
-        info!(prompt_id = prompt.id, mode = %prompt.mode.label(), "prompt added");
+        info!(
+            prompt_id = prompt.id,
+            mode = %prompt.mode.label(),
+            deps = prompt.depends_on.len(),
+            status = ?prompt.status,
+            "prompt added"
+        );
         let info_msg = self.to_prompt_info(&prompt);
         self.prompts.push(prompt);
         self.sessions.broadcast(&DaemonEvent::PromptAdded(info_msg));
@@ -256,6 +414,7 @@ impl Orchestrator {
             let prompt_worktree = self.prompts[idx].worktree;
             let prompt_cwd = self.prompts[idx].cwd.clone();
             let prompt_worktree_path = self.prompts[idx].worktree_path.clone();
+            let prompt_worktree_id = self.prompts[idx].worktree_id.clone();
             let mode = self.prompts[idx].mode;
             let resume_session_id = if self.prompts[idx].resume {
                 Some(self.prompts[idx].session_id.clone().unwrap_or_default())
@@ -273,7 +432,55 @@ impl Orchestrator {
             let session_id = self.prompts[idx].session_id.clone();
 
             let cwd = if prompt_worktree {
-                if prompt_worktree_path.is_none() {
+                if let Some(existing) = prompt_worktree_path.clone() {
+                    Some(existing)
+                } else if let Some(ref wt_id) = prompt_worktree_id {
+                    // Shared worktree: reuse if a sibling already resolved it.
+                    if let Some(shared) = self.shared_worktree_path(wt_id) {
+                        debug!(prompt_id, %wt_id, path = %shared, "reusing shared worktree");
+                        self.prompts[idx].worktree_path = Some(shared.clone());
+                        self.persist_prompt_by_id(prompt_id);
+                        let info = self.to_prompt_info(&self.prompts[idx]);
+                        self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+                        Some(shared)
+                    } else if self.worktree_id_creation_in_flight(wt_id) {
+                        // Another sibling is creating it right now; wait for
+                        // WorktreeCreated to broadcast and re-dispatch.
+                        debug!(prompt_id, %wt_id, "shared worktree creation in flight, waiting");
+                        continue;
+                    } else {
+                        // First prompt for this shared id: create with id-based name.
+                        let effective_cwd = prompt_cwd.clone().unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string()
+                        });
+                        let repo_path = std::path::Path::new(&effective_cwd);
+                        if clhorde_core::worktree::is_git_repo(repo_path) {
+                            debug!(prompt_id, repo = %repo_path.display(), %wt_id, "creating shared worktree");
+                            self.worktree_creating.insert(prompt_id);
+                            let tx = self.worker_tx.clone();
+                            let repo = repo_path.to_path_buf();
+                            let wt_id_owned = wt_id.clone();
+                            std::thread::spawn(move || {
+                                let result = clhorde_core::worktree::create_worktree_named(
+                                    &repo,
+                                    &wt_id_owned,
+                                )
+                                .map(|p| p.to_string_lossy().to_string());
+                                let _ = tx.blocking_send(WorkerMessage::WorktreeCreated {
+                                    prompt_id,
+                                    result,
+                                });
+                            });
+                            continue;
+                        } else {
+                            prompt_cwd
+                        }
+                    }
+                } else {
+                    // Per-prompt worktree (legacy behavior).
                     let effective_cwd = prompt_cwd.clone().unwrap_or_else(|| {
                         std::env::current_dir()
                             .unwrap_or_default()
@@ -282,8 +489,6 @@ impl Orchestrator {
                     });
                     let repo_path = std::path::Path::new(&effective_cwd);
                     if clhorde_core::worktree::is_git_repo(repo_path) {
-                        // Spawn worktree creation in a background thread to avoid
-                        // blocking the async event loop (Fix #5).
                         debug!(prompt_id, repo = %repo_path.display(), "creating worktree");
                         self.worktree_creating.insert(prompt_id);
                         let tx = self.worker_tx.clone();
@@ -300,8 +505,6 @@ impl Orchestrator {
                     } else {
                         prompt_cwd
                     }
-                } else {
-                    prompt_worktree_path
                 }
             } else {
                 prompt_cwd
@@ -315,15 +518,17 @@ impl Orchestrator {
             });
 
             let result = worker::spawn_worker(
-                prompt_id,
-                prompt_text,
-                cwd,
+                WorkerSpawn {
+                    prompt_id,
+                    prompt_text,
+                    cwd,
+                    tx: self.worker_tx.clone(),
+                    resume_session_id,
+                    session_id,
+                    pty_byte_tx: self.pty_byte_tx.clone(),
+                },
                 mode,
-                self.worker_tx.clone(),
                 Some((80, 24)), // Default PTY size; clients can resize
-                resume_session_id,
-                session_id,
-                self.pty_byte_tx.clone(),
             );
 
             match result {
@@ -385,28 +590,6 @@ impl Orchestrator {
                 }
                 self.sessions
                     .broadcast(&DaemonEvent::OutputChunk { prompt_id, text });
-            }
-            WorkerMessage::TurnComplete { prompt_id } => {
-                debug!(prompt_id, "worker turn complete");
-                let mut save = false;
-                if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
-                    if prompt.status == PromptStatus::Running {
-                        if let Some(output) = &mut prompt.output {
-                            output.push('\n');
-                        }
-                        prompt.status = PromptStatus::Idle;
-                        save = true;
-                    }
-                }
-                if save {
-                    self.persist_prompt_by_id(prompt_id);
-                }
-                self.sessions
-                    .broadcast(&DaemonEvent::TurnComplete { prompt_id });
-                if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
-                    let info = self.to_prompt_info(prompt);
-                    self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
-                }
             }
             WorkerMessage::PtyUpdate { prompt_id } => {
                 self.sessions
@@ -535,34 +718,87 @@ impl Orchestrator {
                     let info = self.to_prompt_info(prompt);
                     self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
                 }
+                // If this prompt completed, see if any Blocked dependents are now free.
+                let unblocked = self.unblock_dependents();
+                if !unblocked.is_empty() {
+                    debug!(?unblocked, "unblocked dependents after Finished");
+                }
                 self.sessions.broadcast(&DaemonEvent::ActiveWorkersChanged {
                     count: self.active_workers,
                 });
             }
             WorkerMessage::WorktreeCreated { prompt_id, result } => {
                 self.worktree_creating.remove(&prompt_id);
+                // Look up the worktree_id of the originating prompt so we can
+                // propagate the resolved path to all sibling prompts.
+                let wt_id = self
+                    .prompts
+                    .iter()
+                    .find(|p| p.id == prompt_id)
+                    .and_then(|p| p.worktree_id.clone());
                 match result {
                     Ok(wt_path) => {
                         if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
-                            prompt.worktree_path = Some(wt_path);
+                            prompt.worktree_path = Some(wt_path.clone());
                         }
                         self.persist_prompt_by_id(prompt_id);
+                        // Propagate to siblings sharing the same worktree_id.
+                        if let Some(ref id) = wt_id {
+                            let siblings: Vec<usize> = self
+                                .prompts
+                                .iter()
+                                .filter(|p| {
+                                    p.id != prompt_id
+                                        && p.worktree_id.as_deref() == Some(id.as_str())
+                                        && p.worktree_path.is_none()
+                                })
+                                .map(|p| p.id)
+                                .collect();
+                            for sid in siblings {
+                                if let Some(p) = self.prompts.iter_mut().find(|p| p.id == sid) {
+                                    p.worktree_path = Some(wt_path.clone());
+                                }
+                                self.persist_prompt_by_id(sid);
+                                if let Some(p) = self.prompts.iter().find(|p| p.id == sid) {
+                                    let info = self.to_prompt_info(p);
+                                    self.sessions
+                                        .broadcast(&DaemonEvent::PromptUpdated(info));
+                                }
+                            }
+                        }
                         // dispatch_workers() is called after apply_message() in main loop,
                         // which will pick up this prompt now that it has worktree_path set.
                     }
                     Err(e) => {
-                        if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) {
-                            prompt.status = PromptStatus::Failed;
-                            prompt.error = Some(format!("Failed to create worktree: {e}"));
+                        // Fail the originating prompt and any waiting siblings sharing wt_id.
+                        let mut affected: Vec<usize> = vec![prompt_id];
+                        if let Some(ref id) = wt_id {
+                            for p in &self.prompts {
+                                if p.id != prompt_id
+                                    && p.worktree_id.as_deref() == Some(id.as_str())
+                                    && p.worktree_path.is_none()
+                                {
+                                    affected.push(p.id);
+                                }
+                            }
                         }
-                        self.persist_prompt_by_id(prompt_id);
-                        self.sessions.broadcast(&DaemonEvent::WorkerError {
-                            prompt_id,
-                            error: format!("Failed to create worktree: {e}"),
-                        });
-                        if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
-                            let info = self.to_prompt_info(prompt);
-                            self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+                        for pid in affected {
+                            if let Some(prompt) =
+                                self.prompts.iter_mut().find(|p| p.id == pid)
+                            {
+                                prompt.status = PromptStatus::Failed;
+                                prompt.error =
+                                    Some(format!("Failed to create worktree: {e}"));
+                            }
+                            self.persist_prompt_by_id(pid);
+                            self.sessions.broadcast(&DaemonEvent::WorkerError {
+                                prompt_id: pid,
+                                error: format!("Failed to create worktree: {e}"),
+                            });
+                            if let Some(p) = self.prompts.iter().find(|p| p.id == pid) {
+                                let info = self.to_prompt_info(p);
+                                self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+                            }
                         }
                     }
                 }
@@ -610,10 +846,28 @@ impl Orchestrator {
                 mode,
                 worktree,
                 tags,
+                depends_on,
+                worktree_id,
             } => {
                 let prompt_mode = PromptMode::from_mode_str(&mode);
-                self.add_prompt(text, cwd, prompt_mode, worktree, tags);
-                self.dispatch_workers();
+                match self.resolve_dep_ids(&depends_on) {
+                    Ok(dep_uuids) => {
+                        self.add_prompt(AddPrompt {
+                            text,
+                            cwd,
+                            mode: prompt_mode,
+                            worktree,
+                            tags,
+                            depends_on: dep_uuids,
+                            worktree_id,
+                        });
+                        self.dispatch_workers();
+                    }
+                    Err(message) => {
+                        self.sessions
+                            .send_to(session_id, DaemonEvent::Error { message });
+                    }
+                }
             }
             ClientRequest::SendInput { prompt_id, text } => {
                 // Only echo and send if a worker input channel exists (interactive workers).
@@ -665,13 +919,26 @@ impl Orchestrator {
                                 p.mode,
                                 p.worktree,
                                 p.tags.clone(),
+                                p.worktree_id.clone(),
                             ))
                         } else {
                             None
                         }
                     });
-                if let Some((text, cwd, mode, wt, tags)) = retry_data {
-                    self.add_prompt(text, cwd, mode, wt, tags);
+                if let Some((text, cwd, mode, wt, tags, wt_id)) = retry_data {
+                    // Retry creates a fresh prompt with no inherited deps —
+                    // by design, the user re-links manually if desired.
+                    // worktree_id is preserved so the retry joins the same
+                    // shared worktree as the original.
+                    self.add_prompt(AddPrompt {
+                        text,
+                        cwd,
+                        mode,
+                        worktree: wt,
+                        tags,
+                        depends_on: Vec::new(),
+                        worktree_id: wt_id,
+                    });
                     self.dispatch_workers();
                 }
             }
@@ -714,6 +981,89 @@ impl Orchestrator {
                         self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
                     }
                 }
+            }
+            ClientRequest::SetDependencies {
+                prompt_id,
+                depends_on,
+            } => {
+                let Some(idx) = self.prompts.iter().position(|p| p.id == prompt_id) else {
+                    self.sessions.send_to(
+                        session_id,
+                        DaemonEvent::Error {
+                            message: format!("Unknown prompt {prompt_id}"),
+                        },
+                    );
+                    return;
+                };
+                let current_status = self.prompts[idx].status.clone();
+                if !matches!(
+                    current_status,
+                    PromptStatus::Pending | PromptStatus::Blocked
+                ) {
+                    self.sessions.send_to(
+                        session_id,
+                        DaemonEvent::Error {
+                            message: format!(
+                                "Cannot change dependencies of prompt {prompt_id} in {current_status:?} state"
+                            ),
+                        },
+                    );
+                    return;
+                }
+                let dep_uuids = match self.resolve_dep_ids(&depends_on) {
+                    Ok(u) => u,
+                    Err(message) => {
+                        self.sessions
+                            .send_to(session_id, DaemonEvent::Error { message });
+                        return;
+                    }
+                };
+                let target_uuid = self.prompts[idx].uuid.clone();
+                if self.would_create_cycle(&target_uuid, &dep_uuids) {
+                    self.sessions.send_to(
+                        session_id,
+                        DaemonEvent::Error {
+                            message: format!(
+                                "Refused: dependency change on prompt {prompt_id} would create a cycle"
+                            ),
+                        },
+                    );
+                    return;
+                }
+                self.prompts[idx].depends_on = dep_uuids;
+                self.prompts[idx].status =
+                    if self.all_deps_completed(&self.prompts[idx]) {
+                        PromptStatus::Pending
+                    } else {
+                        PromptStatus::Blocked
+                    };
+                self.persist_prompt_by_id(prompt_id);
+                let info = self.to_prompt_info(&self.prompts[idx]);
+                self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+                self.dispatch_workers();
+            }
+            ClientRequest::SetAnnotation {
+                prompt_id,
+                key,
+                value,
+            } => {
+                let Some(idx) = self.prompts.iter().position(|p| p.id == prompt_id) else {
+                    self.sessions.send_to(
+                        session_id,
+                        DaemonEvent::Error {
+                            message: format!("Unknown prompt {prompt_id}"),
+                        },
+                    );
+                    return;
+                };
+                if value.is_null() {
+                    self.prompts[idx].annotations.remove(&key);
+                } else {
+                    self.prompts[idx].annotations.insert(key, value);
+                }
+                self.persist_prompt_by_id(prompt_id);
+                let info = self.to_prompt_info(&self.prompts[idx]);
+                self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
             }
             ClientRequest::GetState => {
                 let state = self.to_daemon_state();
@@ -906,6 +1256,12 @@ impl Orchestrator {
                 self.active_workers = self.active_workers.saturating_sub(1);
             }
         }
+        // Capture UUID before removal so we can purge it from dependents' lists.
+        let removed_uuid = self
+            .prompts
+            .iter()
+            .find(|p| p.id == prompt_id)
+            .map(|p| p.uuid.clone());
         // Delete persistence file
         if let Some(ref dir) = self.prompts_dir {
             if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
@@ -916,6 +1272,30 @@ impl Orchestrator {
             self.prompts.remove(pos);
             self.sessions
                 .broadcast(&DaemonEvent::PromptRemoved { prompt_id });
+        }
+        // Purge the deleted UUID from any other prompt's depends_on, then
+        // re-evaluate blocked dependents. Deletion implies "no longer needed",
+        // so dependents should not wait on a vanished prompt.
+        if let Some(uuid) = removed_uuid {
+            let affected: Vec<usize> = self
+                .prompts
+                .iter()
+                .filter(|p| p.depends_on.iter().any(|d| d == &uuid))
+                .map(|p| p.id)
+                .collect();
+            for id in &affected {
+                if let Some(p) = self.prompts.iter_mut().find(|p| p.id == *id) {
+                    p.depends_on.retain(|d| d != &uuid);
+                }
+                self.persist_prompt_by_id(*id);
+                if let Some(p) = self.prompts.iter().find(|p| p.id == *id) {
+                    let info = self.to_prompt_info(p);
+                    self.sessions.broadcast(&DaemonEvent::PromptUpdated(info));
+                }
+            }
+            if !affected.is_empty() {
+                self.unblock_dependents();
+            }
         }
     }
 
@@ -1010,28 +1390,42 @@ impl Orchestrator {
     fn clean_worktrees(&self) -> usize {
         info!("cleaning worktrees");
         let mut count = 0;
+        // Track shared worktrees we've already cleaned so we don't try
+        // multiple times across siblings.
+        let mut cleaned_shared: HashSet<String> = HashSet::new();
         for prompt in &self.prompts {
-            if prompt.status == PromptStatus::Completed || prompt.status == PromptStatus::Failed {
-                if let Some(ref wt_path) = prompt.worktree_path {
-                    let wt = std::path::PathBuf::from(wt_path);
-                    if wt.exists() {
-                        if let Some(parent) = wt.parent() {
-                            if let Ok(entries) = std::fs::read_dir(parent) {
-                                for entry in entries.flatten() {
-                                    let path = entry.path();
-                                    if path.is_dir()
-                                        && path != wt
-                                        && clhorde_core::worktree::is_git_repo(&path)
-                                    {
-                                        if let Some(root) = clhorde_core::worktree::repo_root(&path)
+            if prompt.status != PromptStatus::Completed && prompt.status != PromptStatus::Failed {
+                continue;
+            }
+            // If the worktree is shared, only clean it when no sibling is still
+            // active and we haven't processed this id yet.
+            if let Some(ref wt_id) = prompt.worktree_id {
+                if cleaned_shared.contains(wt_id) {
+                    continue;
+                }
+                if self.shared_worktree_active_count(wt_id) > 0 {
+                    continue;
+                }
+                cleaned_shared.insert(wt_id.clone());
+            }
+            if let Some(ref wt_path) = prompt.worktree_path {
+                let wt = std::path::PathBuf::from(wt_path);
+                if wt.exists() {
+                    if let Some(parent) = wt.parent() {
+                        if let Ok(entries) = std::fs::read_dir(parent) {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.is_dir()
+                                    && path != wt
+                                    && clhorde_core::worktree::is_git_repo(&path)
+                                {
+                                    if let Some(root) = clhorde_core::worktree::repo_root(&path) {
+                                        if clhorde_core::worktree::remove_worktree(&root, &wt)
+                                            .is_ok()
                                         {
-                                            if clhorde_core::worktree::remove_worktree(&root, &wt)
-                                                .is_ok()
-                                            {
-                                                count += 1;
-                                            }
-                                            break;
+                                            count += 1;
                                         }
+                                        break;
                                     }
                                 }
                             }
@@ -1049,6 +1443,25 @@ impl Orchestrator {
         if self.worktree_cleanup != WorktreeCleanup::Auto {
             return;
         }
+        let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) else {
+            return;
+        };
+        let wt_id = prompt.worktree_id.clone();
+        // Refcount: a shared worktree must not be cleaned up while other
+        // sharing prompts are still active (Pending/Blocked/Running/Idle).
+        if let Some(ref id) = wt_id {
+            // The prompt that just finished is still in self.prompts here,
+            // counted as Completed/Failed by the caller, so this returns the
+            // count of *other* still-active siblings.
+            if self.shared_worktree_active_count(id) > 0 {
+                debug!(
+                    prompt_id,
+                    %id,
+                    "skipping worktree cleanup: siblings still active"
+                );
+                return;
+            }
+        }
         let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == prompt_id) else {
             return;
         };
@@ -1056,7 +1469,8 @@ impl Orchestrator {
             return;
         };
         debug!(prompt_id, path = %wt_path, "auto-cleanup worktree");
-        // Persist the cleared worktree_path
+        // Persist the cleared worktree_path on this prompt and on any siblings
+        // sharing the same worktree_id (they all referenced the same path).
         if let Some(ref dir) = self.prompts_dir {
             if let Some(prompt) = self.prompts.iter().find(|p| p.id == prompt_id) {
                 persistence::save_prompt(
@@ -1064,6 +1478,24 @@ impl Orchestrator {
                     &prompt.uuid,
                     &persistence::PromptFile::from_prompt(prompt),
                 );
+            }
+        }
+        if let Some(ref id) = wt_id {
+            let siblings: Vec<usize> = self
+                .prompts
+                .iter()
+                .filter(|p| {
+                    p.id != prompt_id
+                        && p.worktree_id.as_deref() == Some(id.as_str())
+                        && p.worktree_path.is_some()
+                })
+                .map(|p| p.id)
+                .collect();
+            for sid in siblings {
+                if let Some(p) = self.prompts.iter_mut().find(|p| p.id == sid) {
+                    p.worktree_path = None;
+                }
+                self.persist_prompt_by_id(sid);
             }
         }
         // Spawn a background thread for cleanup
@@ -1107,6 +1539,7 @@ impl Orchestrator {
 mod tests {
     use super::*;
     use clhorde_core::prompt::Prompt;
+    use clhorde_core::protocol::ClientRequest;
 
     /// Helper: insert a prompt with a given status directly into the orchestrator.
     fn insert_prompt(orch: &mut Orchestrator, id: usize, status: PromptStatus) {
@@ -1272,6 +1705,497 @@ mod tests {
         assert!(matches!(event, DaemonEvent::Unsubscribed));
     }
 
+    // ── annotations (Phase 0.3) ──
+
+    #[tokio::test]
+    async fn set_annotation_inserts_value() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+
+        orch.handle_request(
+            ClientRequest::SetAnnotation {
+                prompt_id: 1,
+                key: "openspec.affected_changes".to_string(),
+                value: serde_json::json!(["add-oauth"]),
+            },
+            0,
+        );
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(
+            prompt.annotations["openspec.affected_changes"],
+            serde_json::json!(["add-oauth"])
+        );
+    }
+
+    #[tokio::test]
+    async fn set_annotation_overwrites_existing_value() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+
+        for value in [serde_json::json!("v1"), serde_json::json!("v2")] {
+            orch.handle_request(
+                ClientRequest::SetAnnotation {
+                    prompt_id: 1,
+                    key: "k".to_string(),
+                    value,
+                },
+                0,
+            );
+        }
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(prompt.annotations["k"], serde_json::json!("v2"));
+        assert_eq!(prompt.annotations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_annotation_null_removes_key() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+        orch.prompts[0]
+            .annotations
+            .insert("k".to_string(), serde_json::json!("v"));
+
+        orch.handle_request(
+            ClientRequest::SetAnnotation {
+                prompt_id: 1,
+                key: "k".to_string(),
+                value: serde_json::Value::Null,
+            },
+            0,
+        );
+
+        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert!(prompt.annotations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_annotation_unknown_prompt_returns_error() {
+        let mut orch = Orchestrator::new_for_test();
+
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        orch.sessions.add_session_with_id(7, event_tx);
+        orch.sessions.set_subscribed(7, true);
+
+        orch.handle_request(
+            ClientRequest::SetAnnotation {
+                prompt_id: 999,
+                key: "k".to_string(),
+                value: serde_json::json!("v"),
+            },
+            7,
+        );
+
+        let event = event_rx.try_recv().expect("expected Error event");
+        match event {
+            DaemonEvent::Error { message } => assert!(message.contains("999")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_annotation_broadcasts_prompt_updated() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        orch.sessions.add_session_with_id(7, event_tx);
+        orch.sessions.set_subscribed(7, true);
+
+        orch.handle_request(
+            ClientRequest::SetAnnotation {
+                prompt_id: 1,
+                key: "k".to_string(),
+                value: serde_json::json!("v"),
+            },
+            7,
+        );
+
+        let mut last_info: Option<PromptInfo> = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let DaemonEvent::PromptUpdated(info) = ev {
+                last_info = Some(info);
+            }
+        }
+        let info = last_info.expect("expected PromptUpdated");
+        assert_eq!(info.id, 1);
+        assert_eq!(info.annotations["k"], serde_json::json!("v"));
+    }
+
+    #[tokio::test]
+    async fn annotations_persist_through_restoration() {
+        // The orchestrator restores annotations from PromptFile on startup.
+        // Round-trip through PromptFile::from_prompt and back via the same
+        // restoration code path the daemon uses in `new()`.
+        use clhorde_core::persistence::PromptFile;
+
+        let mut prompt = clhorde_core::prompt::Prompt::new(
+            1,
+            "test".to_string(),
+            None,
+            PromptMode::Interactive,
+        );
+        prompt.annotations.insert(
+            "openspec.affected_changes".to_string(),
+            serde_json::json!(["add-oauth"]),
+        );
+        let pf = PromptFile::from_prompt(&prompt);
+        assert_eq!(
+            pf.annotations["openspec.affected_changes"],
+            serde_json::json!(["add-oauth"])
+        );
+
+        // Simulate restoration on a fresh prompt struct.
+        let mut restored = clhorde_core::prompt::Prompt::new(
+            1,
+            pf.prompt.clone(),
+            pf.options.context.clone(),
+            PromptMode::Interactive,
+        );
+        restored.annotations = pf.annotations.clone();
+        assert_eq!(
+            restored.annotations["openspec.affected_changes"],
+            serde_json::json!(["add-oauth"])
+        );
+    }
+
+    // ── dependencies ──
+
+    #[tokio::test]
+    async fn add_prompt_with_unmet_deps_starts_blocked() {
+        let mut orch = Orchestrator::new_for_test();
+        // Insert a Pending prompt with id 1 and capture its UUID
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        let dep_uuid = orch.prompts[0].uuid.clone();
+
+        orch.add_prompt(AddPrompt {
+            text: "child".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![dep_uuid],
+            worktree_id: None,
+        });
+        let child = orch.prompts.iter().find(|p| p.id == 2).unwrap();
+        assert_eq!(child.status, PromptStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn add_prompt_with_completed_deps_starts_pending() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Completed);
+        let dep_uuid = orch.prompts[0].uuid.clone();
+
+        orch.add_prompt(AddPrompt {
+            text: "child".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![dep_uuid],
+            worktree_id: None,
+        });
+        let child = orch.prompts.iter().find(|p| p.id == 2).unwrap();
+        assert_eq!(child.status, PromptStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_blocked_prompts() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        let dep_uuid = orch.prompts[0].uuid.clone();
+        orch.add_prompt(AddPrompt {
+            text: "child".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![dep_uuid],
+            worktree_id: None,
+        });
+        // The pending parent at idx 0 should be picked first; the blocked
+        // child at idx 1 must not appear.
+        let idx = orch.next_pending_prompt_index();
+        assert_eq!(idx, Some(0));
+        // Blocking the parent (set to Blocked) leaves nothing dispatchable.
+        orch.prompts[0].status = PromptStatus::Blocked;
+        assert_eq!(orch.next_pending_prompt_index(), None);
+    }
+
+    #[tokio::test]
+    async fn unblock_dependents_transitions_blocked_to_pending() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Running);
+        let dep_uuid = orch.prompts[0].uuid.clone();
+        orch.add_prompt(AddPrompt {
+            text: "child".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![dep_uuid],
+            worktree_id: None,
+        });
+        assert_eq!(orch.prompts[1].status, PromptStatus::Blocked);
+        // Mark the parent Completed; unblock_dependents should run.
+        orch.prompts[0].status = PromptStatus::Completed;
+        let unblocked = orch.unblock_dependents();
+        assert_eq!(unblocked, vec![2]);
+        assert_eq!(orch.prompts[1].status, PromptStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn dep_on_failed_prompt_keeps_dependent_blocked() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Failed);
+        let dep_uuid = orch.prompts[0].uuid.clone();
+        orch.add_prompt(AddPrompt {
+            text: "child".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![dep_uuid],
+            worktree_id: None,
+        });
+        assert_eq!(orch.prompts[1].status, PromptStatus::Blocked);
+        // unblock_dependents must not free dependents of Failed prompts.
+        let unblocked = orch.unblock_dependents();
+        assert!(unblocked.is_empty());
+        assert_eq!(orch.prompts[1].status, PromptStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn would_create_cycle_detects_self_loop() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        let uuid = orch.prompts[0].uuid.clone();
+        assert!(orch.would_create_cycle(&uuid, &[uuid.clone()]));
+    }
+
+    #[tokio::test]
+    async fn would_create_cycle_detects_indirect_cycle() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        insert_prompt(&mut orch, 2, PromptStatus::Pending);
+        let uuid_a = orch.prompts[0].uuid.clone();
+        let uuid_b = orch.prompts[1].uuid.clone();
+        // a depends on b; making b depend on a would close the loop.
+        orch.prompts[0].depends_on = vec![uuid_b.clone()];
+        assert!(orch.would_create_cycle(&uuid_b, &[uuid_a]));
+    }
+
+    #[tokio::test]
+    async fn resolve_dep_ids_returns_error_for_unknown() {
+        let orch = Orchestrator::new_for_test();
+        match orch.resolve_dep_ids(&[42]) {
+            Ok(_) => panic!("should have errored"),
+            Err(msg) => assert!(msg.contains("42")),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_prompt_purges_deps_and_unblocks() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_prompt(&mut orch, 1, PromptStatus::Pending);
+        let dep_uuid = orch.prompts[0].uuid.clone();
+        orch.add_prompt(AddPrompt {
+            text: "child".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![dep_uuid.clone()],
+            worktree_id: None,
+        });
+        assert_eq!(orch.prompts[1].status, PromptStatus::Blocked);
+
+        orch.delete_prompt(1);
+        // The child's depends_on should be empty now, and status Pending.
+        let child = orch.prompts.iter().find(|p| p.id == 2).unwrap();
+        assert!(child.depends_on.is_empty());
+        assert_eq!(child.status, PromptStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn submit_prompt_with_unknown_dep_id_returns_error() {
+        let mut orch = Orchestrator::new_for_test();
+        let (event_tx, mut event_rx) = mpsc::channel(1024);
+        orch.sessions.add_session_with_id(1, event_tx);
+
+        orch.handle_request(
+            ClientRequest::SubmitPrompt {
+                text: "child".into(),
+                cwd: None,
+                mode: "interactive".into(),
+                worktree: false,
+                tags: vec![],
+                depends_on: vec![999],
+                worktree_id: None,
+            },
+            1,
+        );
+        let event = event_rx.try_recv().expect("should receive Error");
+        match event {
+            DaemonEvent::Error { message } => assert!(message.contains("999")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(orch.prompts.is_empty());
+    }
+
+    // ── shared worktrees ──
+
+    /// Helper: insert a prompt with a worktree_id and optional worktree_path.
+    fn insert_shared(
+        orch: &mut Orchestrator,
+        id: usize,
+        status: PromptStatus,
+        wt_id: &str,
+        wt_path: Option<&str>,
+    ) {
+        let mut p = Prompt::new(id, format!("p-{id}"), None, PromptMode::Interactive);
+        p.status = status;
+        p.worktree = true;
+        p.worktree_id = Some(wt_id.to_string());
+        p.worktree_path = wt_path.map(String::from);
+        orch.prompts.push(p);
+        if id >= orch.next_id {
+            orch.next_id = id + 1;
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_worktree_path_finds_sibling() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_shared(&mut orch, 1, PromptStatus::Running, "flow-A", Some("/tmp/wt-A"));
+        insert_shared(&mut orch, 2, PromptStatus::Pending, "flow-A", None);
+        assert_eq!(
+            orch.shared_worktree_path("flow-A"),
+            Some("/tmp/wt-A".to_string())
+        );
+        assert_eq!(orch.shared_worktree_path("flow-B"), None);
+    }
+
+    #[tokio::test]
+    async fn shared_worktree_active_count_excludes_terminal() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_shared(&mut orch, 1, PromptStatus::Running, "X", Some("/tmp/x"));
+        insert_shared(&mut orch, 2, PromptStatus::Completed, "X", Some("/tmp/x"));
+        insert_shared(&mut orch, 3, PromptStatus::Failed, "X", Some("/tmp/x"));
+        insert_shared(&mut orch, 4, PromptStatus::Pending, "X", None);
+        // 1 (Running) and 4 (Pending) are active; 2 and 3 are terminal.
+        assert_eq!(orch.shared_worktree_active_count("X"), 2);
+    }
+
+    #[tokio::test]
+    async fn worktree_id_creation_in_flight_tracks_siblings() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_shared(&mut orch, 1, PromptStatus::Pending, "X", None);
+        insert_shared(&mut orch, 2, PromptStatus::Pending, "X", None);
+        // No creation in flight initially.
+        assert!(!orch.worktree_id_creation_in_flight("X"));
+        // Mark prompt 1 as currently creating.
+        orch.worktree_creating.insert(1);
+        assert!(orch.worktree_id_creation_in_flight("X"));
+        assert!(!orch.worktree_id_creation_in_flight("Y"));
+    }
+
+    #[tokio::test]
+    async fn worktree_created_propagates_path_to_siblings() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_shared(&mut orch, 1, PromptStatus::Pending, "shared", None);
+        insert_shared(&mut orch, 2, PromptStatus::Pending, "shared", None);
+        insert_shared(&mut orch, 3, PromptStatus::Pending, "other", None);
+        orch.worktree_creating.insert(1);
+
+        orch.apply_message(WorkerMessage::WorktreeCreated {
+            prompt_id: 1,
+            result: Ok("/tmp/shared-wt".to_string()),
+        });
+
+        let p1 = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        let p2 = orch.prompts.iter().find(|p| p.id == 2).unwrap();
+        let p3 = orch.prompts.iter().find(|p| p.id == 3).unwrap();
+        assert_eq!(p1.worktree_path.as_deref(), Some("/tmp/shared-wt"));
+        assert_eq!(p2.worktree_path.as_deref(), Some("/tmp/shared-wt"));
+        // Different worktree_id — must not get propagated.
+        assert!(p3.worktree_path.is_none());
+        // The creator was removed from the in-flight set.
+        assert!(!orch.worktree_creating.contains(&1));
+    }
+
+    #[tokio::test]
+    async fn worktree_created_failure_fails_all_siblings_waiting_on_path() {
+        let mut orch = Orchestrator::new_for_test();
+        insert_shared(&mut orch, 1, PromptStatus::Pending, "shared", None);
+        insert_shared(&mut orch, 2, PromptStatus::Pending, "shared", None);
+        // Sibling 3 already has a path — should NOT be marked Failed.
+        insert_shared(&mut orch, 3, PromptStatus::Running, "shared", Some("/old"));
+        orch.worktree_creating.insert(1);
+
+        orch.apply_message(WorkerMessage::WorktreeCreated {
+            prompt_id: 1,
+            result: Err("disk full".into()),
+        });
+
+        let p1 = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        let p2 = orch.prompts.iter().find(|p| p.id == 2).unwrap();
+        let p3 = orch.prompts.iter().find(|p| p.id == 3).unwrap();
+        assert_eq!(p1.status, PromptStatus::Failed);
+        assert_eq!(p2.status, PromptStatus::Failed);
+        assert_eq!(p3.status, PromptStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn maybe_cleanup_skips_when_siblings_active() {
+        let mut orch = Orchestrator::new_for_test();
+        orch.worktree_cleanup = WorktreeCleanup::Auto;
+        insert_shared(&mut orch, 1, PromptStatus::Completed, "shared", Some("/tmp/x"));
+        insert_shared(&mut orch, 2, PromptStatus::Running, "shared", Some("/tmp/x"));
+
+        // Trigger cleanup for the completed prompt.
+        orch.maybe_cleanup_worktree(1);
+
+        // Path must still be set on prompt 1 because cleanup was skipped.
+        let p1 = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(p1.worktree_path.as_deref(), Some("/tmp/x"));
+    }
+
+    #[tokio::test]
+    async fn maybe_cleanup_clears_when_last_sibling_terminal() {
+        let mut orch = Orchestrator::new_for_test();
+        orch.worktree_cleanup = WorktreeCleanup::Auto;
+        insert_shared(&mut orch, 1, PromptStatus::Completed, "shared", Some("/tmp/x"));
+        insert_shared(&mut orch, 2, PromptStatus::Failed, "shared", Some("/tmp/x"));
+
+        orch.maybe_cleanup_worktree(1);
+
+        // No active sibling → path is cleared on both (refcount drained).
+        let p1 = orch.prompts.iter().find(|p| p.id == 1).unwrap();
+        let p2 = orch.prompts.iter().find(|p| p.id == 2).unwrap();
+        assert!(p1.worktree_path.is_none());
+        assert!(p2.worktree_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn add_prompt_persists_worktree_id() {
+        let mut orch = Orchestrator::new_for_test();
+        orch.add_prompt(AddPrompt {
+            text: "task".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: true,
+            tags: vec![],
+            depends_on: vec![],
+            worktree_id: Some("flow-42".to_string()),
+        });
+        let p = &orch.prompts[0];
+        assert_eq!(p.worktree_id.as_deref(), Some("flow-42"));
+        assert!(p.worktree);
+    }
+
     // ── add_prompt ──
 
     #[tokio::test]
@@ -1279,12 +2203,28 @@ mod tests {
         let mut orch = Orchestrator::new_for_test();
         assert_eq!(orch.next_id, 1);
 
-        orch.add_prompt("hello".into(), None, PromptMode::Interactive, false, vec![]);
+        orch.add_prompt(AddPrompt {
+            text: "hello".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![],
+            worktree_id: None,
+        });
         assert_eq!(orch.prompts.len(), 1);
         assert_eq!(orch.prompts[0].id, 1);
         assert_eq!(orch.next_id, 2);
 
-        orch.add_prompt("world".into(), None, PromptMode::OneShot, false, vec![]);
+        orch.add_prompt(AddPrompt {
+            text: "world".into(),
+            cwd: None,
+            mode: PromptMode::OneShot,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![],
+            worktree_id: None,
+        });
         assert_eq!(orch.prompts.len(), 2);
         assert_eq!(orch.prompts[1].id, 2);
         assert_eq!(orch.next_id, 3);
@@ -1297,7 +2237,15 @@ mod tests {
         orch.sessions.add_session_with_id(1, tx);
         orch.sessions.set_subscribed(1, true);
 
-        orch.add_prompt("test".into(), None, PromptMode::Interactive, false, vec![]);
+        orch.add_prompt(AddPrompt {
+            text: "test".into(),
+            cwd: None,
+            mode: PromptMode::Interactive,
+            worktree: false,
+            tags: vec![],
+            depends_on: vec![],
+            worktree_id: None,
+        });
 
         let event = rx.try_recv().expect("should receive PromptAdded");
         assert!(matches!(event, DaemonEvent::PromptAdded(_)));
@@ -1458,17 +2406,6 @@ mod tests {
 
         let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
         assert_eq!(prompt.output.as_deref(), Some("first second"));
-    }
-
-    #[tokio::test]
-    async fn apply_turn_complete_sets_idle() {
-        let mut orch = Orchestrator::new_for_test();
-        insert_prompt(&mut orch, 1, PromptStatus::Running);
-
-        orch.apply_message(WorkerMessage::TurnComplete { prompt_id: 1 });
-
-        let prompt = orch.prompts.iter().find(|p| p.id == 1).unwrap();
-        assert_eq!(prompt.status, PromptStatus::Idle);
     }
 
     #[tokio::test]
@@ -1636,13 +2573,15 @@ mod tests {
 
         // Add 5 prompts — only 3 should remain on disk
         for _ in 0..5 {
-            orch.add_prompt(
-                "test".to_string(),
-                None,
-                PromptMode::Interactive,
-                false,
-                Vec::new(),
-            );
+            orch.add_prompt(AddPrompt {
+                text: "test".to_string(),
+                cwd: None,
+                mode: PromptMode::Interactive,
+                worktree: false,
+                tags: Vec::new(),
+                depends_on: Vec::new(),
+                worktree_id: None,
+            });
             // Small sleep to ensure UUID v7 ordering
             std::thread::sleep(std::time::Duration::from_millis(1));
         }

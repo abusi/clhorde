@@ -14,6 +14,7 @@
       <div class="nav-links">
         <a href="guide.html">Guide</a>
         <a href="features.html">Features</a>
+        <a href="scheduler.html">Scheduler</a>
         <a href="keybindings.html">Keys</a>
         <a href="configuration.html">Config</a>
         <a href="cli.html">CLI</a>
@@ -43,6 +44,10 @@
       <li><a href="#split-view">Split View</a></li>
       <li><a href="#export">Export</a></li>
       <li><a href="#prompt-from-files">Prompt from Files</a></li>
+      <li><a href="#prompt-dependencies">Prompt Dependencies</a></li>
+      <li><a href="#shared-worktrees">Shared Worktrees</a></li>
+      <li><a href="#annotations">Prompt Annotations</a></li>
+      <li><a href="#scheduler">Spec-driven Workflows (Scheduler)</a></li>
     </ul>
 
     <hr>
@@ -350,6 +355,84 @@
       <p>Use <code>--run-path &lt;path&gt;</code> to specify the working directory (and git repo) for all prompts. This is useful when the prompt files live in a different location than the target repository.</p>
 
       <p>This is useful for batch workflows where you prepare prompts in advance as individual files.</p>
+    </section>
+
+    <!-- ── Prompt Dependencies ── -->
+    <section id="prompt-dependencies" class="feature-section">
+      <h2>Prompt Dependencies</h2>
+
+      <p>Any prompt can name other prompts as prerequisites. The daemon parks it in a new <strong>Blocked</strong> state until every dependency reaches <code>Completed</code>; then it transitions to <code>Pending</code> and a worker picks it up.</p>
+
+      <table>
+        <thead><tr><th>Submit via</th><th>How</th></tr></thead>
+        <tbody>
+          <tr><td>CLI</td><td><code>clhorde-cli submit "..." --depends-on 1,2,3</code> (alias <code>--after</code>)</td></tr>
+          <tr><td>Web</td><td><code>POST /api/prompts</code> body field <code>"depends_on": [1, 2]</code></td></tr>
+        </tbody>
+      </table>
+
+      <ul>
+        <li>Cycles are rejected at submit time.</li>
+        <li>If a dep ends in <code>Failed</code>, the dependent stays <code>Blocked</code> indefinitely &mdash; no auto-cascade. Decide what you want to do.</li>
+        <li>Deleting a prompt scrubs its UUID from any other prompt's <code>depends_on</code> and re-evaluates.</li>
+        <li><code>PromptInfo</code> exposes <code>depends_on</code> and <code>blocked_by</code> (the unmet subset) so clients can render "waiting on X, Y".</li>
+      </ul>
+
+      <pre><code><span class="tok-prompt">$ </span>clhorde-cli submit <span class="tok-str">"Review the PR"</span>
+Submitted prompt #1
+<span class="tok-prompt">$ </span>clhorde-cli submit <span class="tok-str">"Land it"</span> <span class="tok-flag">--depends-on</span> 1
+Submitted prompt #2 (blocked: waiting on 1)</code></pre>
+    </section>
+
+    <!-- ── Shared Worktrees ── -->
+    <section id="shared-worktrees" class="feature-section">
+      <h2>Shared Worktrees</h2>
+
+      <p>Two prompts can share a single git worktree by carrying the same <code>worktree_id</code>. The daemon creates the worktree once and reuses its path for every sibling. When the last sibling reaches a terminal state, the worktree is removed (refcounted &mdash; manual <code>store clean-worktrees</code> respects the same count).</p>
+
+      <table>
+        <thead><tr><th>Submit via</th><th>How</th></tr></thead>
+        <tbody>
+          <tr><td>CLI</td><td><code>clhorde-cli submit "..." --worktree --worktree-id flow-42</code></td></tr>
+          <tr><td>Web</td><td><code>POST /api/prompts</code> body field <code>"worktree_id": "flow-42"</code></td></tr>
+        </tbody>
+      </table>
+
+      <p>The directory layout is <code>&lt;repo&gt;-wt-&lt;sanitized-id&gt;/</code> &mdash; the suffix is restricted to <code>[A-Za-z0-9._-]</code> so it stays a sane filename. Retried prompts rejoin the same shared worktree automatically.</p>
+
+      <p>This is the primitive the <a href="scheduler.html">scheduler</a> uses to keep every prompt of one workflow on a single branch.</p>
+    </section>
+
+    <!-- ── Annotations ── -->
+    <section id="annotations" class="feature-section">
+      <h2>Prompt Annotations</h2>
+
+      <p>Each prompt carries a free-form annotations bag &mdash; <code>{ string &rarr; JSON }</code>. The daemon stores, persists, and broadcasts it but never interprets the contents. Anyone can write a key:</p>
+
+      <pre><code><span class="tok-cmt">// IPC request, also reachable via the daemon socket directly</span>
+{ <span class="tok-key">"type"</span>: <span class="tok-str">"SetAnnotation"</span>, <span class="tok-key">"prompt_id"</span>: <span class="tok-val">42</span>, <span class="tok-key">"key"</span>: <span class="tok-str">"my.tool/build"</span>, <span class="tok-key">"value"</span>: <span class="tok-str">"green"</span> }</code></pre>
+
+      <p>Setting <code>"value": null</code> removes the key. Annotations round-trip through prompt persistence and surface on every <code>PromptInfo</code> broadcast.</p>
+
+      <p>One reserved key is <code>openspec.affected_changes</code>: the scheduler writes it on every <code>WorkerFinished</code> with the list of OpenSpec change directories the worker touched. The TUI's Drafts tab uses this to suggest follow-up work. Other workflow sources (Linear, GitHub Issues) can claim their own keys without touching the daemon.</p>
+    </section>
+
+    <!-- ── Scheduler ── -->
+    <section id="scheduler" class="feature-section">
+      <h2>Spec-driven Workflows (Scheduler)</h2>
+
+      <p>The new <code>clhorde-scheduler</code> binary turns the daemon into a runtime for <a href="https://openspec.dev/">OpenSpec</a>: parse <code>openspec/changes/&lt;name&gt;/tasks.md</code> into a DAG, dispatch each section as a dependent prompt sharing a worktree, watch the boxes tick, then verify and archive.</p>
+
+      <ul>
+        <li><strong>Hand-off</strong> via a <code>.clhorde-ready</code> TOML marker per change.</li>
+        <li><strong>Two new TUI tabs</strong> &mdash; Drafts (no marker) and Workflows (queued + running + archived). Switch with <kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd>.</li>
+        <li><strong>Per-section detail overlay</strong> with live push updates over the scheduler control socket &mdash; no polling.</li>
+        <li><strong>Inter-workflow dependencies</strong>: a workflow can <code>depends_on</code> other change names and stays <code>queued</code> until every dep archives.</li>
+        <li><strong>One CLI</strong>: <code>clhorde-cli flow &lt;subcommand&gt;</code> wraps the scheduler.</li>
+        <li><strong>Web parity</strong>: the SPA gets the same Drafts/Workflows tabs, served by new <code>/api/scheduler/*</code> routes.</li>
+      </ul>
+
+      <p>See the dedicated <a href="scheduler.html">Scheduler &amp; Workflows</a> page for the full reference: marker format, <code>tasks.md</code> syntax, DAG annotations, templates, CLI subcommands, key cheatsheet, and an end-to-end recipe.</p>
     </section>
 
   </main>

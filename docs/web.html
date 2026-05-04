@@ -14,6 +14,7 @@
       <div class="nav-links">
         <a href="guide.html">Guide</a>
         <a href="features.html">Features</a>
+        <a href="scheduler.html">Scheduler</a>
         <a href="keybindings.html">Keys</a>
         <a href="configuration.html">Config</a>
         <a href="cli.html">CLI</a>
@@ -32,7 +33,9 @@
       <li><a href="#quickstart">Quick Start</a></li>
       <li><a href="#dashboard">Dashboard</a></li>
       <li><a href="#prompt-detail">Prompt Detail &amp; Terminal</a></li>
+      <li><a href="#scheduler-tabs">Drafts &amp; Workflows Tabs</a></li>
       <li><a href="#rest-api">REST API Reference</a></li>
+      <li><a href="#scheduler-api">Scheduler API</a></li>
       <li><a href="#websocket">WebSocket API</a></li>
       <li><a href="#store">Store Management</a></li>
       <li><a href="#auth">Authentication</a></li>
@@ -123,6 +126,30 @@
       <p>Destructive actions (Kill, Delete) require a confirmation dialog.</p>
     </section>
 
+    <section id="scheduler-tabs" class="feature-section">
+      <h2>Drafts &amp; Workflows Tabs</h2>
+
+      <p>Two new top-nav tabs back the same Drafts/Workflows views the TUI exposes. They become populated when <code>clhorde-scheduler daemon</code> is running &mdash; the bridge starts even if it isn't, so the daemon-only views (Prompts, Store) are unaffected.</p>
+
+      <h3>Drafts</h3>
+      <ul>
+        <li>One row per <code>openspec/changes/&lt;X&gt;/</code> without a <code>.clhorde-ready</code> marker.</li>
+        <li><strong>[Queue]</strong> button per row writes the marker via <code>POST /api/scheduler/workflow/{name}/queue</code>.</li>
+        <li>Empty state distinguishes "no drafts yet" from "scheduler not reachable".</li>
+      </ul>
+
+      <h3>Workflows</h3>
+      <ul>
+        <li>One row per known workflow with status-coloured badges (<code>drafted</code>, <code>queued</code>, <code>implementing</code>, <code>verifying</code>, <code>archiving</code>, <code>archived</code>, <code>cancelled</code>, <code>failed</code>).</li>
+        <li>Yellow <strong>&middot; blocked</strong> suffix tags any workflow held by an unmet inter-workflow dep, with a tooltip listing the deps.</li>
+        <li><strong>[Open]</strong> zooms into a detail block fetched via <code>GET /api/scheduler/workflow/{name}</code>: apply DAG nodes (id, label, state, prompt id, exit code, deps), then verify and archive singletons. The detail card header carries a <strong>Blocked by: ...</strong> line when applicable.</li>
+        <li><strong>[Cancel]</strong> runs <code>POST /api/scheduler/workflow/{name}/cancel</code> behind a confirm dialog.</li>
+        <li><strong>[Retry section]</strong> in the detail block re-dispatches one apply node by dotted id.</li>
+      </ul>
+
+      <p>Updates land via WebSocket push &mdash; both the row list <em>and</em> the expanded detail re-render automatically as the orchestrator emits <code>SchedulerEvent</code> frames. No client-side polling.</p>
+    </section>
+
     <section id="rest-api" class="feature-section">
       <h2>REST API Reference</h2>
 
@@ -160,9 +187,13 @@
   <span class="tok-key">"text"</span>: <span class="tok-str">"Review the auth module"</span>,      <span class="tok-cmt">// required</span>
   <span class="tok-key">"mode"</span>: <span class="tok-str">"interactive"</span>,                <span class="tok-cmt">// default: "interactive"</span>
   <span class="tok-key">"worktree"</span>: <span class="tok-val">false</span>,                    <span class="tok-cmt">// default: false</span>
+  <span class="tok-key">"worktree_id"</span>: <span class="tok-str">"flow-42"</span>,               <span class="tok-cmt">// optional shared-worktree key</span>
+  <span class="tok-key">"depends_on"</span>: [<span class="tok-val">1</span>, <span class="tok-val">2</span>],                  <span class="tok-cmt">// optional, prompt IDs that must complete first</span>
   <span class="tok-key">"cwd"</span>: <span class="tok-str">"/path/to/project"</span>,             <span class="tok-cmt">// optional</span>
   <span class="tok-key">"tags"</span>: [<span class="tok-str">"review"</span>, <span class="tok-str">"auth"</span>]            <span class="tok-cmt">// optional</span>
 }</code></pre>
+
+      <p>If <code>depends_on</code> is non-empty, the new prompt is created in the <code>Blocked</code> state until every named prompt reaches <code>Completed</code>. <code>worktree_id</code> requires <code>worktree: true</code> and lets two prompts share one git worktree (refcount-cleaned). See <a href="features.html#prompt-dependencies">prompt dependencies</a> and <a href="features.html#shared-worktrees">shared worktrees</a>.</p>
 
       <p>Valid modes: <code>"interactive"</code>, <code>"one-shot"</code>, <code>"one_shot"</code>, <code>"oneshot"</code></p>
 
@@ -221,6 +252,62 @@
       <pre><code>{ <span class="tok-key">"error"</span>: <span class="tok-str">"prompt 99 not found"</span> }</code></pre>
     </section>
 
+    <section id="scheduler-api" class="feature-section">
+      <h2>Scheduler API</h2>
+
+      <p>The web bridge exposes the scheduler control socket as a small REST surface plus push events on the same WebSocket. Routes are prefixed with <code>/api/scheduler/</code> and gated by the same auth middleware as the daemon routes.</p>
+
+      <table>
+        <thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET</code></td><td><code>/api/scheduler/status</code></td><td>List every known workflow plus the watched <code>root</code> and a <code>connected</code> flag.</td></tr>
+          <tr><td><code>GET</code></td><td><code>/api/scheduler/workflow/{name}</code></td><td>Per-workflow detail (DAG nodes + per-phase dispatch state).</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/scheduler/workflow/{name}/queue</code></td><td>Write the <code>.clhorde-ready</code> marker.</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/scheduler/workflow/{name}/cancel</code></td><td>Remove the marker and transition state.</td></tr>
+          <tr><td><code>POST</code></td><td><code>/api/scheduler/workflow/{name}/retry</code></td><td>Re-dispatch one apply node.</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Queue body</h4>
+      <pre><code>{ <span class="tok-key">"priority"</span>: <span class="tok-val">5</span> }    <span class="tok-cmt">// optional</span></code></pre>
+
+      <h4>Retry body</h4>
+      <pre><code>{ <span class="tok-key">"section"</span>: <span class="tok-str">"3.2"</span> }   <span class="tok-cmt">// required, dotted decimal section id</span></code></pre>
+
+      <h4>Status response shape</h4>
+      <pre><code>{
+  <span class="tok-key">"connected"</span>: <span class="tok-val">true</span>,
+  <span class="tok-key">"root"</span>: <span class="tok-str">"/home/user/code/myrepo"</span>,
+  <span class="tok-key">"workflows"</span>: [
+    {
+      <span class="tok-key">"name"</span>: <span class="tok-str">"add-oauth-login"</span>,
+      <span class="tok-key">"status"</span>: <span class="tok-str">"queued"</span>,
+      <span class="tok-key">"priority"</span>: <span class="tok-val">5</span>,
+      <span class="tok-key">"failure_reason"</span>: <span class="tok-val">null</span>,
+      <span class="tok-key">"queued_at"</span>: <span class="tok-str">"2026-05-04T10:00:00Z"</span>,
+      <span class="tok-key">"started_at"</span>: <span class="tok-val">null</span>,
+      <span class="tok-key">"finished_at"</span>: <span class="tok-val">null</span>,
+      <span class="tok-key">"prompts"</span>: [],
+      <span class="tok-key">"blocked_by"</span>: [<span class="tok-str">"add-base-auth"</span>]
+    }
+  ]
+}</code></pre>
+
+      <p><code>blocked_by</code> is omitted from the wire payload when empty (back-compat with older scheduler builds). When present, the SPA renders a <code>&middot; blocked</code> badge and lists the deps in the detail card.</p>
+
+      <h4>Error mapping</h4>
+      <table>
+        <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>400</code></td><td>Mutation rejected by scheduler (e.g. queue missing change dir)</td></tr>
+          <tr><td><code>404</code></td><td>Detail requested for unknown workflow</td></tr>
+          <tr><td><code>502</code></td><td>Bridge IO error</td></tr>
+          <tr><td><code>503</code></td><td>Scheduler not reachable &mdash; start with <code>clhorde-scheduler daemon</code></td></tr>
+          <tr><td><code>504</code></td><td>Scheduler call timed out</td></tr>
+        </tbody>
+      </table>
+    </section>
+
     <section id="websocket" class="feature-section">
       <h2>WebSocket API</h2>
 
@@ -245,6 +332,29 @@
   <span class="tok-key">"prompt_id"</span>: <span class="tok-val">1</span>,
   <span class="tok-key">"data"</span>: <span class="tok-str">"G1szMW0="</span>            <span class="tok-cmt">// base64-encoded raw PTY bytes</span>
 }</code></pre>
+
+      <h4>Scheduler Events</h4>
+      <p>When the scheduler is reachable, the bridge multiplexes its event stream onto the same WebSocket. Frames carry a top-level <code>"type": "SchedulerEvent"</code> envelope so clients can route on the discriminator alone.</p>
+      <pre><code>{
+  <span class="tok-key">"type"</span>: <span class="tok-str">"SchedulerEvent"</span>,
+  <span class="tok-key">"event"</span>: {
+    <span class="tok-key">"type"</span>: <span class="tok-str">"WorkflowUpdated"</span>,
+    <span class="tok-key">"summary"</span>: {
+      <span class="tok-key">"name"</span>: <span class="tok-str">"add-oauth-login"</span>,
+      <span class="tok-key">"status"</span>: <span class="tok-str">"implementing"</span>,
+      <span class="tok-key">"priority"</span>: <span class="tok-val">5</span>,
+      <span class="tok-key">"prompts"</span>: [<span class="tok-val">47</span>, <span class="tok-val">48</span>],
+      <span class="tok-key">"blocked_by"</span>: []
+    }
+  }
+}</code></pre>
+      <p>Inner <code>event.type</code> variants:</p>
+      <ul>
+        <li><code>Snapshot</code> &mdash; initial summary of every workflow + the watched <code>root</code>. Sent on connect and as a re-baseline if the broadcast lags.</li>
+        <li><code>WorkflowUpdated</code> &mdash; one workflow's <code>WorkflowSummary</code> changed.</li>
+        <li><code>DetailSnapshot</code> &mdash; full <code>WorkflowDetail</code> for one workflow (used by per-card subscriptions).</li>
+        <li><code>DetailUpdated</code> &mdash; one workflow's detail changed (per-node state, prompt id, exit code, ...).</li>
+      </ul>
 
       <h3>Client &rarr; Server</h3>
 
