@@ -153,6 +153,10 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
             None
         }
     };
+    // Tracks whether the watcher's sender side is still alive. Hoisted out of
+    // the inner select loop so a closed channel disables the arm for the rest
+    // of the daemon's lifetime instead of spinning on `recv() -> None`.
+    let mut watcher_alive = _watcher_handle.is_some();
 
     // Spawn the control socket so `clhorde-cli flow status` (and Phase 4's
     // TUI) can talk to this scheduler instance. Failure to bind is
@@ -195,7 +199,7 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
                                 break;
                             }
                         },
-                        ev = fs_rx.recv() => match ev {
+                        ev = fs_rx.recv(), if watcher_alive => match ev {
                             Some(ev) => {
                                 tracing::debug!(?ev, "fs event");
                                 let mut g = orch.lock().expect("orch mutex");
@@ -204,7 +208,12 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
                                 }
                             }
                             None => {
-                                warn!("scheduler: fs watcher channel closed");
+                                // Sender dropped (watcher thread exited).
+                                // Flip the gate so this arm stops being
+                                // polled — otherwise select! would race here
+                                // every iteration and burn CPU logging.
+                                warn!("scheduler: fs watcher channel closed; reactive updates disabled");
+                                watcher_alive = false;
                             }
                         },
                         req = orch_rx.recv() => match req {
