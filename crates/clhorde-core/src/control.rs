@@ -117,6 +117,12 @@ pub enum ControlResponse {
         workflows: Vec<WorkflowSummary>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         root: Option<String>,
+        /// Per-source health snapshot. Empty when the scheduler has no
+        /// sources registered (e.g. older builds, or a daemon launched
+        /// with all sources disabled). Defaults to empty for back-compat
+        /// with clients that pre-date the field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        source_health: Vec<SourceHealthReport>,
     },
 
     /// Mutation succeeded. `message` is a single-line human summary that
@@ -152,6 +158,13 @@ pub enum SchedulerEvent {
         workflows: Vec<WorkflowSummary>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         root: Option<String>,
+        /// Per-source health snapshot at the moment of the snapshot.
+        /// Empty for older daemons or when no sources are registered.
+        /// Pushed alongside the workflow list so subscribed clients
+        /// (TUI, web) can render source health without a separate
+        /// `Status` round-trip.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        source_health: Vec<SourceHealthReport>,
     },
 
     /// One workflow's [`WorkflowSummary`] changed. Clients merge by
@@ -206,6 +219,21 @@ pub struct WorkflowSummary {
     /// empty for back-compat with older scheduler builds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
+    /// Snake-case source name (`"open_spec"`, `"jira"`) — matches the
+    /// persisted `SourceKind` serialisation. Defaults to `"open_spec"`
+    /// for back-compat with summaries written before the field existed.
+    #[serde(default = "default_source")]
+    pub source: String,
+    /// True when the workflow is in `Exploring` AND its explore-gate
+    /// PTY worker is still alive (or recently exited but not yet
+    /// reaped). Always false outside of `Exploring`. Defaults to false
+    /// for back-compat with summaries written before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub explore_worker_alive: bool,
+}
+
+fn default_source() -> String {
+    "open_spec".to_string()
 }
 
 /// Per-workflow detail, returned by [`ControlRequest::Detail`].
@@ -244,6 +272,28 @@ pub struct WorkflowDetail {
     /// otherwise. Defaults to empty for back-compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
+    /// Same semantics as [`WorkflowSummary::source`].
+    #[serde(default = "default_source")]
+    pub source: String,
+    /// Same semantics as [`WorkflowSummary::explore_worker_alive`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub explore_worker_alive: bool,
+}
+
+/// Per-source health, reported alongside [`ControlResponse::Status`].
+///
+/// `source` is the snake-case source name (`"open_spec"`, `"jira"`),
+/// matching the persisted `SourceKind` serialisation. Each registered
+/// source emits exactly one entry; the orchestrator updates the entry
+/// every time the source produces an event (success or error).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceHealthReport {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_run: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub is_healthy: bool,
 }
 
 /// One row in the workflow detail view. Models a single DAG node (for
@@ -351,6 +401,7 @@ mod tests {
         let resp = ControlResponse::Status {
             workflows: vec![],
             root: Some("/tmp/repo".into()),
+            source_health: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(r#""root":"/tmp/repo""#));
@@ -369,8 +420,49 @@ mod tests {
             ControlResponse::Status {
                 workflows: vec![],
                 root: None,
+                source_health: vec![],
             }
         );
+    }
+
+    #[test]
+    fn status_response_carries_source_health() {
+        let resp = ControlResponse::Status {
+            workflows: vec![],
+            root: None,
+            source_health: vec![
+                SourceHealthReport {
+                    source: "open_spec".into(),
+                    last_successful_run: None,
+                    last_error: None,
+                    is_healthy: true,
+                },
+                SourceHealthReport {
+                    source: "jira".into(),
+                    last_successful_run: None,
+                    last_error: Some("401".into()),
+                    is_healthy: false,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""source_health""#));
+        assert!(json.contains(r#""source":"jira""#));
+        let back: ControlResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn status_response_omits_source_health_when_empty() {
+        // skip_serializing_if = Vec::is_empty means a CLI/TUI built
+        // against the older protocol can still decode the response.
+        let resp = ControlResponse::Status {
+            workflows: vec![],
+            root: None,
+            source_health: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("source_health"), "got: {json}");
     }
 
     #[test]
@@ -404,6 +496,8 @@ mod tests {
             verify: None,
             archive: None,
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         };
         let resp = ControlResponse::Detail {
             detail: detail.clone(),
@@ -453,6 +547,8 @@ mod tests {
             finished_at: None,
             prompt_ids: vec![],
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: WorkflowSummary = serde_json::from_str(&json).unwrap();
@@ -469,6 +565,10 @@ mod tests {
         assert!(s.blocked_by.is_empty());
         assert!(s.prompt_ids.is_empty());
         assert!(s.queued_at.is_none());
+        // Pre-section-9 payloads default `source` to OpenSpec and
+        // `explore_worker_alive` to false.
+        assert_eq!(s.source, "open_spec");
+        assert!(!s.explore_worker_alive);
     }
 
     #[test]
@@ -499,8 +599,11 @@ mod tests {
                 finished_at: None,
                 prompt_ids: vec![],
                 blocked_by: vec![],
+                source: "open_spec".into(),
+                explore_worker_alive: false,
             }],
             root: Some("/tmp/repo".into()),
+            source_health: vec![],
         };
         let resp = ControlResponse::Event {
             event: event.clone(),
@@ -521,10 +624,16 @@ mod tests {
         let resp: ControlResponse = serde_json::from_str(json).unwrap();
         match resp {
             ControlResponse::Event {
-                event: SchedulerEvent::Snapshot { workflows, root },
+                event:
+                    SchedulerEvent::Snapshot {
+                        workflows,
+                        root,
+                        source_health,
+                    },
             } => {
                 assert!(workflows.is_empty());
                 assert!(root.is_none());
+                assert!(source_health.is_empty());
             }
             other => panic!("expected Snapshot event, got {other:?}"),
         }
@@ -542,6 +651,8 @@ mod tests {
             finished_at: None,
             prompt_ids: vec!["uuid-1".into()],
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         };
         let resp = ControlResponse::Event {
             event: SchedulerEvent::WorkflowUpdated {
@@ -611,6 +722,8 @@ mod tests {
             verify: None,
             archive: None,
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         }
     }
 
@@ -667,6 +780,8 @@ mod tests {
             finished_at: None,
             prompt_ids: vec![],
             blocked_by: vec!["a".into(), "b".into()],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(
@@ -692,6 +807,8 @@ mod tests {
             finished_at: None,
             prompt_ids: vec![],
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(

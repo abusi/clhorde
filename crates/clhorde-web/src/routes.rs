@@ -868,11 +868,16 @@ async fn scheduler_status(State(state): State<AppState>) -> impl IntoResponse {
         .request(ControlRequest::Status { name: None })
         .await
     {
-        Ok(ControlResponse::Status { workflows, root }) => (
+        Ok(ControlResponse::Status {
+            workflows,
+            root,
+            source_health,
+        }) => (
             StatusCode::OK,
             Json(json!({
                 "workflows": workflows,
                 "root": root,
+                "source_health": source_health,
                 "connected": state.scheduler.is_connected(),
             })),
         )

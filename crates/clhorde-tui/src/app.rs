@@ -12,7 +12,7 @@ use crate::key_encoding;
 use crate::keymap::{FilterAction, InsertAction, InteractAction, Keymap, NormalAction, ViewAction};
 use crate::pty_renderer::PtyRenderer;
 use clhorde_core::control::{
-    ControlRequest, SchedulerEvent, WorkflowDetail, WorkflowSummary,
+    ControlRequest, SchedulerEvent, SourceHealthReport, WorkflowDetail, WorkflowSummary,
 };
 use clhorde_core::prompt::{PromptMode, PromptStatus};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent, DaemonState, PromptInfo};
@@ -157,6 +157,11 @@ pub struct App {
     /// `Status` response. The R/E actions need it to resolve
     /// `openspec/changes/<name>/...` paths and prompt cwds.
     pub scheduler_root: Option<PathBuf>,
+    /// Per-source health snapshot from the most recent `Status`
+    /// response. Empty until the scheduler responds (or when running
+    /// against an older daemon that pre-dates the field). Surfaced in
+    /// the Workflows tab footer.
+    pub source_health: Vec<SourceHealthReport>,
     /// Pending scheduler control requests the main loop should dispatch
     /// on the next tick. Drained by `take_pending_scheduler_actions`.
     pending_scheduler_actions: Vec<ControlRequest>,
@@ -251,6 +256,7 @@ impl App {
             scheduler_reachable: false,
             scheduler_last_poll: None,
             scheduler_root: None,
+            source_health: Vec::new(),
             pending_scheduler_actions: Vec::new(),
             retry_section_input: None,
             pending_pager_path: None,
@@ -809,6 +815,8 @@ impl App {
             verify: None,
             archive: None,
             blocked_by: wf.blocked_by.clone(),
+            source: wf.source.clone(),
+            explore_worker_alive: wf.explore_worker_alive,
         };
         self.workflow_detail = Some(optimistic);
         self.detail_scroll = 0;
@@ -1175,6 +1183,13 @@ impl App {
         self.scheduler_last_poll = Some(Instant::now());
     }
 
+    /// Replace the per-source health snapshot. Called after every
+    /// `Status` response so the Workflows tab footer matches the
+    /// scheduler's view.
+    pub fn apply_source_health(&mut self, reports: Vec<SourceHealthReport>) {
+        self.source_health = reports;
+    }
+
     /// Mark the most recent scheduler poll as failed so the UI shows a
     /// hint instead of a stale list.
     pub fn note_scheduler_unreachable(&mut self) {
@@ -1194,8 +1209,13 @@ impl App {
     ///   between the two lists in one event.
     pub fn apply_scheduler_event(&mut self, event: SchedulerEvent) {
         match event {
-            SchedulerEvent::Snapshot { workflows, root } => {
+            SchedulerEvent::Snapshot {
+                workflows,
+                root,
+                source_health,
+            } => {
                 self.apply_scheduler_status(workflows, root.map(PathBuf::from));
+                self.apply_source_health(source_health);
             }
             SchedulerEvent::WorkflowUpdated { summary } => {
                 self.apply_workflow_summary_update(summary);
@@ -2843,6 +2863,7 @@ mod tests {
             scheduler_reachable: false,
             scheduler_last_poll: None,
             scheduler_root: None,
+            source_health: Vec::new(),
             pending_scheduler_actions: Vec::new(),
             retry_section_input: None,
             pending_pager_path: None,
@@ -3616,6 +3637,8 @@ mod tests {
             finished_at: None,
             prompt_ids: vec![],
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         }
     }
 
@@ -3734,6 +3757,7 @@ mod tests {
                 summary("draft-a", "drafted"),
             ],
             root: Some("/repo".into()),
+            source_health: vec![],
         });
         assert_eq!(app.drafts, vec!["draft-a", "draft-b"]);
         assert_eq!(app.workflows.len(), 1);
@@ -3776,6 +3800,7 @@ mod tests {
         app.apply_scheduler_event(SchedulerEvent::Snapshot {
             workflows: vec![summary("flow", "drafted")],
             root: None,
+            source_health: vec![],
         });
         assert_eq!(app.drafts, vec!["flow"]);
 
@@ -3796,6 +3821,7 @@ mod tests {
         app.apply_scheduler_event(SchedulerEvent::Snapshot {
             workflows: vec![summary("a", "queued"), summary("b", "queued")],
             root: None,
+            source_health: vec![],
         });
         app.workflows_selected = 1;
 
@@ -4143,6 +4169,8 @@ mod tests {
             verify: None,
             archive: None,
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         }
     }
 
@@ -4312,6 +4340,7 @@ mod tests {
         app.apply_detail_event(SchedulerEvent::Snapshot {
             workflows: vec![],
             root: None,
+            source_health: vec![],
         });
         app.apply_detail_event(SchedulerEvent::WorkflowUpdated {
             summary: WorkflowSummary {
@@ -4324,6 +4353,8 @@ mod tests {
                 finished_at: None,
                 prompt_ids: vec![],
                 blocked_by: vec![],
+                source: "open_spec".into(),
+                explore_worker_alive: false,
             },
         });
         // Detail unchanged (empty_detail's default status is

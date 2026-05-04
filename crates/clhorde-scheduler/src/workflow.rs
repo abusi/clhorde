@@ -8,17 +8,22 @@
 //!
 //! ```text
 //! Drafted ──queue──▶ Queued ──start_implementing──▶ Implementing
-//!                       │                                │
-//!                       │                                ▼
-//!                       │                            Verifying
-//!                       │                                │
-//!                       │                                ▼
-//!                       │                            Archiving
-//!                       │                                │
-//!                       │                                ▼
-//!                       │                             Archived
+//!                       ▲                              │
+//!                       │                              ▼
+//!                       │                          Verifying
+//!                       │                              │
+//!                       │                              ▼
+//!                       │                          Archiving
+//!                       │                              │
+//!                       │                              ▼
+//!                       │                           Archived
 //!                       │
-//!                       └─unqueue───▶ Drafted
+//!                       │  approval (MarkerCreated)
+//! Triggered ──start_exploring──▶ Exploring ──────────┘
+//!  (Jira)                          │
+//!                                  └─cancel_from_exploring──▶ Cancelled
+//!
+//!  Drafted ──unqueue──▶ Drafted
 //!
 //!  any_active ──cancel──▶ Cancelled
 //!  any_active ──fail───▶  Failed { reason }
@@ -44,6 +49,15 @@ pub enum WorkflowStatus {
     /// User is still iterating; no marker on disk.
     #[default]
     Drafted,
+    /// A non-OpenSpec source (e.g. Jira) has created the workflow but the
+    /// explore-gate worker hasn't been dispatched yet. Transient — the
+    /// orchestrator immediately calls `start_exploring()` after a successful
+    /// dispatch.
+    Triggered,
+    /// Explore-gate worker is alive (or has exited and is resumable). The
+    /// workflow is parked here until a human writes `.clhorde-ready` or
+    /// rejects via `clhorde-cli reject`.
+    Exploring,
     /// Marker on disk; scheduler will pick up when workers free up.
     Queued,
     /// Apply phase prompts in flight.
@@ -60,9 +74,29 @@ pub enum WorkflowStatus {
     Failed { reason: String },
 }
 
+/// Which source created a workflow. Persisted alongside the workflow so the
+/// orchestrator can route lifecycle write-back to the right place (Jira
+/// comments, label management, …) without re-deriving origin from the name.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    /// The OpenSpec watcher saw a change directory. This is the legacy
+    /// path and the default for back-compat with workflows persisted before
+    /// `source` was a field.
+    #[default]
+    OpenSpec,
+    /// The Jira poll loop ingested an issue matching a configured JQL
+    /// filter and used the issue key as the workflow name.
+    Jira,
+}
+
 impl WorkflowStatus {
     /// Returns true if the workflow is in a terminal state — no further
-    /// transitions are valid.
+    /// transitions are valid. `Exploring` is intentionally **not** terminal
+    /// even when its worker has exited: a marker write or CLI signal can
+    /// still move it forward or cancel it.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -70,7 +104,11 @@ impl WorkflowStatus {
         )
     }
 
-    /// Returns true if the scheduler is actively working on this workflow.
+    /// Returns true if the scheduler is actively working on this workflow's
+    /// implementation phases. `Exploring` is **not** "running" in this
+    /// sense — it's a human-gated parking phase, distinct from the
+    /// OpenSpec apply/verify/archive cadence the rest of the scheduler
+    /// reasons about.
     pub fn is_running(&self) -> bool {
         matches!(
             self,
@@ -129,6 +167,11 @@ pub struct Workflow {
     /// Time the workflow reached a terminal state.
     #[serde(default)]
     pub finished_at: Option<DateTime<Utc>>,
+    /// Which source created the workflow. Defaults to [`SourceKind::OpenSpec`]
+    /// for backward compatibility with workflows persisted before this
+    /// field existed.
+    #[serde(default)]
+    pub source: SourceKind,
 }
 
 impl Workflow {
@@ -144,6 +187,7 @@ impl Workflow {
             queued_at: None,
             started_at: None,
             finished_at: None,
+            source: SourceKind::OpenSpec,
         }
     }
 
@@ -160,19 +204,74 @@ impl Workflow {
             queued_at: Some(now),
             started_at: None,
             finished_at: None,
+            source: SourceKind::OpenSpec,
         }
     }
 
-    /// Move from `Drafted` to `Queued`.
+    /// Build a workflow in the transient `Triggered` state. Used by the
+    /// Jira source the moment it sees a new ticket and before it has
+    /// dispatched the explore worker. Callers should immediately call
+    /// [`Workflow::start_exploring`] once dispatch succeeds, or
+    /// [`Workflow::fail`] if dispatch fails catastrophically.
+    pub fn triggered(name: impl Into<String>, source: SourceKind) -> Self {
+        Self {
+            name: name.into(),
+            status: WorkflowStatus::Triggered,
+            metadata: MarkerMetadata::default(),
+            prompt_ids: Vec::new(),
+            created_at: Some(Utc::now()),
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            source,
+        }
+    }
+
+    /// Move from `Drafted` or `Exploring` to `Queued`.
+    ///
+    /// `Drafted → Queued` is the OpenSpec watcher's marker-created path.
+    /// `Exploring → Queued` is the explore-gate approval path: the human
+    /// has written `.clhorde-ready` (directly or via `clhorde-cli approve`)
+    /// and the orchestrator drives the same handler regardless of source.
     pub fn queue(&mut self, metadata: MarkerMetadata) -> Result<(), TransitionError> {
         match self.status {
-            WorkflowStatus::Drafted => {
+            WorkflowStatus::Drafted | WorkflowStatus::Exploring => {
                 self.status = WorkflowStatus::Queued;
                 self.metadata = metadata;
                 self.queued_at = Some(Utc::now());
                 Ok(())
             }
             _ => Err(self.bad_transition("queue")),
+        }
+    }
+
+    /// Move from `Triggered` to `Exploring`. Called by the explore-gate
+    /// dispatch helper after it has successfully spawned the interactive
+    /// worker; the workflow then parks here until a human approves
+    /// (marker write → `queue()`) or rejects (CLI signal →
+    /// [`Workflow::cancel_from_exploring`]).
+    pub fn start_exploring(&mut self) -> Result<(), TransitionError> {
+        match self.status {
+            WorkflowStatus::Triggered => {
+                self.status = WorkflowStatus::Exploring;
+                Ok(())
+            }
+            _ => Err(self.bad_transition("start_exploring")),
+        }
+    }
+
+    /// Cancel from `Exploring` specifically. The generic `cancel()` method
+    /// also accepts `Exploring`, but this dedicated entry point exists to
+    /// make explore-gate call-sites self-documenting and to give the
+    /// scheduler one place to audit Jira-side reject side-effects.
+    pub fn cancel_from_exploring(&mut self) -> Result<(), TransitionError> {
+        match self.status {
+            WorkflowStatus::Exploring => {
+                self.status = WorkflowStatus::Cancelled;
+                self.finished_at = Some(Utc::now());
+                Ok(())
+            }
+            _ => Err(self.bad_transition("cancel_from_exploring")),
         }
     }
 
@@ -412,6 +511,8 @@ mod tests {
     #[test]
     fn is_running_distinguishes_active_phases() {
         assert!(!WorkflowStatus::Drafted.is_running());
+        assert!(!WorkflowStatus::Triggered.is_running());
+        assert!(!WorkflowStatus::Exploring.is_running());
         assert!(!WorkflowStatus::Queued.is_running());
         assert!(WorkflowStatus::Implementing.is_running());
         assert!(WorkflowStatus::Verifying.is_running());
@@ -426,6 +527,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn is_terminal_excludes_triggered_and_exploring() {
+        // Explicit per scheduler-workflow spec: Exploring is a parking
+        // phase, not a terminal state. Triggered is transient.
+        assert!(!WorkflowStatus::Triggered.is_terminal());
+        assert!(!WorkflowStatus::Exploring.is_terminal());
+        assert!(WorkflowStatus::Archived.is_terminal());
+        assert!(WorkflowStatus::Cancelled.is_terminal());
+        assert!(
+            WorkflowStatus::Failed {
+                reason: "x".into()
+            }
+            .is_terminal()
+        );
+    }
+
     // ── constructors ──
 
     #[test]
@@ -435,5 +552,147 @@ mod tests {
         assert!(wf.created_at.is_some());
         assert!(wf.queued_at.is_some());
         assert_eq!(wf.metadata.priority, Some(2));
+    }
+
+    #[test]
+    fn drafted_defaults_to_openspec_source() {
+        let wf = Workflow::drafted("x");
+        assert_eq!(wf.source, SourceKind::OpenSpec);
+    }
+
+    #[test]
+    fn triggered_constructor_records_source_and_state() {
+        let wf = Workflow::triggered("PROJ-1", SourceKind::Jira);
+        assert_eq!(wf.status, WorkflowStatus::Triggered);
+        assert_eq!(wf.source, SourceKind::Jira);
+        assert!(wf.created_at.is_some());
+        assert!(wf.queued_at.is_none());
+        assert!(wf.started_at.is_none());
+        assert!(wf.finished_at.is_none());
+    }
+
+    // ── Triggered → Exploring → {Queued, Cancelled} ──
+
+    #[test]
+    fn start_exploring_promotes_triggered() {
+        let mut wf = Workflow::triggered("PROJ-1", SourceKind::Jira);
+        wf.start_exploring().unwrap();
+        assert_eq!(wf.status, WorkflowStatus::Exploring);
+    }
+
+    #[test]
+    fn cannot_start_exploring_outside_triggered() {
+        for ctor in [
+            || Workflow::drafted("x"),
+            || Workflow::queued("x", MarkerMetadata::default()),
+        ] {
+            let mut wf = ctor();
+            let err = wf.start_exploring().unwrap_err();
+            assert_eq!(err.attempted, "start_exploring");
+        }
+        // From Implementing, also rejected.
+        let mut wf = Workflow::drafted("x");
+        wf.queue(MarkerMetadata::default()).unwrap();
+        wf.start_implementing().unwrap();
+        let err = wf.start_exploring().unwrap_err();
+        assert_eq!(err.attempted, "start_exploring");
+        assert_eq!(err.from, WorkflowStatus::Implementing);
+    }
+
+    #[test]
+    fn approval_promotes_exploring_to_queued() {
+        let mut wf = Workflow::triggered("PROJ-1", SourceKind::Jira);
+        wf.start_exploring().unwrap();
+        wf.queue(meta_with_priority(3)).unwrap();
+        assert_eq!(wf.status, WorkflowStatus::Queued);
+        assert_eq!(wf.metadata.priority, Some(3));
+        assert!(wf.queued_at.is_some());
+    }
+
+    #[test]
+    fn cancel_from_exploring_terminates() {
+        let mut wf = Workflow::triggered("PROJ-1", SourceKind::Jira);
+        wf.start_exploring().unwrap();
+        wf.cancel_from_exploring().unwrap();
+        assert_eq!(wf.status, WorkflowStatus::Cancelled);
+        assert!(wf.status.is_terminal());
+        assert!(wf.finished_at.is_some());
+    }
+
+    #[test]
+    fn cancel_from_exploring_rejects_other_states() {
+        let mut wf = Workflow::drafted("x");
+        let err = wf.cancel_from_exploring().unwrap_err();
+        assert_eq!(err.attempted, "cancel_from_exploring");
+        assert_eq!(err.from, WorkflowStatus::Drafted);
+
+        let mut wf2 = Workflow::triggered("PROJ-1", SourceKind::Jira);
+        let err = wf2.cancel_from_exploring().unwrap_err();
+        assert_eq!(err.from, WorkflowStatus::Triggered);
+    }
+
+    #[test]
+    fn generic_cancel_also_works_from_exploring() {
+        // The spec lists both `cancel_from_exploring` and the general
+        // `cancel` as valid; the latter is what `RejectRequested` /
+        // `TicketLeftFilter` handlers fall through to.
+        let mut wf = Workflow::triggered("PROJ-1", SourceKind::Jira);
+        wf.start_exploring().unwrap();
+        wf.cancel().unwrap();
+        assert_eq!(wf.status, WorkflowStatus::Cancelled);
+    }
+
+    #[test]
+    fn cannot_skip_exploring_directly_to_implementing() {
+        let mut wf = Workflow::triggered("PROJ-1", SourceKind::Jira);
+        wf.start_exploring().unwrap();
+        let err = wf.start_implementing().unwrap_err();
+        assert_eq!(err.attempted, "start_implementing");
+        assert_eq!(err.from, WorkflowStatus::Exploring);
+    }
+
+    #[test]
+    fn cannot_unqueue_from_exploring() {
+        let mut wf = Workflow::triggered("PROJ-1", SourceKind::Jira);
+        wf.start_exploring().unwrap();
+        let err = wf.unqueue().unwrap_err();
+        assert_eq!(err.attempted, "unqueue");
+        assert_eq!(err.from, WorkflowStatus::Exploring);
+    }
+
+    #[test]
+    fn cannot_archive_or_verify_from_exploring() {
+        let mut wf = Workflow::triggered("PROJ-1", SourceKind::Jira);
+        wf.start_exploring().unwrap();
+        assert!(wf.start_verifying().is_err());
+        assert!(wf.start_archiving().is_err());
+        assert!(wf.archive().is_err());
+    }
+
+    #[test]
+    fn fail_works_from_triggered_and_exploring() {
+        // Catastrophic dispatch failure path → Failed.
+        let mut wf = Workflow::triggered("PROJ-1", SourceKind::Jira);
+        wf.fail("dispatch refused").unwrap();
+        assert!(matches!(wf.status, WorkflowStatus::Failed { .. }));
+
+        let mut wf2 = Workflow::triggered("PROJ-2", SourceKind::Jira);
+        wf2.start_exploring().unwrap();
+        wf2.fail("worker crashed unrecoverably").unwrap();
+        assert!(matches!(wf2.status, WorkflowStatus::Failed { .. }));
+    }
+
+    #[test]
+    fn cannot_re_enter_exploring_from_implementing() {
+        // Spec scenario: "Cannot enter Exploring from Implementing".
+        // We don't have a public transition into Exploring from
+        // Implementing; the only entry is `start_exploring()` from
+        // Triggered. Verify the latter doesn't accidentally accept
+        // Implementing.
+        let mut wf = Workflow::drafted("x");
+        wf.queue(MarkerMetadata::default()).unwrap();
+        wf.start_implementing().unwrap();
+        let err = wf.start_exploring().unwrap_err();
+        assert_eq!(err.from, WorkflowStatus::Implementing);
     }
 }

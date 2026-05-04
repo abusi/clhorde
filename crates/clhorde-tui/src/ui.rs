@@ -457,6 +457,13 @@ fn render_drafts_view(f: &mut Frame, app: &App, area: Rect) {
 /// Workflows tab: queued + running + recent terminal workflows. One
 /// line per workflow showing status and (if present) a short suffix.
 fn render_workflows_view(f: &mut Frame, app: &App, area: Rect) {
+    // When the scheduler exposes per-source health, carve a small
+    // strip at the bottom of the area so the user can see at a glance
+    // whether the Jira poll loop (or any other source) is healthy
+    // without needing to drop into the CLI. Sized to fit one line
+    // per registered source plus a header.
+    let (list_area, health_area) = split_workflows_area(area, app.source_health.len());
+
     let title = format!(
         " Workflows ({}){} ",
         app.workflows.len(),
@@ -506,7 +513,10 @@ fn render_workflows_view(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             )),
         ];
-        f.render_widget(Paragraph::new(body).block(block), area);
+        f.render_widget(Paragraph::new(body).block(block), list_area);
+        if let Some(h) = health_area {
+            render_source_health_footer(f, app, h);
+        }
         return;
     }
 
@@ -529,13 +539,129 @@ fn render_workflows_view(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▌ ");
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
+    if let Some(h) = health_area {
+        render_source_health_footer(f, app, h);
+    }
+}
+
+/// Reserve a small strip at the bottom of the Workflows tab for the
+/// per-source health summary. Returns `(list_area, Some(health_area))`
+/// when there is at least one registered source AND the area has
+/// enough vertical room to fit it; otherwise the health area is
+/// `None` and the caller draws the list across the whole rect.
+fn split_workflows_area(area: Rect, source_count: usize) -> (Rect, Option<Rect>) {
+    if source_count == 0 {
+        return (area, None);
+    }
+    // 1 line for the bordered top, 1 per source, 1 line for bottom border.
+    let needed = (source_count as u16) + 2;
+    if area.height <= needed + 5 {
+        // Not enough room — the workflow list itself needs to be at
+        // least a few lines tall to be useful.
+        return (area, None);
+    }
+    let split = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Min(5),
+            ratatui::layout::Constraint::Length(needed),
+        ])
+        .split(area);
+    (split[0], Some(split[1]))
+}
+
+/// Render a one-line-per-source health summary inside its own bordered
+/// block. Pulls `last_run`, `last_error`, and a healthy/unhealthy
+/// flag from `app.source_health`.
+fn render_source_health_footer(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Sources ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    if app.source_health.is_empty() {
+        f.render_widget(block, area);
+        return;
+    }
+
+    let lines: Vec<Line<'static>> = app
+        .source_health
+        .iter()
+        .map(|h| {
+            let (state_label, state_color) = if h.is_healthy {
+                ("ok", Color::Green)
+            } else {
+                ("unhealthy", Color::Red)
+            };
+            let last_run = match h.last_successful_run {
+                Some(t) => relative_time(t),
+                None => "never".to_string(),
+            };
+            let mut spans: Vec<Span> = vec![
+                Span::raw(" "),
+                Span::styled(
+                    format!("{:<10}", h.source),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("[{state_label}]"),
+                    Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("last_run={last_run}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+            if let Some(err) = &h.last_error {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    format!("· {err}"),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Format a UTC timestamp as a coarse relative duration ("12s ago",
+/// "3m ago"). Mirrors the scheduler's CLI helper so TUI/CLI surfaces
+/// agree on the wording.
+fn relative_time(t: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let secs = (now - t).num_seconds();
+    if secs < 0 {
+        // Clock skew between the daemon and our process — treat as "now".
+        return "just now".to_string();
+    }
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
 }
 
 fn workflow_line(w: &WorkflowSummary) -> Line<'static> {
     let (color, label) = workflow_status_style(&w.status);
+    // Lead the row with a single-glyph state symbol so a multi-source
+    // list scans visually without reading every status word. Mirrors
+    // the badge palette: magenta diamond for the human-gated explore
+    // state, yellow dot for queued, etc.
+    let (symbol, symbol_color) = workflow_state_symbol(&w.status);
     let mut spans: Vec<Span> = vec![
-        Span::raw("  "),
+        Span::raw(" "),
+        Span::styled(
+            format!("{symbol} "),
+            Style::default().fg(symbol_color).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!("{:<24}", w.name),
             Style::default().add_modifier(Modifier::BOLD),
@@ -546,6 +672,28 @@ fn workflow_line(w: &WorkflowSummary) -> Line<'static> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
     ];
+    // Source tag: dim chip after the status. Multi-source operators
+    // need to see at a glance which workflows came from Jira vs the
+    // OpenSpec watcher.
+    if !w.source.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("[{}]", w.source),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    // Live explore worker indicator. Only meaningful while the
+    // workflow is parked in Exploring; the orchestrator keeps the
+    // flag false in every other state.
+    if w.explore_worker_alive {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            "· worker live",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     // Surface the inter-workflow dep gate alongside the status badge.
     // Kept outside the padded label so the rest of the row stays aligned.
     if !w.blocked_by.is_empty() {
@@ -573,9 +721,39 @@ fn workflow_line(w: &WorkflowSummary) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Map a workflow status string to a single-glyph leading symbol +
+/// colour. Used as a quick visual hint at the start of every row in
+/// the Workflows tab so the user can scan a long list without parsing
+/// the textual label on each line.
+fn workflow_state_symbol(status: &str) -> (&'static str, Color) {
+    match status {
+        "drafted" => ("·", Color::DarkGray),
+        "triggered" => ("·", Color::DarkGray),
+        // Diamond reads as "needs your attention" without screaming
+        // failure-red — the same connotation the magenta badge gives.
+        "exploring" => ("◆", Color::LightMagenta),
+        "queued" => ("○", Color::Yellow),
+        "implementing" => ("▶", Color::Cyan),
+        "verifying" => ("▶", Color::Blue),
+        "archiving" => ("▶", Color::Magenta),
+        "archived" => ("✓", Color::Green),
+        "cancelled" => ("✗", Color::DarkGray),
+        "failed" => ("✗", Color::Red),
+        _ => ("·", Color::Gray),
+    }
+}
+
 fn workflow_status_style(status: &str) -> (Color, &'static str) {
     match status {
         "drafted" => (Color::DarkGray, "drafted"),
+        // Triggered is transient: the orchestrator promotes it to
+        // Exploring within milliseconds of creation. Render it in the
+        // same dim palette as Drafted to avoid visual flicker for a
+        // state the user almost never sees.
+        "triggered" => (Color::DarkGray, "triggered"),
+        // Exploring is human-gated; magenta for "needs your attention",
+        // distinct from the OpenSpec implementation phases.
+        "exploring" => (Color::LightMagenta, "exploring"),
         "queued" => (Color::Yellow, "queued"),
         "implementing" => (Color::Cyan, "implementing"),
         "verifying" => (Color::Blue, "verifying"),
@@ -2254,6 +2432,8 @@ mod tests {
             finished_at: None,
             prompt_ids: vec![],
             blocked_by,
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         }
     }
 
@@ -2280,6 +2460,45 @@ mod tests {
         assert!(
             !text.contains("blocked"),
             "blocked suffix should not appear for unblocked queued workflow: {text}"
+        );
+    }
+
+    #[test]
+    fn workflow_line_renders_exploring_with_distinct_symbol_and_source() {
+        let mut s = summary("PROJ-1", "exploring", vec![]);
+        s.source = "jira".into();
+        s.explore_worker_alive = true;
+        let line = workflow_line(&s);
+        let text = line_text(&line);
+        // Distinct leading symbol — the bare row should not look like
+        // a Drafted or Queued row to a quick scanner.
+        assert!(
+            text.contains("◆"),
+            "expected diamond symbol for exploring rows: {text}"
+        );
+        // Source surfaced explicitly so multi-source operators can
+        // tell at a glance where the workflow originated.
+        assert!(
+            text.contains("[jira]"),
+            "expected jira source chip in: {text}"
+        );
+        // Live worker indicator surfaces the optional "worker_alive"
+        // state from task 9.1's spec.
+        assert!(
+            text.contains("worker live"),
+            "expected worker-alive indicator when explore worker is up: {text}"
+        );
+    }
+
+    #[test]
+    fn workflow_line_omits_worker_indicator_when_no_explore_worker() {
+        let mut s = summary("native", "implementing", vec![]);
+        s.source = "open_spec".into();
+        let line = workflow_line(&s);
+        let text = line_text(&line);
+        assert!(
+            !text.contains("worker live"),
+            "worker-alive chip must only render for live explore workers: {text}"
         );
     }
 }

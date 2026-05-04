@@ -307,8 +307,11 @@ mod tests {
                 finished_at: None,
                 prompt_ids: vec![],
                 blocked_by: vec![],
+                source: "open_spec".into(),
+                explore_worker_alive: false,
             }],
             root: None,
+            source_health: vec![],
         };
         spawn_one_shot_server(path.clone(), response.clone()).await;
 
@@ -371,11 +374,14 @@ mod tests {
             finished_at: None,
             prompt_ids: vec![],
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         };
         let events = vec![
             SchedulerEvent::Snapshot {
                 workflows: vec![summary.clone()],
                 root: Some("/tmp/repo".into()),
+                source_health: vec![],
             },
             SchedulerEvent::WorkflowUpdated {
                 summary: clhorde_core::control::WorkflowSummary {
@@ -390,7 +396,7 @@ mod tests {
         let first = rx.recv().await.expect("first event");
         match first {
             SubscriptionMessage::Event(SchedulerEvent::Snapshot {
-                workflows, root,
+                workflows, root, ..
             }) => {
                 assert_eq!(workflows.len(), 1);
                 assert_eq!(workflows[0].name, "x");
@@ -461,6 +467,8 @@ mod tests {
             verify: None,
             archive: None,
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         }
     }
 

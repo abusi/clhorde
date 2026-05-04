@@ -17,8 +17,12 @@ use clhorde_scheduler::control;
 use clhorde_scheduler::daemon_client::{self, DaemonMessage};
 use clhorde_scheduler::orchestrator::Orchestrator;
 use clhorde_scheduler::persistence::WorkflowStore;
+use clhorde_scheduler::jira;
+use clhorde_scheduler::source;
 use clhorde_scheduler::watcher::{self, FsEvent};
+use clhorde_core::control::{ControlRequest, ControlResponse};
 use clhorde_core::ipc::scheduler_socket_path;
+use clhorde_core::keymap;
 use clhorde_core::protocol::ClientRequest;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -37,7 +41,19 @@ async fn main() -> ExitCode {
         }
         Command::Drafts(args) => run_one_shot(commands::drafts(args)),
         Command::Status(args) => match WorkflowStore::open_default() {
-            Ok(store) => run_one_shot(commands::status(args, &store)),
+            Ok(store) => {
+                let result = commands::status(args, &store).map(|mut out| {
+                    // Best-effort: ask the running daemon for source
+                    // health and append it. Skipped silently when the
+                    // daemon is offline (the workflow list still
+                    // renders from disk).
+                    if let Some(reports) = fetch_source_health() {
+                        out.stdout.push_str(&commands::format_source_health(&reports));
+                    }
+                    out
+                });
+                run_one_shot(result)
+            }
             Err(e) => {
                 eprintln!("error: {e}");
                 ExitCode::from(1)
@@ -132,12 +148,27 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
         store,
         orch_tx,
     )));
+    let jira_validation = validate_jira_config();
+    let enable_jira = jira_validation.is_some();
     {
         let mut g = orch.lock().expect("orchestrator mutex poisoned");
+        // Register every default source so the status surface lists
+        // them even before their first event lands. Jira is registered
+        // when the user has a valid `[sources.jira]` block in
+        // `keymap.toml`; queues that fail validation (missing fields,
+        // direct mode, etc.) are skipped with logged errors but do not
+        // disable the whole source.
+        source::register_default_sources(&mut g, enable_jira);
         if let Err(e) = g.reconcile() {
             warn!(error = %e, "initial reconcile failed; continuing");
         }
     }
+    // The validated config is dropped here in this change — the actual
+    // poll loop / writeback wiring happens in follow-up sections that
+    // build on top of section 8. Holding it briefly until the source
+    // is registered is enough to satisfy the "validate at scheduler
+    // startup" contract for this change.
+    drop(jira_validation);
 
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<FsEvent>();
     let _watcher_handle = match watcher::spawn(root.clone(), fs_tx) {
@@ -266,6 +297,69 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
 
 fn cleanup_control_socket(path: &PathBuf) {
     let _ = std::fs::remove_file(path);
+}
+
+/// Best-effort lookup of per-source health from the running scheduler.
+///
+/// Returns `Some(reports)` when the daemon is reachable AND its Status
+/// response carries source health data. Returns `None` on any failure
+/// (no daemon running, timeout, decoding mismatch) — the caller is
+/// expected to treat absence as "no extra info to render", not as an
+/// error worth surfacing. Synchronous wrapper around the async control
+/// client so the existing one-shot `Status` command stays sync.
+fn fetch_source_health() -> Option<Vec<clhorde_core::control::SourceHealthReport>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let result = rt.block_on(control::client::request(ControlRequest::Status {
+        name: None,
+    }));
+    match result {
+        Ok(ControlResponse::Status { source_health, .. }) if !source_health.is_empty() => {
+            Some(source_health)
+        }
+        _ => None,
+    }
+}
+
+/// Validate the user's `[sources.jira]` block at scheduler startup.
+///
+/// Returns `Some(JiraConfig)` when the source is configured AND every
+/// source-wide required field is present; per-queue errors (e.g.
+/// `mode = "direct"`, missing `filter_jql`) are logged but do not
+/// disable the whole source. Returns `None` when the block is absent
+/// or the source-wide validation hard-fails — in either case the daemon
+/// proceeds without registering Jira and the OpenSpec source continues
+/// to operate normally.
+fn validate_jira_config() -> Option<jira::JiraConfig> {
+    let toml_config = keymap::load_toml_config();
+    let jira_toml = toml_config.sources.and_then(|s| s.jira)?;
+    match jira::build_config_partial(&jira_toml) {
+        Ok(outcome) => {
+            if outcome.config.poll_interval_clamped {
+                warn!(
+                    floor_secs = jira::MIN_POLL_INTERVAL.as_secs(),
+                    "[sources.jira] poll_interval_secs below floor; clamped to {}s",
+                    jira::MIN_POLL_INTERVAL.as_secs(),
+                );
+            }
+            for skip in &outcome.skipped_queue_errors {
+                warn!(error = %skip, "[sources.jira] queue skipped");
+            }
+            info!(
+                queues = outcome.config.queues.len(),
+                "Jira source configured; registering",
+            );
+            Some(outcome.config)
+        }
+        Err(errs) => {
+            for e in &errs {
+                tracing::error!(error = %e, "[sources.jira] invalid config — source disabled");
+            }
+            None
+        }
+    }
 }
 
 fn resolve_root(arg: Option<PathBuf>) -> std::io::Result<PathBuf> {

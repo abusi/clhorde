@@ -97,6 +97,110 @@ systemctl --user restart clhorded  # restart after rebuild
 journalctl --user -u clhorded -f   # follow logs
 ```
 
+## Workflow lifecycle
+
+The scheduler drives each workflow through a small finite state machine. Most states map onto OpenSpec phases the user already knows (`Implementing`, `Verifying`, `Archiving`); the **`Triggered` / `Exploring`** pair was added with the Jira source so a ticket can run `/opsx:explore` interactively before a human approves the resulting proposal.
+
+```
+                       Drafted ──queue──▶ Queued ─▶ Implementing ─▶ Verifying ─▶ Archiving ─▶ Archived
+                                          ▲              │
+                                          │              │
+            ┌─────────────────────────────┘              ▼
+            │ approval (`.clhorde-ready` / `clhorde-cli approve`)
+            │                                         cancel/fail
+Triggered ──start_exploring──▶ Exploring                 │
+ (Jira)                          │                       ▼
+                                 ├─ reject / fail ─▶ Cancelled / Failed { reason }
+                                 │
+                                 └─ TicketLeftFilter ─▶ Cancelled
+```
+
+- **`Drafted`** — change directory exists but no `.clhorde-ready` marker. Default for OpenSpec-source workflows.
+- **`Triggered`** — transient. A non-OpenSpec source (today: Jira) just created the workflow but has not yet dispatched the explore worker; promoted to `Exploring` within milliseconds of creation.
+- **`Exploring`** — interactive PTY worker is running `/opsx:explore` (or has exited and is waiting to be re-spawned). The workflow is parked here until a human writes `.clhorde-ready` (`clhorde-cli approve <id>`) or rejects (`clhorde-cli reject <id>`). `Exploring` is **not** terminal and **not** "running" in the OpenSpec implementation sense — it is a distinct human-gated parking phase.
+- **`Queued` → `Implementing` → `Verifying` → `Archiving` → `Archived`** — the existing OpenSpec phases.
+- **`Cancelled` / `Failed { reason }`** — terminal escape hatches.
+
+Each workflow records a `source: SourceKind` (`OpenSpec` or `Jira`) at creation time. The CLI, TUI, and web dashboard all surface the state, source, and a per-source `SourceHealth` (`last_successful_run`, `last_error`, `is_healthy`) snapshot so multi-source operators can see at a glance whether the Jira poll loop is healthy.
+
+## Jira source
+
+The scheduler can ingest work directly from Jira via JQL polling. This is opt-in: a fresh install ignores Jira until `[sources.jira]` is added to `keymap.toml`.
+
+### Required Jira permissions
+
+The Atlassian account whose API token is configured in `auth_token_env` must have the following permissions, scoped to every project the configured JQL filters can reach:
+
+- **Browse Projects** — to read issues that match the JQL filter (`POST /rest/api/2/search`).
+- **Add Comments** — to post the `🤖 clhorde started exploring this` / archive / reject comments (`POST /rest/api/2/issue/{key}/comment`). Required when the queue's `comments = true` (default).
+- **Transition Issues** — to move a ticket between Jira statuses on workflow lifecycle events (`POST /rest/api/2/issue/{key}/transitions`). Only required when the queue's `transitions` table is non-empty (default: empty / disabled).
+- **Edit Issues** — to add and remove the trigger label (`PUT /rest/api/2/issue/{key}` with `update.labels`). Required when the queue's `labels = true` (default).
+
+A typical setup is to provision a dedicated bot account with the project-level role `Developer` (or any custom role that grants the four permissions above). Avoid using a human's personal token: the account name shows up on every comment and transition.
+
+### Auth setup
+
+Generate an Atlassian API token at <https://id.atlassian.com/manage-profile/security/api-tokens>, export it as the env var named in `auth_token_env`, and never commit the token. The scheduler reads the token at request time and never logs it (the in-memory `JiraAuth` redacts the token in `Debug` output).
+
+```bash
+export JIRA_API_TOKEN='atlassian-api-token-here'
+clhorded
+```
+
+If the token env var is unset or empty at startup, the Jira source is registered as unhealthy and other sources continue to run unchanged.
+
+### Configuration schema
+
+Add a `[sources.jira]` block to `~/.config/clhorde/keymap.toml`. A minimal config looks like:
+
+```toml
+[sources.jira]
+url = "https://your-site.atlassian.net"
+email = "bot@your-company.com"          # account tied to the API token
+auth_token_env = "JIRA_API_TOKEN"        # env var holding the token
+# Optional source-wide knobs:
+poll_interval_secs = 30                  # cadence between polls (clamped to a 15s floor)
+max_concurrent_explore = 5               # cap on simultaneously active explore workers
+idle_explore_timeout = 86400             # seconds before the reaper kills an idle explore worker
+
+[sources.jira.queues.backlog]
+filter_jql = "project = PROJ AND labels = clhorde-plan"
+mode = "openspec"                        # only "openspec" is implemented today; "direct" is reserved
+comments = true                          # post lifecycle comments on the ticket (default: true)
+labels = true                            # remove the trigger label on Exploring start (default: true)
+trigger_label = "clhorde-plan"           # label removed when the workflow leaves Exploring
+# Optional: map workflow lifecycle phases to Jira transition ids. Empty/missing
+# disables transitions entirely.
+[sources.jira.queues.backlog.transitions]
+exploring = "31"
+archived = "61"
+cancelled = "71"
+```
+
+Source-wide fields:
+
+| Field | Required | Default | Notes |
+|-------|----------|---------|-------|
+| `url` | yes | — | Atlassian site base URL. |
+| `email` | yes | — | Account email used as the HTTP Basic username half. |
+| `auth_token_env` | yes | — | Env var the token is read from. |
+| `poll_interval_secs` | no | 30 | Clamped at runtime to a 15-second floor (a warning is logged if you go lower). |
+| `max_concurrent_explore` | no | 5 | Per-source cap on parked explore workers; excess tickets queue inside the source. |
+| `idle_explore_timeout` | no | 86400 | Seconds before the explore-worker reaper kills a parked worker. |
+
+Per-queue fields (`[sources.jira.queues.<name>]`):
+
+| Field | Required | Default | Notes |
+|-------|----------|---------|-------|
+| `filter_jql` | yes | — | Raw JQL passed verbatim to Jira's `/search` endpoint. |
+| `mode` | no | `"openspec"` | Only `"openspec"` is implemented today. `"direct"` is reserved for a follow-up change; queues using it are skipped at startup with a clear error. |
+| `comments` | no | `true` | Post `🤖 clhorde …` comments on lifecycle events. |
+| `labels` | no | `true` | Remove the trigger label when the workflow leaves the explore gate. |
+| `trigger_label` | no | `"clhorde-plan"` | Label removed by the labels-write-back step. |
+| `transitions` | no | `{}` | Map from lifecycle phase (`"exploring"`, `"archived"`, `"cancelled"`) to Jira transition id. Empty disables transitions entirely. |
+
+Validation runs at scheduler startup. Source-wide errors (missing `url`/`email`/`auth_token_env`, `max_concurrent_explore = 0`) disable the whole source. Per-queue errors (missing `filter_jql`, `mode = "direct"`, unrecognised mode, etc.) skip just that queue with a logged warning; other queues in the same source keep running.
+
 ## Documentation
 
 Full documentation is available at **[abusi.github.io/clhorde](https://abusi.github.io/clhorde/)**:

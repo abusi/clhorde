@@ -518,6 +518,8 @@ mod tests {
             finished_at: None,
             prompt_ids: vec![],
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         }
     }
 
@@ -541,6 +543,7 @@ mod tests {
             SchedulerEvent::Snapshot {
                 workflows: vec![sample_summary("x", "queued")],
                 root: Some("/repo".into()),
+                source_health: vec![],
             },
             SchedulerEvent::WorkflowUpdated {
                 summary: sample_summary("x", "implementing"),
@@ -722,6 +725,8 @@ mod tests {
             verify: None,
             archive: None,
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         };
 
         spawn_mock_dual_subscribe(
@@ -771,6 +776,8 @@ mod tests {
             verify: None,
             archive: None,
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         };
 
         spawn_mock_dual_subscribe(

@@ -32,3 +32,6 @@ include_dir = "0.7"
 notify = "8"
 notify-debouncer-full = "0.7"
 tera = { version = "1", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+wiremock = "0.6"
+url = "2"

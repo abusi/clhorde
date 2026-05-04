@@ -28,6 +28,68 @@ pub struct TomlConfig {
     pub filter: Option<TomlFilterBindings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quick_prompts: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sources: Option<TomlSources>,
+}
+
+/// `[sources]` block: per-source configuration. Each source is opt-in;
+/// omitting a sub-table leaves that source unregistered. Section 8 of
+/// the `add-jira-source` change introduces the Jira sub-table here.
+#[derive(Deserialize, Serialize, Default)]
+pub struct TomlSources {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jira: Option<TomlSourcesJira>,
+}
+
+/// `[sources.jira]` block: Jira source-wide settings. Per-queue settings
+/// live under [`TomlSourcesJiraQueue`] in the `queues` map.
+#[derive(Deserialize, Serialize, Default)]
+pub struct TomlSourcesJira {
+    /// Atlassian site base URL, e.g. `"https://your-site.atlassian.net"`.
+    pub url: Option<String>,
+    /// Email tied to the API token; used as the username half of HTTP
+    /// Basic auth.
+    pub email: Option<String>,
+    /// Name of the env var holding the Atlassian API token. Read at
+    /// startup; never persisted.
+    pub auth_token_env: Option<String>,
+    /// Cadence between polls, in seconds. Defaults to 30; clamped to a
+    /// 15-second floor at runtime.
+    pub poll_interval_secs: Option<u64>,
+    /// Max simultaneously-active explore workers attributable to this
+    /// source. Defaults to 5.
+    pub max_concurrent_explore: Option<usize>,
+    /// Idle threshold (in seconds) before the explore-worker reaper
+    /// kills a parked worker. Defaults to 86400 (24h).
+    pub idle_explore_timeout: Option<u64>,
+    /// Map from queue name → per-queue config.
+    #[serde(default)]
+    pub queues: HashMap<String, TomlSourcesJiraQueue>,
+}
+
+/// `[sources.jira.queues.<name>]` block: one named JQL queue.
+#[derive(Deserialize, Serialize, Default)]
+pub struct TomlSourcesJiraQueue {
+    /// Raw JQL forwarded to Jira's `/search` endpoint.
+    pub filter_jql: Option<String>,
+    /// Queue mode: `"openspec"` (default) routes through the explore
+    /// gate. `"direct"` is reserved for a follow-up change and is
+    /// rejected at scheduler startup.
+    pub mode: Option<String>,
+    /// Whether to post comments on lifecycle events. Default on.
+    pub comments: Option<bool>,
+    /// Whether to remove the trigger label on `Exploring` start.
+    /// Default on.
+    pub labels: Option<bool>,
+    /// Trigger label removed from the ticket when the workflow leaves
+    /// the explore gate. Defaults to `"clhorde-plan"`.
+    pub trigger_label: Option<String>,
+    /// Optional per-phase Jira transition ids. Keys are lifecycle
+    /// phase names (`"exploring"`, `"archived"`, `"cancelled"`); values
+    /// are Jira transition ids. An empty/missing table disables
+    /// transitions entirely.
+    #[serde(default)]
+    pub transitions: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -652,6 +714,7 @@ impl Keymap {
                 cancel: Some(keys_to_strings(&km.filter, FilterAction::Cancel)),
             }),
             quick_prompts: None,
+            sources: None,
         }
     }
 
@@ -941,6 +1004,100 @@ c = "continue"
             km.quick_prompts.get(&KeyCode::Char('g')),
             Some(&"let's go".to_string())
         );
+    }
+
+    #[test]
+    fn from_toml_sources_jira_full_block_round_trips() {
+        // Parse a complete `[sources.jira]` block, serialize it back,
+        // and re-parse — the TOML schema must accept everything it
+        // produces. Validation logic for the contained values lives
+        // in `clhorde_scheduler::jira::config`; this test only
+        // exercises the parse layer.
+        let toml_str = r#"
+[sources.jira]
+url = "https://example.atlassian.net"
+email = "bot@example.com"
+auth_token_env = "JIRA_TOKEN"
+poll_interval_secs = 60
+max_concurrent_explore = 3
+idle_explore_timeout = 7200
+
+[sources.jira.queues.backlog]
+filter_jql = "project = PROJ"
+mode = "openspec"
+comments = true
+labels = true
+trigger_label = "clhorde-plan"
+
+[sources.jira.queues.backlog.transitions]
+exploring = "31"
+archived = "61"
+"#;
+        let parsed: TomlConfig = toml::from_str(toml_str).expect("parses");
+        let jira = parsed
+            .sources
+            .as_ref()
+            .and_then(|s| s.jira.as_ref())
+            .expect("jira block present");
+        assert_eq!(jira.url.as_deref(), Some("https://example.atlassian.net"));
+        assert_eq!(jira.email.as_deref(), Some("bot@example.com"));
+        assert_eq!(jira.auth_token_env.as_deref(), Some("JIRA_TOKEN"));
+        assert_eq!(jira.poll_interval_secs, Some(60));
+        assert_eq!(jira.max_concurrent_explore, Some(3));
+        assert_eq!(jira.idle_explore_timeout, Some(7200));
+        let q = jira.queues.get("backlog").expect("queue present");
+        assert_eq!(q.filter_jql.as_deref(), Some("project = PROJ"));
+        assert_eq!(q.mode.as_deref(), Some("openspec"));
+        assert_eq!(q.comments, Some(true));
+        assert_eq!(q.labels, Some(true));
+        assert_eq!(q.trigger_label.as_deref(), Some("clhorde-plan"));
+        assert_eq!(q.transitions.get("exploring"), Some(&"31".to_string()));
+        assert_eq!(q.transitions.get("archived"), Some(&"61".to_string()));
+
+        // Serialise the parsed shape back out and re-parse to confirm
+        // the schema is symmetric (no fields lost in the round trip).
+        let serialised = toml::to_string(&parsed).expect("serialises");
+        let reparsed: TomlConfig = toml::from_str(&serialised).expect("re-parses");
+        let rj = reparsed.sources.unwrap().jira.unwrap();
+        assert_eq!(rj.url, jira.url);
+        assert_eq!(rj.email, jira.email);
+        assert_eq!(rj.poll_interval_secs, jira.poll_interval_secs);
+        assert_eq!(rj.queues.len(), jira.queues.len());
+    }
+
+    #[test]
+    fn from_toml_sources_jira_omitted_block_is_none() {
+        // Without a [sources.jira] block, `sources` parses to None
+        // (or `sources.jira` to None). Either way the daemon should
+        // not attempt to register the source.
+        let toml_str = r#"
+[normal]
+quit = ["q"]
+"#;
+        let parsed: TomlConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            parsed.sources.is_none()
+                || parsed.sources.as_ref().unwrap().jira.is_none()
+        );
+    }
+
+    #[test]
+    fn from_toml_sources_jira_only_required_fields_parses() {
+        // Optional fields default to `None`/`{}` and are left for the
+        // scheduler-side validation layer to fill in.
+        let toml_str = r#"
+[sources.jira]
+url = "https://x.atlassian.net"
+email = "a@b.c"
+auth_token_env = "TOK"
+"#;
+        let parsed: TomlConfig = toml::from_str(toml_str).expect("parses");
+        let jira = parsed.sources.unwrap().jira.unwrap();
+        assert_eq!(jira.url.as_deref(), Some("https://x.atlassian.net"));
+        assert!(jira.poll_interval_secs.is_none());
+        assert!(jira.max_concurrent_explore.is_none());
+        assert!(jira.idle_explore_timeout.is_none());
+        assert!(jira.queues.is_empty());
     }
 
     #[test]

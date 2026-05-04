@@ -22,22 +22,30 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use clhorde_core::protocol::{ClientRequest, DaemonEvent, PromptInfo};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::control::{DetailNode, SchedulerEvent, WorkflowDetail, WorkflowSummary};
 use crate::deps::{self, DepEvaluation};
 use crate::dispatch::{is_node_done, next_runnable_nodes};
+use std::sync::Arc;
+
+use crate::explore::{self, ExploreWorker};
+use crate::jira::writeback::JiraWriteback;
+use crate::jira::{JiraEvent, JiraTicketPayload};
 use crate::openspec::affected_changes::{self, ChangesSnapshot};
 use crate::openspec::annotations::{annotate, AnnotatedSection};
 use crate::openspec::dag::{self, Dag};
 use crate::openspec::discovery::{self, ChangeStatus, MarkerMetadata};
 use crate::openspec::tasks_parser;
 use crate::persistence::{StoreError, WorkflowStore};
+use crate::source::{self, SourceEvent, SourceHealth, SourceHealthReport};
 use crate::templates::{self, TemplateEngine};
 use crate::watcher::FsEvent;
-use crate::workflow::{Workflow, WorkflowStatus};
+use crate::workflow::{SourceKind, Workflow, WorkflowStatus};
 
 /// Tag prefix shared by every scheduler-submitted prompt. The full tag is
 /// e.g. `clhorde-scheduler/wf=add-oauth/phase=apply/node=1.2`.
@@ -68,6 +76,10 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// The `NotFound` / `BadRequest` / `Io` / `Render` variants only show up on
 /// the control-socket entry points (`cancel_workflow`, `retry_section`); the
 /// existing FS/event handlers continue to surface only `Store`.
+///
+/// `WorkflowNameConflict` is raised by [`Orchestrator::create_workflow`]
+/// when a source tries to register a workflow with a name another source
+/// already owns. First-write wins; the rejected source can log and skip.
 #[derive(Debug)]
 pub enum OrchestratorError {
     Store(StoreError),
@@ -75,6 +87,11 @@ pub enum OrchestratorError {
     BadRequest(String),
     Io(std::io::Error),
     Render(String),
+    WorkflowNameConflict {
+        name: String,
+        existing_source: SourceKind,
+        attempted_source: SourceKind,
+    },
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -85,6 +102,16 @@ impl std::fmt::Display for OrchestratorError {
             OrchestratorError::BadRequest(s) => f.write_str(s),
             OrchestratorError::Io(e) => write!(f, "io: {e}"),
             OrchestratorError::Render(s) => write!(f, "render: {s}"),
+            OrchestratorError::WorkflowNameConflict {
+                name,
+                existing_source,
+                attempted_source,
+            } => write!(
+                f,
+                "workflow name {name:?} already owned by {} source; refused {} source",
+                source::source_kind_name(*existing_source),
+                source::source_kind_name(*attempted_source),
+            ),
         }
     }
 }
@@ -109,6 +136,22 @@ impl From<std::io::Error> for OrchestratorError {
     fn from(e: std::io::Error) -> Self {
         OrchestratorError::Io(e)
     }
+}
+
+/// Result of [`Orchestrator::reject_workflow`]. The orchestrator does
+/// the local cleanup; the caller (the daemon binary) uses `source` to
+/// decide whether to fire a write-back (e.g. comment-and-label-remove
+/// for `SourceKind::Jira`). `was_active` is true when the workflow was
+/// in `Triggered` / `Exploring` at the time of the reject — the
+/// expected case. False values surface for non-explore states (e.g.
+/// rejecting a `Drafted` or `Implementing` workflow), so the caller
+/// can decide whether to log a "not really an explore reject" line
+/// before continuing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectOutcome {
+    pub source: SourceKind,
+    pub transitioned: bool,
+    pub was_active: bool,
 }
 
 /// Captured state used by [`Orchestrator::emit_diff`] to detect
@@ -163,6 +206,25 @@ pub struct Orchestrator {
     workflows: BTreeMap<String, Workflow>,
     parsed_tasks: BTreeMap<String, Vec<AnnotatedSection>>,
     runtimes: BTreeMap<String, WorkflowRuntime>,
+    /// Live explore workers, keyed by workflow name. Populated when the
+    /// explore-gate dispatch fires (Triggered → Exploring) and removed
+    /// when the worker is killed (approve / reject / reaper) or its
+    /// daemon-side `WorkerFinished` lands. Tracks the daemon-assigned
+    /// prompt id so the orchestrator can `KillWorker` on demand, plus
+    /// `last_input_at` for the idle reaper. Section 5 of `add-jira-source`.
+    explore_workers: BTreeMap<String, ExploreWorker>,
+    /// Cached Jira ticket payloads keyed by workflow name. Used to
+    /// re-render the `/opsx:explore` prompt when a CLI-triggered
+    /// re-dispatch lands (`clhorde-cli explore`, section 7), and to
+    /// preserve the original ticket body across daemon-side worker
+    /// failures.
+    jira_payloads: BTreeMap<String, JiraTicketPayload>,
+    /// Per-source health snapshot. Updated every time the orchestrator
+    /// processes a [`SourceEvent`] (or a source explicitly reports an
+    /// error via [`Orchestrator::record_source_error`]). Surfaced on
+    /// the control socket inside [`crate::control::ControlResponse::Status`]
+    /// so CLI/TUI/web can render it next to the workflow list.
+    source_health: BTreeMap<SourceKind, SourceHealth>,
     templates: TemplateEngine,
     outbound: mpsc::UnboundedSender<ClientRequest>,
     /// Effective working directory per prompt id, learned from
@@ -184,6 +246,14 @@ pub struct Orchestrator {
     /// filters by name on `SubscribeDetail` connections. `send` is a
     /// no-op when nobody's listening.
     detail_events: broadcast::Sender<SchedulerEvent>,
+    /// Optional Jira write-back driver. When wired, the orchestrator
+    /// fires comments / label removal / optional transitions on
+    /// lifecycle events for `SourceKind::Jira` workflows. Section 6 of
+    /// `add-jira-source`. The driver is fire-and-forget — failed Jira
+    /// calls are logged and surfaced via `last_jira_error` but do not
+    /// block the orchestrator (per spec `scheduler-source` Requirement
+    /// 5 / `jira-source` Requirement 5).
+    jira_writeback: Option<Arc<JiraWriteback>>,
 }
 
 impl Orchestrator {
@@ -202,13 +272,31 @@ impl Orchestrator {
             workflows: BTreeMap::new(),
             parsed_tasks: BTreeMap::new(),
             runtimes: BTreeMap::new(),
+            explore_workers: BTreeMap::new(),
+            jira_payloads: BTreeMap::new(),
+            source_health: BTreeMap::new(),
             templates,
             outbound,
             prompt_cwds: HashMap::new(),
             prompt_baselines: HashMap::new(),
             events,
             detail_events,
+            jira_writeback: None,
         }
+    }
+
+    /// Wire a Jira write-back driver. The orchestrator calls
+    /// `notify_*` methods on the driver at lifecycle boundaries for
+    /// workflows whose `source` is [`SourceKind::Jira`]. Calling this
+    /// twice replaces the previous driver; passing `None`-equivalent
+    /// (i.e. not calling it) leaves write-back inert, which is the
+    /// default and the behaviour every existing test relies on.
+    ///
+    /// Production wiring lives in the daemon binary: section 8's
+    /// config layer builds the [`JiraWriteback`] from the parsed
+    /// `[sources.jira]` block and hands it in once at startup.
+    pub fn set_jira_writeback(&mut self, writeback: Arc<JiraWriteback>) {
+        self.jira_writeback = Some(writeback);
     }
 
     /// Subscribe to push-based summary-level [`SchedulerEvent`]s
@@ -246,7 +334,10 @@ impl Orchestrator {
         let summaries = self
             .workflows
             .iter()
-            .map(|(name, wf)| (name.clone(), workflow_summary(wf, &self.workflows)))
+            .map(|(name, wf)| {
+                let alive = self.explore_workers.contains_key(name);
+                (name.clone(), workflow_summary(wf, &self.workflows, alive))
+            })
             .collect();
         let details = self
             .workflows
@@ -273,7 +364,8 @@ impl Orchestrator {
     /// `implementing`, `prompt_ids` unchanged).
     fn emit_diff(&self, before: &StateSnapshot) {
         for wf in self.workflows.values() {
-            let summary = workflow_summary(wf, &self.workflows);
+            let alive = self.explore_workers.contains_key(&wf.name);
+            let summary = workflow_summary(wf, &self.workflows, alive);
             if before.summaries.get(&wf.name) != Some(&summary) {
                 let _ = self
                     .events
@@ -346,16 +438,20 @@ impl Orchestrator {
     pub fn summaries(&self) -> Vec<WorkflowSummary> {
         self.workflows
             .values()
-            .map(|wf| workflow_summary(wf, &self.workflows))
+            .map(|wf| {
+                let alive = self.explore_workers.contains_key(&wf.name);
+                workflow_summary(wf, &self.workflows, alive)
+            })
             .collect()
     }
 
     /// Snapshot one workflow as a [`WorkflowSummary`], or `None` if it
     /// does not exist.
     pub fn summary(&self, name: &str) -> Option<WorkflowSummary> {
-        self.workflows
-            .get(name)
-            .map(|wf| workflow_summary(wf, &self.workflows))
+        self.workflows.get(name).map(|wf| {
+            let alive = self.explore_workers.contains_key(&wf.name);
+            workflow_summary(wf, &self.workflows, alive)
+        })
     }
 
     /// Assemble a [`WorkflowDetail`] for `name`, or `None` if no
@@ -367,7 +463,8 @@ impl Orchestrator {
     /// described on `WorkflowDetail::apply`.
     pub fn detail(&self, name: &str) -> Option<WorkflowDetail> {
         let wf = self.workflows.get(name)?;
-        let summary = workflow_summary(wf, &self.workflows);
+        let alive = self.explore_workers.contains_key(name);
+        let summary = workflow_summary(wf, &self.workflows, alive);
         let runtime = self.runtimes.get(name);
         let apply = runtime
             .and_then(|r| r.dag.as_ref().map(|d| (r, d)))
@@ -397,6 +494,8 @@ impl Orchestrator {
             verify,
             archive,
             blocked_by: summary.blocked_by,
+            source: summary.source,
+            explore_worker_alive: summary.explore_worker_alive,
         })
     }
 
@@ -464,6 +563,112 @@ impl Orchestrator {
             self.cascade_dependents(name);
         }
         Ok(kind)
+    }
+
+    /// Reject an `Exploring` (or `Triggered`) workflow per
+    /// explore-gate Requirement 4. Kills the live explore worker if
+    /// any, removes the `openspec/changes/<name>/` directory if it
+    /// exists, transitions the workflow to `Cancelled`, and returns a
+    /// [`RejectOutcome`] so the caller can fire the source-side
+    /// write-back (Jira comment, label removal — section 6).
+    ///
+    /// Per spec, every side-effect is best-effort: an IO failure on
+    /// the directory removal is logged but does not block the local
+    /// cancellation. The kill request is also fire-and-forget — if the
+    /// outbound channel is closed the worker may outlive the workflow
+    /// briefly, but the budget entry is dropped immediately so the
+    /// per-source cap stays accurate.
+    ///
+    /// Errors:
+    /// - `NotFound` — no workflow with that name.
+    /// - `BadRequest` — workflow is in a terminal state and cannot be
+    ///   rejected.
+    pub fn reject_workflow(
+        &mut self,
+        name: &str,
+    ) -> Result<RejectOutcome, OrchestratorError> {
+        let before = self.snapshot_state();
+        let result = self.reject_workflow_inner(name);
+        self.emit_diff(&before);
+        result
+    }
+
+    fn reject_workflow_inner(
+        &mut self,
+        name: &str,
+    ) -> Result<RejectOutcome, OrchestratorError> {
+        let (source, was_active) = match self.workflows.get(name) {
+            Some(wf) => {
+                if wf.status.is_terminal() {
+                    return Err(OrchestratorError::BadRequest(format!(
+                        "{name}: cannot reject a terminal workflow ({:?})",
+                        wf.status
+                    )));
+                }
+                let active = matches!(
+                    wf.status,
+                    WorkflowStatus::Triggered | WorkflowStatus::Exploring
+                );
+                (wf.source, active)
+            }
+            None => return Err(OrchestratorError::NotFound(name.to_string())),
+        };
+
+        // 1. Kill the explore worker if alive. Fire-and-forget.
+        self.kill_explore_worker(name);
+
+        // 2. Remove the change directory. Best-effort — log on failure
+        //    so the user can see why their disk wasn't cleaned up, but
+        //    keep going so the workflow still cancels locally.
+        let change_dir = self
+            .root
+            .join("openspec")
+            .join("changes")
+            .join(name);
+        if change_dir.exists() {
+            if let Err(e) = fs::remove_dir_all(&change_dir) {
+                tracing::warn!(
+                    name,
+                    path = %change_dir.display(),
+                    error = %e,
+                    "could not remove change directory during reject"
+                );
+            }
+        }
+
+        // 3. Transition to Cancelled. cancel() handles every
+        //    non-terminal state, including Triggered / Exploring /
+        //    Drafted / Queued / Implementing / Verifying / Archiving.
+        let transitioned = if let Some(mut wf) = self.workflows.remove(name) {
+            let ok = wf.cancel().is_ok();
+            if ok {
+                if let Err(e) = self.store.save(&wf) {
+                    tracing::warn!(name, error = %e, "persisting after reject failed");
+                }
+            }
+            self.workflows.insert(name.to_string(), wf);
+            ok
+        } else {
+            false
+        };
+
+        // Drop the cached payload — the workflow is dead, no need for
+        // the explore prompt body anymore.
+        self.jira_payloads.remove(name);
+
+        // Jira write-back is best-effort and runs in a spawned task,
+        // so a Jira outage cannot delay the local cancellation above
+        // (per spec `explore-gate` Requirement 4 / Scenario "Reject
+        // succeeds even if Jira write-back fails").
+        if transitioned && source == SourceKind::Jira {
+            self.notify_jira_cancelled(name);
+        }
+
+        Ok(RejectOutcome {
+            source,
+            transitioned,
+            was_active,
+        })
     }
 
     /// Queue a draft change by writing
@@ -633,15 +838,61 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Process one [`FsEvent`].
+    /// Process one [`FsEvent`]. Delegates to
+    /// [`Orchestrator::handle_source_event`] so OpenSpec and Jira share
+    /// one dispatch path. Kept as a stable entry point because the
+    /// daemon binary, the control server, and most existing tests still
+    /// drive the orchestrator with raw `FsEvent`s.
     pub fn handle_event(&mut self, event: FsEvent) -> Result<(), OrchestratorError> {
+        self.handle_source_event(SourceEvent::Fs(event))
+    }
+
+    /// Single dispatch entry point for every workflow source. Both the
+    /// OpenSpec watcher and the Jira poll loop wrap their concrete
+    /// events in [`SourceEvent`] before forwarding here. The
+    /// orchestrator branches on the variant exactly once and runs the
+    /// same per-workflow advance afterwards.
+    ///
+    /// On a successful dispatch the source's [`SourceHealth`] entry is
+    /// stamped with `Utc::now()`. On error, the entry's `last_error` is
+    /// set so the CLI/TUI/web status surface can render the source as
+    /// unhealthy.
+    pub fn handle_source_event(
+        &mut self,
+        event: SourceEvent,
+    ) -> Result<(), OrchestratorError> {
         let before = self.snapshot_state();
-        let result = self.handle_event_inner(event);
+        let origin = event.origin();
+        let result = self.handle_source_event_inner(event);
+        match &result {
+            Ok(()) => {
+                self.source_health
+                    .entry(origin)
+                    .or_insert_with(SourceHealth::unstarted)
+                    .note_success(Utc::now());
+            }
+            Err(e) => {
+                self.source_health
+                    .entry(origin)
+                    .or_insert_with(SourceHealth::unstarted)
+                    .note_error(e.to_string());
+            }
+        }
         self.emit_diff(&before);
         result
     }
 
-    fn handle_event_inner(
+    fn handle_source_event_inner(
+        &mut self,
+        event: SourceEvent,
+    ) -> Result<(), OrchestratorError> {
+        match event {
+            SourceEvent::Fs(fs) => self.handle_fs_event_inner(fs),
+            SourceEvent::Jira(jira) => self.handle_jira_event_inner(jira),
+        }
+    }
+
+    fn handle_fs_event_inner(
         &mut self,
         event: FsEvent,
     ) -> Result<(), OrchestratorError> {
@@ -658,6 +909,307 @@ impl Orchestrator {
             }
         }
         self.try_advance_inner(&name)
+    }
+
+    /// Handler for [`JiraEvent`]. `TicketAppeared` creates a
+    /// `Triggered` workflow (idempotent: same-source re-creation is a
+    /// no-op via [`Self::create_workflow`]) and dispatches the
+    /// explore-gate worker. `TicketLeftFilter` cancels the workflow if
+    /// it is still in `Triggered` / `Exploring` and kills any live
+    /// explore worker so the budget is freed.
+    fn handle_jira_event_inner(
+        &mut self,
+        event: JiraEvent,
+    ) -> Result<(), OrchestratorError> {
+        match event {
+            JiraEvent::TicketAppeared { key, payload } => {
+                // Polling re-emits TicketAppeared every tick. Only the
+                // first emission for a given key should dispatch an
+                // explore worker; subsequent ones are no-ops on top of
+                // the existing `Triggered` / `Exploring` workflow.
+                let was_fresh = !self.workflows.contains_key(&key);
+                let wf = Workflow::triggered(&key, SourceKind::Jira);
+                match self.create_workflow(wf) {
+                    Ok(()) if was_fresh => {
+                        // Fresh workflow: cache the payload and dispatch
+                        // the explore worker. A dispatch failure
+                        // catastrophically transitions to Failed per
+                        // explore-gate Requirement 1 / Scenario 3.
+                        self.jira_payloads.insert(key.clone(), payload.clone());
+                        self.dispatch_explore(&key, &payload);
+                    }
+                    Ok(()) => {
+                        // Same-source idempotent re-emission: leave the
+                        // existing workflow alone. Refresh the cached
+                        // payload in case the ticket body changed
+                        // upstream — re-dispatch via `clhorde-cli
+                        // explore` (section 7) will use the latest.
+                        self.jira_payloads.insert(key.clone(), payload);
+                    }
+                    Err(OrchestratorError::WorkflowNameConflict { .. }) => {
+                        // Cross-source conflict: the OpenSpec source
+                        // already owns this name. Skip silently — the
+                        // existing OpenSpec workflow is unaffected.
+                    }
+                    Err(e) => return Err(e),
+                }
+                self.try_advance_inner(&key)
+            }
+            JiraEvent::TicketLeftFilter { key } => {
+                let mut cancelled = false;
+                if let Some(mut wf) = self.workflows.remove(&key) {
+                    let changed = matches!(
+                        wf.status,
+                        WorkflowStatus::Triggered | WorkflowStatus::Exploring,
+                    ) && wf.cancel().is_ok();
+                    if changed {
+                        self.store.save(&wf)?;
+                        cancelled = wf.source == SourceKind::Jira;
+                    }
+                    self.workflows.insert(key.clone(), wf);
+                }
+                if cancelled {
+                    // Comment + label removal so the next poll cycle
+                    // doesn't immediately re-trigger the same workflow.
+                    self.notify_jira_cancelled(&key);
+                }
+                // Free the explore worker budget if one was alive — the
+                // workflow is no longer interested in human input.
+                self.kill_explore_worker(&key);
+                self.try_advance_inner(&key)
+            }
+        }
+    }
+
+    /// Dispatch the explore-gate worker for `name`. On success the
+    /// workflow transitions `Triggered → Exploring`; on a dispatch
+    /// channel failure it transitions to `Failed { reason }` per
+    /// explore-gate Requirement 1 / Scenario 3.
+    ///
+    /// Called from [`Self::handle_jira_event_inner`] on `TicketAppeared`
+    /// and from the CLI `explore` subcommand (section 7) for re-dispatch
+    /// against a workflow already in `Exploring`. Idempotent on the
+    /// outbound channel — the orchestrator's `prompt_ids` correlation
+    /// only completes once `PromptAdded` echoes the tag back.
+    fn dispatch_explore(&mut self, name: &str, payload: &JiraTicketPayload) {
+        let cwd = Some(self.root.to_string_lossy().into_owned());
+        match explore::dispatch(name, cwd, payload, &self.outbound) {
+            Ok(()) => {
+                self.explore_workers
+                    .insert(name.to_string(), ExploreWorker::new(name, Utc::now()));
+                let mut entered_exploring = false;
+                let mut source = SourceKind::OpenSpec;
+                if let Some(wf) = self.workflows.get_mut(name) {
+                    source = wf.source;
+                    if matches!(wf.status, WorkflowStatus::Triggered) {
+                        match wf.start_exploring() {
+                            Ok(()) => entered_exploring = true,
+                            Err(e) => tracing::warn!(
+                                name,
+                                error = %e,
+                                "could not transition Triggered → Exploring after dispatch"
+                            ),
+                        }
+                    }
+                    if let Err(e) = self.store.save(wf) {
+                        tracing::warn!(name, error = %e, "persisting after start_exploring");
+                    }
+                }
+                if entered_exploring && source == SourceKind::Jira {
+                    self.notify_jira_exploring(name);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    name,
+                    error = %e,
+                    "explore-gate dispatch failed; transitioning to Failed"
+                );
+                if let Some(wf) = self.workflows.get_mut(name) {
+                    let _ = wf.fail(format!("explore dispatch: {e}"));
+                    if let Err(e) = self.store.save(wf) {
+                        tracing::warn!(name, error = %e, "persisting after dispatch failure");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send a `KillWorker` for the explore worker bound to `name`, if
+    /// any. No-op when the worker hasn't yet been echoed by the daemon
+    /// (no prompt_id) or no entry exists. Always clears the in-memory
+    /// entry so the per-source budget reflects reality even when the
+    /// kill itself is a no-op.
+    fn kill_explore_worker(&mut self, name: &str) {
+        let Some(worker) = self.explore_workers.remove(name) else {
+            return;
+        };
+        let Some(prompt_id) = worker.prompt_id else {
+            return;
+        };
+        if let Err(e) = self
+            .outbound
+            .send(ClientRequest::KillWorker { prompt_id })
+        {
+            tracing::warn!(
+                name,
+                prompt_id,
+                error = %e,
+                "outbound channel closed; explore worker kill request dropped"
+            );
+        }
+    }
+
+    /// Create a fresh workflow if no entry exists for its name, or
+    /// no-op if the existing entry was created by the same source. If
+    /// a different source already owns the name, return
+    /// [`OrchestratorError::WorkflowNameConflict`] — first-write wins.
+    ///
+    /// The function persists the new workflow before inserting it into
+    /// the in-memory map; on a `Store` error neither the disk nor the
+    /// map is mutated.
+    pub fn create_workflow(
+        &mut self,
+        wf: Workflow,
+    ) -> Result<(), OrchestratorError> {
+        if let Some(existing) = self.workflows.get(&wf.name) {
+            if existing.source == wf.source {
+                return Ok(());
+            }
+            return Err(OrchestratorError::WorkflowNameConflict {
+                name: wf.name.clone(),
+                existing_source: existing.source,
+                attempted_source: wf.source,
+            });
+        }
+        let before = self.snapshot_state();
+        self.store.save(&wf)?;
+        self.workflows.insert(wf.name.clone(), wf);
+        self.emit_diff(&before);
+        Ok(())
+    }
+
+    /// Per-source health snapshots, keyed by [`SourceKind`]. Every
+    /// source the orchestrator has observed at least one event for
+    /// shows up here; sources that registered without ever firing an
+    /// event (e.g. via [`Orchestrator::register_source`]) are also
+    /// included so CLI/TUI/web can render them.
+    pub fn source_health_reports(&self) -> Vec<SourceHealthReport> {
+        self.source_health
+            .iter()
+            .map(|(k, h)| source::report(*k, h))
+            .collect()
+    }
+
+    /// Register a source without dispatching any event. Used by the
+    /// daemon's startup helper so `clhorde-cli status` shows every
+    /// configured source even before its first event lands.
+    /// Idempotent — re-registering the same source preserves its
+    /// recorded state.
+    pub fn register_source(&mut self, kind: SourceKind) {
+        self.source_health
+            .entry(kind)
+            .or_insert_with(SourceHealth::unstarted);
+    }
+
+    /// Bump the explore worker's `last_input_at` to `now` for the
+    /// workflow that owns `prompt_id`. Called by the daemon binary
+    /// when human keystrokes / `SendInput` / `SendBytes` traffic for
+    /// an explore worker reaches the orchestrator. No-op when the
+    /// prompt id doesn't match a tracked explore worker.
+    pub fn note_explore_input(&mut self, prompt_id: usize, now: DateTime<Utc>) {
+        let Some(name) = self.explore_worker_owning_prompt(prompt_id) else {
+            return;
+        };
+        if let Some(worker) = self.explore_workers.get_mut(&name) {
+            worker.last_input_at = now;
+        }
+    }
+
+    /// One reaping pass over the explore-worker map. Returns the
+    /// number of `KillWorker` requests dispatched. Workers past
+    /// `threshold` get a kill request and are removed from the
+    /// in-memory map; workflows stay in `Exploring` per spec.
+    ///
+    /// `now` is taken as a parameter so tests can drive the clock
+    /// deterministically; production callers pass [`Utc::now`].
+    pub fn reap_idle_explore_workers(
+        &mut self,
+        now: DateTime<Utc>,
+        threshold: Duration,
+    ) -> usize {
+        let kills = explore::reap_idle_workers(self.explore_workers.values(), now, threshold);
+        let to_remove: Vec<String> = self
+            .explore_workers
+            .iter()
+            .filter(|(_, w)| w.is_idle_for(now, threshold))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &to_remove {
+            self.explore_workers.remove(name);
+        }
+        let count = kills.len();
+        for req in kills {
+            if let Err(e) = self.outbound.send(req) {
+                tracing::warn!(error = %e, "outbound channel closed; reaper kill dropped");
+            }
+        }
+        count
+    }
+
+    /// Test introspection: is the orchestrator currently tracking an
+    /// explore worker for `name`?
+    #[cfg(test)]
+    fn has_explore_worker(&self, name: &str) -> bool {
+        self.explore_workers.contains_key(name)
+    }
+
+    /// Test introspection: snapshot the explore worker for `name`.
+    #[cfg(test)]
+    fn explore_worker(&self, name: &str) -> Option<&ExploreWorker> {
+        self.explore_workers.get(name)
+    }
+
+    /// Record an error against a source without going through an
+    /// event. Used by source startup code to surface boot-time
+    /// failures (bad config, unreachable Jira) on the status surface
+    /// while still letting the rest of the daemon run.
+    pub fn record_source_error(
+        &mut self,
+        kind: SourceKind,
+        message: impl Into<String>,
+    ) {
+        self.source_health
+            .entry(kind)
+            .or_insert_with(SourceHealth::unstarted)
+            .note_error(message);
+    }
+
+    /// Fire the Jira write-back for `name` entering `Exploring`. No-op
+    /// when no writeback driver is wired (the default for unit tests
+    /// and pre-section-8 daemon builds). Non-blocking: the driver
+    /// spawns the actual REST calls. Section 6 of `add-jira-source`.
+    fn notify_jira_exploring(&self, name: &str) {
+        if let Some(wb) = &self.jira_writeback {
+            wb.notify_exploring(name.to_string());
+        }
+    }
+
+    /// Fire the Jira write-back for `name` reaching `Archived`. No-op
+    /// when no writeback driver is wired.
+    fn notify_jira_archived(&self, name: &str) {
+        if let Some(wb) = &self.jira_writeback {
+            wb.notify_archived(name.to_string());
+        }
+    }
+
+    /// Fire the Jira write-back for `name` transitioning to
+    /// `Cancelled` (reject, ticket-left-filter, manual cancel from a
+    /// Jira-source workflow). No-op when no writeback driver is wired.
+    fn notify_jira_cancelled(&self, name: &str) {
+        if let Some(wb) = &self.jira_writeback {
+            wb.notify_cancelled(name.to_string());
+        }
     }
 
     /// Process one [`DaemonEvent`] from the upstream daemon. Only the
@@ -704,11 +1256,24 @@ impl Orchestrator {
                 if let Some(name) = self.workflow_owning_prompt(*prompt_id) {
                     self.note_worker_finished(&name, *prompt_id, *exit_code);
                     self.try_advance_inner(&name)?;
+                } else if let Some(name) = self.explore_worker_owning_prompt(*prompt_id) {
+                    // Per explore-gate Requirement 2 / Scenario 1, an
+                    // explore worker exiting on its own does NOT advance
+                    // the FSM. We just clean up the local entry — the
+                    // workflow stays in `Exploring` until a marker
+                    // write or a reject hits.
+                    self.explore_workers.remove(&name);
                 }
             }
             DaemonEvent::PromptRemoved { prompt_id } => {
                 self.prompt_cwds.remove(prompt_id);
                 self.prompt_baselines.remove(prompt_id);
+                // Mirror the cleanup for explore workers — once the
+                // daemon reports the prompt gone, the budget entry is
+                // stale.
+                if let Some(name) = self.explore_worker_owning_prompt(*prompt_id) {
+                    self.explore_workers.remove(&name);
+                }
             }
             _ => {}
         }
@@ -920,7 +1485,9 @@ impl Orchestrator {
             Some(d) if d.finished => {
                 let exit = d.exit_code.unwrap_or(0);
                 if exit == 0 {
-                    let _ = wf.archive();
+                    if wf.archive().is_ok() && wf.source == SourceKind::Jira {
+                        self.notify_jira_archived(&wf.name);
+                    }
                 } else {
                     let _ = wf.fail(format!("archive exited with code {exit}"));
                 }
@@ -1207,6 +1774,20 @@ impl Orchestrator {
                     entry.tag = format!("{TAG_PREFIX}/wf={name}/phase=archive");
                 }
             }
+            TagTarget::Explore => {
+                // Section 5: bind the daemon-assigned id to the
+                // in-flight explore worker so the reaper, the kill
+                // path, and `clhorde-cli explore <id>` (section 7)
+                // can address it.
+                if let Some(worker) = self.explore_workers.get_mut(&name) {
+                    worker.prompt_id = Some(info.id);
+                }
+                if let Some(wf) = self.workflows.get_mut(&name) {
+                    if !wf.prompt_ids.contains(&info.uuid) {
+                        wf.prompt_ids.push(info.uuid.clone());
+                    }
+                }
+            }
         }
     }
 
@@ -1239,6 +1820,17 @@ impl Orchestrator {
                 d.exit_code = exit_code;
             }
         }
+    }
+
+    /// Reverse-lookup a workflow by its in-flight explore worker's
+    /// daemon-assigned prompt id. Used to drive the
+    /// `WorkerFinished`-doesn't-advance-FSM behaviour from
+    /// explore-gate Requirement 2 / Scenario 1.
+    fn explore_worker_owning_prompt(&self, prompt_id: usize) -> Option<String> {
+        self.explore_workers
+            .iter()
+            .find(|(_, w)| w.prompt_id == Some(prompt_id))
+            .map(|(name, _)| name.clone())
     }
 
     fn workflow_owning_prompt(&self, prompt_id: usize) -> Option<String> {
@@ -1343,10 +1935,30 @@ impl Orchestrator {
 
     fn on_marker_created(&mut self, name: String) -> Result<(), OrchestratorError> {
         let metadata = self.read_marker(&name);
+        // Per explore-gate Requirement 2 / Scenario "Marker written
+        // while worker is alive — worker is killed", a marker landing
+        // for an `Exploring` workflow first kills the live PTY worker
+        // (gracefully, via `KillWorker`) so the budget is freed before
+        // the FSM transitions to `Queued`.
+        if let Some(wf) = self.workflows.get(&name) {
+            if matches!(wf.status, WorkflowStatus::Exploring) {
+                self.kill_explore_worker(&name);
+            }
+        }
         match self.workflows.remove(&name) {
             Some(mut wf) => {
                 let changed = match wf.status {
-                    WorkflowStatus::Drafted => {
+                    // Drafted is the OpenSpec watcher's classic
+                    // "user-touched" path. Exploring is the
+                    // explore-gate approval path: a Jira-created
+                    // workflow whose human reviewer wrote
+                    // `.clhorde-ready` (directly or via
+                    // `clhorde-cli approve`). Both run the same
+                    // `Workflow::queue` transition; the orchestrator
+                    // does not branch on `wf.source` here — exactly
+                    // the contract `scheduler-source` Requirement 1
+                    // / Scenario 2 calls for.
+                    WorkflowStatus::Drafted | WorkflowStatus::Exploring => {
                         if let Err(e) = wf.queue(metadata) {
                             tracing::warn!(name = %name, error = %e, "queue rejected");
                             false
@@ -1386,7 +1998,14 @@ impl Orchestrator {
     }
 
     fn on_marker_removed(&mut self, name: String) -> Result<(), OrchestratorError> {
+        let mut cancelled_jira = false;
         if let Some(mut wf) = self.workflows.remove(&name) {
+            let was_running = matches!(
+                wf.status,
+                WorkflowStatus::Implementing
+                    | WorkflowStatus::Verifying
+                    | WorkflowStatus::Archiving,
+            );
             let changed = match wf.status {
                 WorkflowStatus::Queued => wf.unqueue().is_ok(),
                 WorkflowStatus::Implementing
@@ -1396,8 +2015,12 @@ impl Orchestrator {
             };
             if changed {
                 self.store.save(&wf)?;
+                cancelled_jira = was_running && wf.source == SourceKind::Jira;
             }
-            self.workflows.insert(name, wf);
+            self.workflows.insert(name.clone(), wf);
+        }
+        if cancelled_jira {
+            self.notify_jira_cancelled(&name);
         }
         Ok(())
     }
@@ -1449,12 +2072,21 @@ impl Orchestrator {
 /// `others` is the orchestrator's view of every other workflow, used to
 /// compute the `blocked_by` field via [`deps::evaluate`]. For workflows
 /// in any state other than `Queued`, `blocked_by` is always empty.
+///
+/// `explore_alive` is true when the orchestrator is tracking a live
+/// explore worker for `wf.name`. Forwarded onto
+/// [`WorkflowSummary::explore_worker_alive`] so CLI/TUI/web can render
+/// a "worker live" indicator while a Jira-driven workflow is parked in
+/// `Exploring`. Always false outside `Exploring`.
 fn workflow_summary(
     wf: &Workflow,
     others: &BTreeMap<String, Workflow>,
+    explore_alive: bool,
 ) -> WorkflowSummary {
     let (status, failure_reason) = match &wf.status {
         WorkflowStatus::Drafted => ("drafted", None),
+        WorkflowStatus::Triggered => ("triggered", None),
+        WorkflowStatus::Exploring => ("exploring", None),
         WorkflowStatus::Queued => ("queued", None),
         WorkflowStatus::Implementing => ("implementing", None),
         WorkflowStatus::Verifying => ("verifying", None),
@@ -1487,6 +2119,8 @@ fn workflow_summary(
         finished_at: wf.finished_at,
         prompt_ids: wf.prompt_ids.clone(),
         blocked_by,
+        source: source::source_kind_name(wf.source).to_string(),
+        explore_worker_alive: matches!(wf.status, WorkflowStatus::Exploring) && explore_alive,
     }
 }
 
@@ -1557,6 +2191,7 @@ enum TagTarget {
     Apply { node_id: String },
     Verify,
     Archive,
+    Explore,
 }
 
 fn expected_apply_tag(workflow: &str, node_id: &str) -> String {
@@ -1592,6 +2227,7 @@ fn parse_scheduler_tag(tags: &[String]) -> Option<(String, TagTarget)> {
             },
             "verify" => TagTarget::Verify,
             "archive" => TagTarget::Archive,
+            "explore" => TagTarget::Explore,
             _ => continue,
         };
         return Some((n, target));
@@ -3195,6 +3831,949 @@ mod tests {
             final_x.blocked_by.is_empty(),
             "final x update should have empty blocked_by, got {:?}",
             final_x.blocked_by
+        );
+    }
+
+    // ── Multi-source plumbing (section 2 of add-jira-source) ──
+
+    use crate::jira::{JiraEvent, JiraTicketPayload};
+    use crate::source::SourceEvent;
+
+    fn jira_payload(key: &str) -> JiraTicketPayload {
+        JiraTicketPayload {
+            key: key.to_string(),
+            title: "Test ticket".into(),
+            ..JiraTicketPayload::default()
+        }
+    }
+
+    #[test]
+    fn handle_event_delegates_through_handle_source_event() {
+        // The legacy `handle_event(FsEvent)` entry point still works and
+        // is observably equivalent to wrapping in SourceEvent::Fs.
+        let (tmp, mut orch, _rx) = fixture();
+        write_marker(&tmp, "x", "");
+        orch.handle_event(FsEvent::MarkerCreated { name: "x".into() })
+            .unwrap();
+        assert_eq!(orch.workflow("x").unwrap().status, WorkflowStatus::Queued);
+    }
+
+    #[test]
+    fn jira_ticket_appeared_creates_workflow_and_dispatches_explore() {
+        // Section 5 wires `TicketAppeared` to auto-dispatch the
+        // explore worker and advance Triggered → Exploring. The
+        // workflow ends up in `Exploring`, not `Triggered`.
+        let (_tmp, mut orch, mut rx) = fixture();
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+
+        let wf = orch.workflow("PROJ-1").expect("workflow created");
+        assert_eq!(wf.status, WorkflowStatus::Exploring);
+        assert_eq!(wf.source, SourceKind::Jira);
+
+        // Exactly one SubmitPrompt was sent; mode=interactive,
+        // tag=phase=explore.
+        let reqs = drain_requests(&mut rx);
+        assert_eq!(reqs.len(), 1, "expected one explore dispatch, got {reqs:?}");
+        match &reqs[0] {
+            ClientRequest::SubmitPrompt { mode, tags, text, .. } => {
+                assert_eq!(mode, "interactive");
+                assert_eq!(tags.len(), 1);
+                assert!(tags[0].contains("phase=explore"));
+                assert!(text.starts_with("/opsx:explore"));
+            }
+            other => panic!("expected SubmitPrompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jira_ticket_appeared_is_idempotent_for_same_source() {
+        // Polling re-emits TicketAppeared every tick. Re-creating the
+        // same workflow with the same source must not error or replace
+        // existing state.
+        let (_tmp, mut orch, _rx) = fixture();
+        let payload = jira_payload("PROJ-1");
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: payload.clone(),
+        }))
+        .unwrap();
+        let created_at = orch.workflow("PROJ-1").unwrap().created_at;
+
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload,
+        }))
+        .unwrap();
+
+        let after = orch.workflow("PROJ-1").unwrap();
+        assert_eq!(after.created_at, created_at);
+        assert_eq!(after.source, SourceKind::Jira);
+    }
+
+    #[test]
+    fn create_workflow_rejects_cross_source_collision() {
+        // OpenSpec already owns the name; Jira tries to claim it. The
+        // OpenSpec workflow must stay intact, the error must report
+        // both sides, and the OpenSpec workflow's source must be
+        // unchanged.
+        let (tmp, mut orch, _rx) = fixture();
+        write_marker(&tmp, "shared", "");
+        orch.handle_event(FsEvent::MarkerCreated {
+            name: "shared".into(),
+        })
+        .unwrap();
+
+        let err = orch
+            .create_workflow(Workflow::triggered("shared", SourceKind::Jira))
+            .unwrap_err();
+        match err {
+            OrchestratorError::WorkflowNameConflict {
+                name,
+                existing_source,
+                attempted_source,
+            } => {
+                assert_eq!(name, "shared");
+                assert_eq!(existing_source, SourceKind::OpenSpec);
+                assert_eq!(attempted_source, SourceKind::Jira);
+            }
+            other => panic!("expected WorkflowNameConflict, got {other:?}"),
+        }
+        // Existing workflow untouched.
+        let wf = orch.workflow("shared").unwrap();
+        assert_eq!(wf.source, SourceKind::OpenSpec);
+        assert_eq!(wf.status, WorkflowStatus::Queued);
+    }
+
+    #[test]
+    fn jira_ticket_appeared_skips_when_openspec_owns_name() {
+        // The Jira ingest helper swallows WorkflowNameConflict; the
+        // event should leave the orchestrator's existing OpenSpec
+        // workflow alone instead of bubbling an error up.
+        let (tmp, mut orch, _rx) = fixture();
+        write_marker(&tmp, "shared", "");
+        orch.handle_event(FsEvent::MarkerCreated {
+            name: "shared".into(),
+        })
+        .unwrap();
+
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "shared".into(),
+            payload: jira_payload("shared"),
+        }))
+        .unwrap();
+
+        let wf = orch.workflow("shared").unwrap();
+        assert_eq!(wf.source, SourceKind::OpenSpec);
+        assert_eq!(wf.status, WorkflowStatus::Queued);
+    }
+
+    #[test]
+    fn fs_marker_advances_jira_created_workflow() {
+        // Spec scenario `scheduler-source` Requirement 1 / Scenario 2:
+        // a single workflow can be advanced by multiple sources. Jira
+        // creates `PROJ-1` (Triggered → Exploring); the OpenSpec
+        // watcher later sees `.clhorde-ready` and advances it to
+        // Queued. No Jira-specific code runs in the transition.
+        let (tmp, mut orch, _rx) = fixture();
+        // Jira creates the workflow — section 5 auto-dispatches the
+        // explore worker so the workflow is already in Exploring.
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+        assert_eq!(
+            orch.workflow("PROJ-1").unwrap().status,
+            WorkflowStatus::Exploring,
+        );
+        // Human writes the marker (or `clhorde-cli approve` does it
+        // for them). The OpenSpec watcher fires; the orchestrator
+        // routes the FsEvent through the unified dispatch.
+        change_dir(&tmp, "PROJ-1");
+        write_marker(&tmp, "PROJ-1", "");
+        orch.handle_source_event(SourceEvent::Fs(FsEvent::MarkerCreated {
+            name: "PROJ-1".into(),
+        }))
+        .unwrap();
+
+        let wf = orch.workflow("PROJ-1").unwrap();
+        // Source is still Jira — the FS event advanced it but doesn't
+        // change which source originated the workflow.
+        assert_eq!(wf.source, SourceKind::Jira);
+        assert_eq!(wf.status, WorkflowStatus::Queued);
+    }
+
+    #[test]
+    fn jira_left_filter_cancels_exploring_workflow() {
+        // Scenario: a Jira-created workflow in Exploring loses its
+        // matching ticket (label removed externally, status changed).
+        // The orchestrator cancels it. Section 5 dispatches the
+        // explore worker on TicketAppeared, so the workflow is
+        // Exploring without manual help.
+        let (_tmp, mut orch, _rx) = fixture();
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-9".into(),
+            payload: jira_payload("PROJ-9"),
+        }))
+        .unwrap();
+        assert_eq!(
+            orch.workflow("PROJ-9").unwrap().status,
+            WorkflowStatus::Exploring
+        );
+
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketLeftFilter {
+            key: "PROJ-9".into(),
+        }))
+        .unwrap();
+        assert_eq!(
+            orch.workflow("PROJ-9").unwrap().status,
+            WorkflowStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn jira_left_filter_does_not_disturb_openspec_workflow() {
+        // Scenario `scheduler-source` Requirement 5: removing a Jira
+        // event for a name owned by OpenSpec must not affect the
+        // OpenSpec workflow.
+        let (tmp, mut orch, _rx) = fixture();
+        write_marker(&tmp, "shared", "");
+        orch.handle_event(FsEvent::MarkerCreated {
+            name: "shared".into(),
+        })
+        .unwrap();
+
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketLeftFilter {
+            key: "shared".into(),
+        }))
+        .unwrap();
+        let wf = orch.workflow("shared").unwrap();
+        assert_eq!(wf.source, SourceKind::OpenSpec);
+        assert_eq!(wf.status, WorkflowStatus::Queued);
+    }
+
+    #[test]
+    fn source_event_marks_origin_healthy() {
+        // Successful dispatch updates the source's last_successful_run
+        // and clears any prior error.
+        let (tmp, mut orch, _rx) = fixture();
+        orch.register_source(SourceKind::OpenSpec);
+        orch.register_source(SourceKind::Jira);
+
+        write_marker(&tmp, "x", "");
+        orch.handle_source_event(SourceEvent::Fs(FsEvent::MarkerCreated {
+            name: "x".into(),
+        }))
+        .unwrap();
+
+        let reports = orch.source_health_reports();
+        let openspec = reports
+            .iter()
+            .find(|r| r.source == "open_spec")
+            .expect("openspec report");
+        assert!(openspec.is_healthy);
+        assert!(openspec.last_successful_run.is_some());
+        let jira = reports
+            .iter()
+            .find(|r| r.source == "jira")
+            .expect("jira report");
+        // Registered but never run.
+        assert!(jira.is_healthy);
+        assert!(jira.last_successful_run.is_none());
+    }
+
+    #[test]
+    fn source_error_recorded_without_event() {
+        // Boot-time errors on a source (bad config, unreachable API)
+        // surface via record_source_error so the daemon stays running
+        // and the CLI can see the failure.
+        let (_tmp, mut orch, _rx) = fixture();
+        orch.record_source_error(SourceKind::Jira, "401 unauthorized");
+        let reports = orch.source_health_reports();
+        let jira = reports
+            .iter()
+            .find(|r| r.source == "jira")
+            .expect("jira report");
+        assert!(!jira.is_healthy);
+        assert_eq!(jira.last_error.as_deref(), Some("401 unauthorized"));
+    }
+
+    #[test]
+    fn register_default_sources_seeds_openspec() {
+        // The startup helper makes sure the OpenSpec source is visible
+        // even before its first FS event lands.
+        let (_tmp, mut orch, _rx) = fixture();
+        crate::source::register_default_sources(&mut orch, false);
+        let reports = orch.source_health_reports();
+        assert!(reports.iter().any(|r| r.source == "open_spec"));
+        assert!(!reports.iter().any(|r| r.source == "jira"));
+    }
+
+    #[test]
+    fn register_default_sources_with_jira_seeds_both() {
+        let (_tmp, mut orch, _rx) = fixture();
+        crate::source::register_default_sources(&mut orch, true);
+        let reports = orch.source_health_reports();
+        assert!(reports.iter().any(|r| r.source == "open_spec"));
+        assert!(reports.iter().any(|r| r.source == "jira"));
+    }
+
+    // ── Explore gate (section 5 of add-jira-source) ──
+
+    fn explore_tag_for(name: &str) -> String {
+        format!("clhorde-scheduler/wf={name}/phase=explore")
+    }
+
+    fn explore_dispatch_request(reqs: &[ClientRequest]) -> &ClientRequest {
+        reqs.iter()
+            .find(|r| match r {
+                ClientRequest::SubmitPrompt { tags, .. } => {
+                    tags.iter().any(|t| t.contains("phase=explore"))
+                }
+                _ => false,
+            })
+            .expect("expected one explore SubmitPrompt request")
+    }
+
+    fn kill_request_ids(reqs: &[ClientRequest]) -> Vec<usize> {
+        reqs.iter()
+            .filter_map(|r| match r {
+                ClientRequest::KillWorker { prompt_id } => Some(*prompt_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn explore_dispatch_happy_path_transitions_to_exploring() {
+        // Spec scenario `explore-gate` Requirement 1: TicketAppeared
+        // dispatches an interactive worker and the workflow ends in
+        // `Exploring`. Section 5 ties the dispatch to the same flow.
+        let (_tmp, mut orch, mut rx) = fixture();
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+
+        let reqs = drain_requests(&mut rx);
+        let dispatch = explore_dispatch_request(&reqs);
+        match dispatch {
+            ClientRequest::SubmitPrompt {
+                mode,
+                worktree,
+                tags,
+                worktree_id,
+                ..
+            } => {
+                assert_eq!(mode, "interactive");
+                assert!(!worktree, "explore worker must run outside worktrees");
+                assert_eq!(tags, &vec![explore_tag_for("PROJ-1")]);
+                assert!(worktree_id.is_none());
+            }
+            other => panic!("expected SubmitPrompt, got {other:?}"),
+        }
+        assert_eq!(
+            orch.workflow("PROJ-1").unwrap().status,
+            WorkflowStatus::Exploring,
+        );
+        assert!(orch.has_explore_worker("PROJ-1"));
+    }
+
+    #[test]
+    fn explore_dispatch_failure_marks_workflow_failed() {
+        // Spec scenario `explore-gate` Requirement 1 / Scenario 3:
+        // a catastrophic dispatch failure transitions the workflow
+        // to `Failed { reason }`. We synthesise the failure by
+        // dropping the daemon-IPC receiver before dispatch — the
+        // outbound channel is closed when `dispatch_explore` runs.
+        let tmp = TempDir::new().unwrap();
+        let store = WorkflowStore::open(tmp.path().join("store"));
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let mut orch = Orchestrator::new(tmp.path(), store, tx);
+
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+
+        match &orch.workflow("PROJ-1").unwrap().status {
+            WorkflowStatus::Failed { reason } => {
+                assert!(
+                    reason.contains("explore dispatch"),
+                    "expected dispatch reason, got {reason}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(!orch.has_explore_worker("PROJ-1"));
+    }
+
+    #[test]
+    fn marker_during_explore_kills_worker_and_queues() {
+        // Spec scenario `explore-gate` Requirement 2 / Scenario
+        // "Marker written while worker is alive": writing
+        // `.clhorde-ready` for an `Exploring` workflow kills the
+        // PTY worker and transitions to `Queued`.
+        let (tmp, mut orch, mut rx) = fixture();
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+        let dispatch_reqs = drain_requests(&mut rx);
+        let tag = match explore_dispatch_request(&dispatch_reqs) {
+            ClientRequest::SubmitPrompt { tags, .. } => tags[0].clone(),
+            _ => unreachable!(),
+        };
+        // Daemon echoes the prompt back so the orchestrator binds the
+        // explore worker's prompt id (lets the kill path fire a real
+        // KillWorker request).
+        orch.handle_daemon_event(&fake_prompt_added(123, &tag))
+            .unwrap();
+        assert_eq!(
+            orch.explore_worker("PROJ-1").and_then(|w| w.prompt_id),
+            Some(123)
+        );
+
+        // Human writes the marker.
+        change_dir(&tmp, "PROJ-1");
+        write_marker(&tmp, "PROJ-1", "");
+        orch.handle_event(FsEvent::MarkerCreated { name: "PROJ-1".into() })
+            .unwrap();
+
+        // Kill request landed for the explore worker; workflow is Queued.
+        let post_marker = drain_requests(&mut rx);
+        let kills = kill_request_ids(&post_marker);
+        assert_eq!(kills, vec![123]);
+        assert_eq!(
+            orch.workflow("PROJ-1").unwrap().status,
+            WorkflowStatus::Queued
+        );
+        assert!(!orch.has_explore_worker("PROJ-1"));
+    }
+
+    #[test]
+    fn reject_mid_explore_cleans_up_directory_and_kills_worker() {
+        // Spec scenario `explore-gate` Requirement 4 / Scenario
+        // "Reject fully cleans up": worker killed, change directory
+        // removed, workflow transitions to `Cancelled`.
+        let (tmp, mut orch, mut rx) = fixture();
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+        let tag = match explore_dispatch_request(&drain_requests(&mut rx)) {
+            ClientRequest::SubmitPrompt { tags, .. } => tags[0].clone(),
+            _ => unreachable!(),
+        };
+        orch.handle_daemon_event(&fake_prompt_added(7, &tag))
+            .unwrap();
+
+        // Pretend the explore worker started writing artifacts.
+        let dir = change_dir(&tmp, "PROJ-1");
+        std::fs::write(dir.join("proposal.md"), "draft").unwrap();
+        assert!(dir.exists());
+
+        let outcome = orch.reject_workflow("PROJ-1").unwrap();
+        assert_eq!(outcome.source, SourceKind::Jira);
+        assert!(outcome.transitioned);
+        assert!(outcome.was_active);
+        assert!(!dir.exists(), "change dir should be removed");
+        assert_eq!(
+            orch.workflow("PROJ-1").unwrap().status,
+            WorkflowStatus::Cancelled
+        );
+        assert!(!orch.has_explore_worker("PROJ-1"));
+        let kills = kill_request_ids(&drain_requests(&mut rx));
+        assert_eq!(kills, vec![7]);
+    }
+
+    #[test]
+    fn reject_workflow_rejects_terminal_state() {
+        // Reject on a terminal workflow returns BadRequest and
+        // doesn't touch any state.
+        let (tmp, mut orch, mut rx) = fixture();
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+        let _ = drain_requests(&mut rx);
+        // Force terminal.
+        {
+            let wf = orch.workflows.get_mut("PROJ-1").unwrap();
+            wf.cancel_from_exploring().unwrap();
+        }
+        let err = orch.reject_workflow("PROJ-1").unwrap_err();
+        match err {
+            OrchestratorError::BadRequest(msg) => {
+                assert!(msg.contains("terminal"));
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        // Hold tmp alive for change_dir paths.
+        let _ = tmp;
+    }
+
+    #[test]
+    fn reject_unknown_workflow_returns_not_found() {
+        let (_tmp, mut orch, _rx) = fixture();
+        let err = orch.reject_workflow("ghost").unwrap_err();
+        assert!(matches!(err, OrchestratorError::NotFound(_)));
+    }
+
+    #[test]
+    fn explore_worker_exit_without_marker_leaves_workflow_exploring() {
+        // Spec scenario `explore-gate` Requirement 2 / Scenario
+        // "Worker exits without marker": workflow stays `Exploring`,
+        // change directory unchanged.
+        let (_tmp, mut orch, mut rx) = fixture();
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+        let tag = match explore_dispatch_request(&drain_requests(&mut rx)) {
+            ClientRequest::SubmitPrompt { tags, .. } => tags[0].clone(),
+            _ => unreachable!(),
+        };
+        orch.handle_daemon_event(&fake_prompt_added(99, &tag))
+            .unwrap();
+
+        // Worker exits cleanly with no marker on disk.
+        orch.handle_daemon_event(&DaemonEvent::WorkerFinished {
+            prompt_id: 99,
+            exit_code: Some(0),
+        })
+        .unwrap();
+
+        // Workflow is still Exploring; explore-worker entry is cleaned up.
+        assert_eq!(
+            orch.workflow("PROJ-1").unwrap().status,
+            WorkflowStatus::Exploring
+        );
+        assert!(!orch.has_explore_worker("PROJ-1"));
+    }
+
+    #[test]
+    fn reaper_kills_idle_worker_without_changing_state() {
+        // Spec scenario `explore-gate` Requirement 5 / Scenario
+        // "Reaper does not advance the FSM": idle worker is killed,
+        // workflow stays `Exploring`.
+        let (_tmp, mut orch, mut rx) = fixture();
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+        let tag = match explore_dispatch_request(&drain_requests(&mut rx)) {
+            ClientRequest::SubmitPrompt { tags, .. } => tags[0].clone(),
+            _ => unreachable!(),
+        };
+        orch.handle_daemon_event(&fake_prompt_added(42, &tag))
+            .unwrap();
+
+        // Push the worker's last_input_at back so the reaper flags
+        // it as idle past a short threshold.
+        {
+            let w = orch.explore_workers.get_mut("PROJ-1").unwrap();
+            w.last_input_at = Utc::now() - chrono::Duration::hours(48);
+        }
+
+        let killed =
+            orch.reap_idle_explore_workers(Utc::now(), Duration::from_secs(60 * 60));
+        assert_eq!(killed, 1);
+        let kills = kill_request_ids(&drain_requests(&mut rx));
+        assert_eq!(kills, vec![42]);
+        // Workflow stays in Exploring.
+        assert_eq!(
+            orch.workflow("PROJ-1").unwrap().status,
+            WorkflowStatus::Exploring
+        );
+        assert!(!orch.has_explore_worker("PROJ-1"));
+    }
+
+    #[test]
+    fn reaper_skips_workers_without_prompt_id() {
+        let (_tmp, mut orch, mut rx) = fixture();
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+        let _ = drain_requests(&mut rx); // dispatch request only
+
+        // Nudge last_input_at far back, but do NOT echo PromptAdded —
+        // the worker has no prompt_id, so the reaper must skip it.
+        {
+            let w = orch.explore_workers.get_mut("PROJ-1").unwrap();
+            w.last_input_at = Utc::now() - chrono::Duration::hours(48);
+        }
+
+        let killed =
+            orch.reap_idle_explore_workers(Utc::now(), Duration::from_secs(60 * 60));
+        assert_eq!(killed, 0);
+        assert!(orch.has_explore_worker("PROJ-1"));
+        assert!(drain_requests(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn note_explore_input_bumps_last_input_at() {
+        let (_tmp, mut orch, mut rx) = fixture();
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+        let tag = match explore_dispatch_request(&drain_requests(&mut rx)) {
+            ClientRequest::SubmitPrompt { tags, .. } => tags[0].clone(),
+            _ => unreachable!(),
+        };
+        orch.handle_daemon_event(&fake_prompt_added(11, &tag))
+            .unwrap();
+        // Push last_input_at back into the past.
+        {
+            let w = orch.explore_workers.get_mut("PROJ-1").unwrap();
+            w.last_input_at = Utc::now() - chrono::Duration::hours(48);
+        }
+        let now = Utc::now();
+        orch.note_explore_input(11, now);
+        let after = orch.explore_worker("PROJ-1").unwrap();
+        assert!(
+            after.last_input_at >= now - chrono::Duration::seconds(1),
+            "last_input_at not bumped"
+        );
+    }
+
+    #[test]
+    fn idempotent_reemit_of_ticket_appeared_does_not_redispatch() {
+        // Polling re-emits TicketAppeared every tick; the orchestrator
+        // must not dispatch a fresh explore worker on the second
+        // emission.
+        let (_tmp, mut orch, mut rx) = fixture();
+        let p = jira_payload("PROJ-1");
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: p.clone(),
+        }))
+        .unwrap();
+        let first = drain_requests(&mut rx);
+        assert_eq!(first.len(), 1, "first emission dispatches");
+
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: p,
+        }))
+        .unwrap();
+        let second = drain_requests(&mut rx);
+        assert!(second.is_empty(), "re-emission must not re-dispatch");
+    }
+
+    #[test]
+    fn ticket_left_filter_kills_explore_worker() {
+        let (_tmp, mut orch, mut rx) = fixture();
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+        let tag = match explore_dispatch_request(&drain_requests(&mut rx)) {
+            ClientRequest::SubmitPrompt { tags, .. } => tags[0].clone(),
+            _ => unreachable!(),
+        };
+        orch.handle_daemon_event(&fake_prompt_added(55, &tag))
+            .unwrap();
+
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketLeftFilter {
+            key: "PROJ-1".into(),
+        }))
+        .unwrap();
+        let kills = kill_request_ids(&drain_requests(&mut rx));
+        assert_eq!(kills, vec![55]);
+        assert!(!orch.has_explore_worker("PROJ-1"));
+        assert_eq!(
+            orch.workflow("PROJ-1").unwrap().status,
+            WorkflowStatus::Cancelled
+        );
+    }
+
+    // ── Jira write-back wiring (section 6 of add-jira-source) ──
+
+    use crate::jira::writeback::{JiraWriter, JiraWritebackConfig};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex as StdMutex;
+
+    /// Synthetic writer that records calls and can be scripted to fail.
+    /// Mirrors the one in `jira::writeback::tests` but lives here so
+    /// orchestrator tests can verify the wiring without relying on
+    /// private test-only helpers from another module.
+    struct SyntheticWriter {
+        comments: StdMutex<Vec<(String, String)>>,
+        labels_removed: StdMutex<Vec<(String, String)>>,
+        transitions: StdMutex<Vec<(String, String)>>,
+        fail_comments: StdMutex<bool>,
+    }
+
+    impl SyntheticWriter {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                comments: StdMutex::new(Vec::new()),
+                labels_removed: StdMutex::new(Vec::new()),
+                transitions: StdMutex::new(Vec::new()),
+                fail_comments: StdMutex::new(false),
+            })
+        }
+    }
+
+    impl JiraWriter for SyntheticWriter {
+        fn add_comment<'a>(
+            &'a self,
+            key: &'a str,
+            body: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), crate::jira::JiraError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.comments
+                    .lock()
+                    .unwrap()
+                    .push((key.to_string(), body.to_string()));
+                if *self.fail_comments.lock().unwrap() {
+                    Err(crate::jira::JiraError::Server {
+                        status: 500,
+                        body: "synthetic".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn remove_label<'a>(
+            &'a self,
+            key: &'a str,
+            label: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), crate::jira::JiraError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.labels_removed
+                    .lock()
+                    .unwrap()
+                    .push((key.to_string(), label.to_string()));
+                Ok(())
+            })
+        }
+
+        fn transition<'a>(
+            &'a self,
+            key: &'a str,
+            transition_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), crate::jira::JiraError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.transitions
+                    .lock()
+                    .unwrap()
+                    .push((key.to_string(), transition_id.to_string()));
+                Ok(())
+            })
+        }
+    }
+
+    fn writeback_with(
+        writer: Arc<SyntheticWriter>,
+        config: JiraWritebackConfig,
+    ) -> Arc<JiraWriteback> {
+        Arc::new(JiraWriteback::new(
+            writer as Arc<dyn JiraWriter>,
+            config,
+            None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn exploring_start_fires_jira_writeback() {
+        // Spec scenario `jira-source` Requirement 4 / Scenario "Comment
+        // is posted when explore worker spawns": a fresh Jira ticket
+        // landing in `Exploring` causes a comment + label-remove pass.
+        let (_tmp, mut orch, _rx) = fixture();
+        let writer = SyntheticWriter::new();
+        let wb = writeback_with(Arc::clone(&writer), JiraWritebackConfig::default());
+        orch.set_jira_writeback(Arc::clone(&wb));
+
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+        // Synchronous: workflow has already advanced to Exploring.
+        assert_eq!(
+            orch.workflow("PROJ-1").unwrap().status,
+            WorkflowStatus::Exploring
+        );
+
+        wb.wait_idle().await;
+
+        let comments = writer.comments.lock().unwrap().clone();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].0, "PROJ-1");
+
+        let labels = writer.labels_removed.lock().unwrap().clone();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].0, "PROJ-1");
+    }
+
+    #[tokio::test]
+    async fn comment_failure_does_not_block_archive_transition() {
+        // Spec scenario `jira-source` Requirement 5 / Scenario "Comment
+        // fails on archive": a 500 from Jira during the closing
+        // comment must NOT prevent the workflow from reaching
+        // `Archived`. We drive a Jira-source workflow through the
+        // archive transition synchronously and assert the FSM moved
+        // forward even though the recorded write-back will fail.
+        let (_tmp, mut orch, _rx) = fixture();
+        let writer = SyntheticWriter::new();
+        *writer.fail_comments.lock().unwrap() = true;
+        let wb = writeback_with(Arc::clone(&writer), JiraWritebackConfig::default());
+        orch.set_jira_writeback(Arc::clone(&wb));
+
+        // Construct a Jira-source workflow already in Archiving with a
+        // dispatched archive prompt, then simulate the worker
+        // finishing successfully.
+        let mut wf = Workflow::triggered("PROJ-1", SourceKind::Jira);
+        // Fast-forward through the FSM.
+        wf.start_exploring().unwrap();
+        wf.queue(MarkerMetadata::default()).unwrap();
+        wf.start_implementing().unwrap();
+        wf.start_verifying().unwrap();
+        wf.start_archiving().unwrap();
+        orch.create_workflow(wf).unwrap();
+
+        // Seed a runtime entry for the archive phase so
+        // `advance_archiving` sees a dispatched prompt and reads the
+        // exit code.
+        let runtime = orch.runtimes.entry("PROJ-1".into()).or_default();
+        runtime.archive = Some(NodeDispatch {
+            tag: "clhorde-scheduler/wf=PROJ-1/phase=archive".into(),
+            prompt_id: Some(99),
+            uuid: Some("uuid-99".into()),
+            finished: true,
+            exit_code: Some(0),
+            completed: false,
+        });
+
+        // Drive the FSM forward.
+        orch.try_advance("PROJ-1").unwrap();
+
+        // FSM transition succeeded synchronously even though the
+        // write-back will fail.
+        assert_eq!(
+            orch.workflow("PROJ-1").unwrap().status,
+            WorkflowStatus::Archived
+        );
+
+        wb.wait_idle().await;
+
+        // The closing comment was attempted (and failed silently).
+        let comments = writer.comments.lock().unwrap().clone();
+        assert_eq!(comments.len(), 1, "archive comment must be attempted");
+        // Archive does NOT remove labels.
+        assert!(writer.labels_removed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_via_ticket_left_filter_fires_writeback() {
+        // A ticket leaving the Jira filter cancels the workflow and
+        // (per write-back contract) we comment + label-remove so the
+        // user sees a paper trail and the next poll cycle doesn't
+        // re-create the workflow.
+        let (_tmp, mut orch, _rx) = fixture();
+        let writer = SyntheticWriter::new();
+        let wb = writeback_with(Arc::clone(&writer), JiraWritebackConfig::default());
+        orch.set_jira_writeback(Arc::clone(&wb));
+
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+        wb.wait_idle().await;
+        // Reset recordings so we measure only the cancel-side calls.
+        writer.comments.lock().unwrap().clear();
+        writer.labels_removed.lock().unwrap().clear();
+
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketLeftFilter {
+            key: "PROJ-1".into(),
+        }))
+        .unwrap();
+        assert_eq!(
+            orch.workflow("PROJ-1").unwrap().status,
+            WorkflowStatus::Cancelled
+        );
+
+        wb.wait_idle().await;
+        let comments = writer.comments.lock().unwrap().clone();
+        assert_eq!(comments.len(), 1, "cancel comment must be posted");
+        let labels = writer.labels_removed.lock().unwrap().clone();
+        assert_eq!(
+            labels.len(),
+            1,
+            "cancel must remove the trigger label so re-poll doesn't recreate"
+        );
+    }
+
+    #[tokio::test]
+    async fn writeback_skipped_for_openspec_source() {
+        // OpenSpec-created workflows must never fire Jira write-back,
+        // even when a writeback driver is wired. This is the
+        // "scheduler-source Requirement 5" property: a source observes
+        // only its own workflows.
+        let (tmp, mut orch, _rx) = fixture();
+        let writer = SyntheticWriter::new();
+        let wb = writeback_with(Arc::clone(&writer), JiraWritebackConfig::default());
+        orch.set_jira_writeback(Arc::clone(&wb));
+
+        write_marker(&tmp, "openspec-only", "");
+        orch.handle_event(FsEvent::MarkerCreated {
+            name: "openspec-only".into(),
+        })
+        .unwrap();
+        // Cancel via marker removal.
+        remove_marker(&tmp, "openspec-only");
+        orch.handle_event(FsEvent::MarkerRemoved {
+            name: "openspec-only".into(),
+        })
+        .unwrap();
+
+        wb.wait_idle().await;
+        assert!(writer.comments.lock().unwrap().is_empty());
+        assert!(writer.labels_removed.lock().unwrap().is_empty());
+        assert!(writer.transitions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_writeback_means_no_panic() {
+        // Sanity: orchestrator works without a writeback wired (the
+        // default for every existing test). TicketAppeared transitions
+        // happen normally; no panics from the Option<Arc> field.
+        let (_tmp, mut orch, _rx) = fixture();
+
+        orch.handle_source_event(SourceEvent::Jira(JiraEvent::TicketAppeared {
+            key: "PROJ-1".into(),
+            payload: jira_payload("PROJ-1"),
+        }))
+        .unwrap();
+        assert_eq!(
+            orch.workflow("PROJ-1").unwrap().status,
+            WorkflowStatus::Exploring
         );
     }
 }

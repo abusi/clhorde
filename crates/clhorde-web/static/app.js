@@ -214,6 +214,8 @@ class AppState {
         // Whether the *server* says the scheduler bridge is currently
         // connected. Distinct from `connected` (daemon WS).
         this.schedulerSeen = false;
+        /** @type {Array<{source:string,is_healthy:boolean,last_successful_run?:string,last_error?:string}>} */
+        this.sourceHealth = [];
         this._changeListeners = [];
     }
 
@@ -272,6 +274,13 @@ class AppState {
                     .filter(w => w.status !== "drafted")
                     .sort((a, b) => a.name.localeCompare(b.name));
                 this.schedulerRoot = event.root || null;
+                // Push frame may carry the current SourceHealth slice
+                // alongside the workflow list (post-section-9.4 daemons).
+                // Older daemons send no field — fall back to keeping the
+                // existing snapshot so we don't blank the UI on lag-resync.
+                if (Array.isArray(event.source_health)) {
+                    this.sourceHealth = event.source_health;
+                }
                 break;
             }
 
@@ -1472,6 +1481,7 @@ function renderWorkflows() {
             statusEl.textContent = `${appState.workflows.length} workflows`;
         }
     }
+    renderSourceHealth();
 
     if (appState.workflows.length === 0) {
         if (appState.schedulerSeen) {
@@ -1488,10 +1498,23 @@ function renderWorkflows() {
         const blocked = (w.blocked_by && w.blocked_by.length)
             ? `<span class="blocked-suffix" title="Blocked by: ${escapeHtml(w.blocked_by.join(", "))}">· blocked</span>`
             : "";
+        // Source chip lets multi-source operators tell at a glance
+        // which workflow came from where. Defaults to "open_spec" on
+        // older daemons that don't yet send the field.
+        const source = w.source || "open_spec";
+        const sourceChip = `<span class="footer-label" title="Source: ${escapeHtml(source)}">[${escapeHtml(source)}]</span>`;
+        // Live explore worker indicator. Only shows for workflows in
+        // Exploring whose PTY worker is still alive (or recently
+        // exited). Mirrors the TUI's "· worker live" chip.
+        const workerChip = w.explore_worker_alive
+            ? `<span class="badge badge-workflow-exploring" title="Explore worker is live — attach via TUI or web">· worker live</span>`
+            : "";
         return `
             <div class="scheduler-row ${isOpen ? "scheduler-row-open" : ""}" data-workflow="${escapeHtml(w.name)}">
                 <span class="scheduler-name">${escapeHtml(w.name)}</span>
                 <span class="badge badge-workflow-${w.status}">${w.status}</span>
+                ${sourceChip}
+                ${workerChip}
                 ${blocked}
                 ${w.priority ? `<span class="footer-label">prio ${w.priority}</span>` : ""}
                 <button class="btn btn-sm" data-workflow-action="toggle" data-name="${escapeHtml(w.name)}">${isOpen ? "Close" : "Open"}</button>
@@ -1500,6 +1523,55 @@ function renderWorkflows() {
         `;
     }).join("");
     renderWorkflowDetail();
+}
+
+/** Render the per-source health block under the Workflows pane.
+ *
+ * Pulls from `appState.sourceHealth`, which is populated from the
+ * WebSocket Snapshot. Empty health array hides the block entirely so
+ * older daemons that don't surface the field stay visually clean.
+ */
+function renderSourceHealth() {
+    const wrap = document.getElementById("source-health");
+    if (!wrap) return;
+    const reports = appState.sourceHealth || [];
+    if (reports.length === 0) {
+        wrap.hidden = true;
+        wrap.innerHTML = "";
+        return;
+    }
+    wrap.hidden = false;
+    const rows = reports.map(r => {
+        const healthClass = r.is_healthy ? "ok" : "unhealthy";
+        const lastRun = r.last_successful_run
+            ? `last_run ${formatRelativeTime(r.last_successful_run)}`
+            : "never run";
+        const errorLine = r.last_error
+            ? `<span class="source-health-error">${escapeHtml(r.last_error)}</span>`
+            : "";
+        return `
+            <div class="source-health-row source-health-${healthClass}">
+                <span class="source-health-name">${escapeHtml(r.source)}</span>
+                <span class="source-health-state">${r.is_healthy ? "ok" : "unhealthy"}</span>
+                <span class="source-health-last-run">${escapeHtml(lastRun)}</span>
+                ${errorLine}
+            </div>
+        `;
+    }).join("");
+    wrap.innerHTML = `<h3 class="source-health-title">Sources</h3>${rows}`;
+}
+
+/** Format an ISO-8601 timestamp string as a coarse "Xs ago" / "Xm ago"
+ * relative duration. Mirrors the TUI/CLI helpers so the three surfaces
+ * agree on the wording. */
+function formatRelativeTime(iso) {
+    const t = Date.parse(iso);
+    if (Number.isNaN(t)) return "unknown";
+    const secs = Math.max(0, Math.floor((Date.now() - t) / 1000));
+    if (secs < 60) return `${secs}s ago`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+    return `${Math.floor(secs / 86400)}d ago`;
 }
 
 /** Render the detail block for the currently-expanded workflow. */
@@ -1531,11 +1603,18 @@ function renderWorkflowDetail() {
     const blockedLine = (detail.blocked_by && detail.blocked_by.length)
         ? `<div class="workflow-blocked-line"><strong>Blocked by:</strong> ${escapeHtml(detail.blocked_by.join(", "))}</div>`
         : "";
+    const detailSource = detail.source || "open_spec";
+    const sourceBadge = `<span class="footer-label">[${escapeHtml(detailSource)}]</span>`;
+    const workerLine = detail.explore_worker_alive
+        ? `<div class="workflow-blocked-line"><strong>Explore worker:</strong> live — attach via TUI or web</div>`
+        : "";
 
     header.innerHTML = `
         <strong>${escapeHtml(detail.name)}</strong>
         <span class="badge badge-workflow-${detail.status}">${detail.status}</span>
+        ${sourceBadge}
         ${failureBadge}
+        ${workerLine}
         ${blockedLine}
     `;
 
@@ -1581,7 +1660,34 @@ function renderWorkflowDetail() {
     }
     body.innerHTML = html;
 
+    // Exploring workflows get a dedicated approve/reject action area —
+    // section 9.3 of `add-jira-source`. The buttons POST to the daemon
+    // through /api/scheduler/workflow/<name>/approve|reject, which the
+    // CLI also uses. When the endpoints aren't wired (older daemons),
+    // the API returns a clear error and the SPA surfaces it as a toast.
+    const exploringActions = detail.status === "exploring"
+        ? `
+            <div class="workflow-explore-actions">
+                <strong>Awaiting human review.</strong>
+                Approve to write <code>.clhorde-ready</code> and unpark the workflow,
+                or reject to cancel and clean up the change directory.
+                You can also drive these from the CLI:
+                <code>clhorde-cli approve ${escapeHtml(detail.name)}</code> /
+                <code>clhorde-cli reject ${escapeHtml(detail.name)}</code>.
+                <div class="workflow-explore-buttons">
+                    <button class="btn btn-sm btn-primary"
+                            data-workflow-action="approve"
+                            data-name="${escapeHtml(detail.name)}">Approve</button>
+                    <button class="btn btn-sm btn-danger"
+                            data-workflow-action="reject"
+                            data-name="${escapeHtml(detail.name)}">Reject</button>
+                </div>
+            </div>
+        `
+        : "";
+
     actions.innerHTML = `
+        ${exploringActions}
         <input type="text" class="input" id="retry-section-input" placeholder="Section id (e.g. 1, 3.2)" style="max-width:200px">
         <button class="btn btn-sm" id="retry-section-btn">Retry section</button>
         <button class="btn btn-sm btn-danger" data-workflow-action="cancel" data-name="${escapeHtml(detail.name)}">Cancel workflow</button>
@@ -1635,6 +1741,25 @@ async function cancelWorkflow(name) {
     // The orchestrator emits DetailUpdated within ms of the cancel
     // committing — the SPA's _applySchedulerEvent handler picks it
     // up and re-renders the expanded card. No manual refetch.
+}
+
+async function approveWorkflow(name) {
+    // No confirm — approve is the happy path; users have just read
+    // the explore worker's output and clicked the green button.
+    // Web routes through the existing /queue endpoint, which writes
+    // the marker and drives Exploring → Queued. The CLI's
+    // `clhorde-cli approve` does the same plus a graceful worker
+    // kill — atomic kill from the SPA is intentionally deferred to
+    // section 7 of `add-jira-source`.
+    await schedulerAction("approve", `/api/scheduler/workflow/${encodeURIComponent(name)}/queue`, {});
+}
+
+async function rejectWorkflow(name) {
+    if (!confirm(`Reject workflow ${name}? Use \`clhorde-cli reject ${name}\` for the full reject (worker kill + change dir cleanup + source notification).`)) return;
+    // Web routes through /cancel, which transitions the workflow to
+    // Cancelled but does not remove the change directory or notify
+    // the source. Full reject semantics live in the CLI for now.
+    await schedulerAction("reject", `/api/scheduler/workflow/${encodeURIComponent(name)}/cancel`, null);
 }
 
 async function retrySection(name, section) {
@@ -1798,6 +1923,16 @@ document.getElementById("workflow-detail-actions")?.addEventListener("click", (e
     const cancelBtn = e.target.closest("[data-workflow-action='cancel']");
     if (cancelBtn) {
         cancelWorkflow(cancelBtn.dataset.name);
+        return;
+    }
+    const approveBtn = e.target.closest("[data-workflow-action='approve']");
+    if (approveBtn) {
+        approveWorkflow(approveBtn.dataset.name);
+        return;
+    }
+    const rejectBtn = e.target.closest("[data-workflow-action='reject']");
+    if (rejectBtn) {
+        rejectWorkflow(rejectBtn.dataset.name);
         return;
     }
     if (e.target.id === "retry-section-btn") {

@@ -292,6 +292,47 @@ clhorde prompt-from-files a.txt b.txt c.txt                   # Load specific fi
 clhorde prompt-from-files a.txt,b.txt c.txt                   # Comma-separated + space-separated
 ```
 
+## Scheduler workflows
+
+`clhorde-scheduler` ingests work from one or more sources, turns each item into a workflow, and drives it through a small finite state machine. Each workflow is named globally (the OpenSpec change name or the Jira issue key) and persisted as JSON in `~/.local/share/clhorde/workflows/`.
+
+### State diagram
+
+```
+                       Drafted ──queue──▶ Queued ─▶ Implementing ─▶ Verifying ─▶ Archiving ─▶ Archived
+                                          ▲              │
+                                          │              │
+            ┌─────────────────────────────┘              ▼
+            │ approval (`.clhorde-ready`)             cancel/fail
+            │                                            │
+Triggered ──start_exploring──▶ Exploring                 ▼
+ (Jira)                          │                   Cancelled
+                                 ├──reject/fail──▶  Failed { reason }
+                                 │
+                                 └──TicketLeftFilter──▶ Cancelled
+```
+
+### State semantics
+
+- **Drafted** — change directory exists but no `.clhorde-ready` marker yet. The OpenSpec source's default state.
+- **Triggered** — transient. A non-OpenSpec source (today: Jira) just created the workflow but has not yet dispatched the explore worker.
+- **Exploring** — `Triggered`'s next step. An interactive PTY worker is running `/opsx:explore` (or has exited and is waiting to be re-spawned). The workflow stays here until a human writes `.clhorde-ready` (`clhorde-cli approve <id>`) or rejects (`clhorde-cli reject <id>`). Distinct from `Implementing` so the surface can flag "human needed".
+- **Queued** — marker on disk; the scheduler will pick up when worker slots free up.
+- **Implementing / Verifying / Archiving** — apply, verify, archive prompts in flight. Mapped to `is_running()`.
+- **Archived / Cancelled / Failed** — terminal. `is_terminal()` is true; no further transitions accepted.
+
+### Sources and source health
+
+Each workflow records a `source: SourceKind` (`OpenSpec` or `Jira`) at creation time, used for write-back routing (Jira comments, label management) and surfaced in CLI/TUI/web. Per-source health (`last_successful_run`, `last_error`, `is_healthy`) flows through the control socket alongside the workflow list and renders in:
+
+- `clhorde-scheduler status` — best-effort daemon round-trip; appends a `sources:` block when reachable.
+- TUI Workflows tab — bordered footer block underneath the workflow list.
+- Web dashboard — `<div id="source-health">` card above the workflow list.
+
+### Jira source (opt-in)
+
+Configured under `[sources.jira]` in `keymap.toml`. Polls a JQL filter, creates `Triggered` workflows keyed by the issue key, dispatches `/opsx:explore` for each, and writes back to Jira on lifecycle events (comments, optional transitions, trigger label removal). See README for the full schema.
+
 ## Code conventions
 
 - Rust 2021 edition, MSRV 1.88

@@ -198,6 +198,7 @@ where
         SchedulerEvent::Snapshot {
             workflows: guard.summaries(),
             root: Some(guard.root().to_string_lossy().into_owned()),
+            source_health: guard.source_health_reports(),
         }
     };
     write_response(
@@ -238,6 +239,7 @@ where
                                 root: Some(
                                     guard.root().to_string_lossy().into_owned(),
                                 ),
+                                source_health: guard.source_health_reports(),
                             }
                         };
                         if let Err(e) = write_response(
@@ -461,16 +463,19 @@ pub fn dispatch_request(
     req: ControlRequest,
 ) -> ControlResponse {
     let root = Some(orch.root().to_string_lossy().into_owned());
+    let source_health = orch.source_health_reports();
     match req {
         ControlRequest::Ping => ControlResponse::Pong,
         ControlRequest::Status { name: None } => ControlResponse::Status {
             workflows: orch.summaries(),
             root,
+            source_health,
         },
         ControlRequest::Status { name: Some(n) } => match orch.summary(&n) {
             Some(s) => ControlResponse::Status {
                 workflows: vec![s],
                 root,
+                source_health,
             },
             None => ControlResponse::Error {
                 message: format!("no such workflow: {n}"),
@@ -997,7 +1002,11 @@ mod tests {
         client.flush().await.unwrap();
 
         match read_event(&mut client).await {
-            SchedulerEvent::Snapshot { workflows, root } => {
+            SchedulerEvent::Snapshot {
+                workflows,
+                root,
+                source_health: _,
+            } => {
                 assert_eq!(workflows.len(), 1);
                 assert_eq!(workflows[0].name, "x");
                 assert_eq!(workflows[0].priority, 2);

@@ -57,3 +57,26 @@ cancel = ["Esc"]
 # c = "continue"
 # y = "yes"
 # n = "no"
+
+# Jira source — opt-in. Uncomment and fill in to ingest tickets from Jira.
+# Validation runs at scheduler startup; per-queue errors are skipped with a
+# logged warning, source-wide errors disable the whole source.
+#
+# [sources.jira]
+# url = "https://your-site.atlassian.net"
+# email = "bot@your-company.com"          # tied to the API token
+# auth_token_env = "JIRA_API_TOKEN"        # env var holding the token
+# poll_interval_secs = 30                  # clamped to a 15s floor at runtime
+# max_concurrent_explore = 5               # cap on simultaneously active explore workers
+# idle_explore_timeout = 86400             # seconds before the reaper kills an idle worker
+#
+# [sources.jira.queues.backlog]
+# filter_jql = "project = PROJ AND labels = clhorde-plan"
+# mode = "openspec"                        # only "openspec" is implemented; "direct" is reserved
+# comments = true                          # post 🤖 lifecycle comments on the ticket
+# labels = true                            # remove trigger_label on Exploring start
+# trigger_label = "clhorde-plan"           # label removed when leaving Exploring
+#
+# [sources.jira.queues.backlog.transitions]
+# exploring = "31"                         # Jira transition id; phase keys: exploring/archived/cancelled
+# archived = "61"

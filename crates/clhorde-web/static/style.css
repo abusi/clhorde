@@ -875,6 +875,12 @@ textarea.input {
 /* Workflow status badges. Mirror the prompt-status palette so the
  * dashboard's mental model carries over. */
 .badge-workflow-drafted     { background: var(--bg-tertiary); color: var(--text-secondary); }
+/* Triggered is transient (Jira source dispatched a worker, not yet in
+ * Exploring); render it dim like Drafted to avoid flicker. */
+.badge-workflow-triggered   { background: var(--bg-tertiary); color: var(--text-secondary); }
+/* Exploring needs human attention — pinkish to draw the eye without
+ * looking like a failure. */
+.badge-workflow-exploring   { background: rgba(236, 72, 153, 0.15); color: #f472b6; }
 .badge-workflow-queued      { background: rgba(59, 130, 246, 0.15); color: #60a5fa; }
 .badge-workflow-implementing{ background: rgba(34, 197, 94, 0.15);  color: #4ade80; }
 .badge-workflow-verifying   { background: rgba(168, 85, 247, 0.15); color: #c084fc; }
@@ -899,6 +905,99 @@ textarea.input {
     font-size: var(--font-size-sm);
     margin-top: var(--space-xs);
     flex-basis: 100%;
+}
+
+/* Explore-gate action area. Pink-tinted callout that pairs with the
+ * Exploring badge so the page makes the human-gated state visually
+ * impossible to miss. Buttons sit in the same callout to keep the
+ * "what to do" right next to "what's happening". */
+.workflow-explore-actions {
+    border: 1px solid rgba(236, 72, 153, 0.35);
+    background: rgba(236, 72, 153, 0.08);
+    border-radius: var(--radius-md);
+    padding: var(--space-md);
+    margin-bottom: var(--space-sm);
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+    flex-basis: 100%;
+}
+
+.workflow-explore-actions code {
+    background: rgba(255, 255, 255, 0.06);
+    padding: 0 var(--space-xs);
+    border-radius: var(--radius-sm);
+}
+
+.workflow-explore-buttons {
+    margin-top: var(--space-sm);
+    display: flex;
+    gap: var(--space-sm);
+}
+
+/* Per-source health summary (section 9.4 of `add-jira-source`).
+ * Sits between the Workflows header and the workflow list so the
+ * user sees source liveness right next to the workflows it produces.
+ * Each row is one source. */
+.source-health {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: var(--space-sm) var(--space-md);
+    margin-bottom: var(--space-md);
+    background: var(--bg-secondary);
+}
+
+.source-health-title {
+    margin: 0 0 var(--space-xs);
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.source-health-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-sm);
+    padding: var(--space-xs) 0;
+    font-size: var(--font-size-sm);
+}
+
+.source-health-name {
+    font-weight: 600;
+    min-width: 7em;
+}
+
+.source-health-state {
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 0.75em;
+    padding: 0 var(--space-xs);
+    border-radius: var(--radius-sm);
+}
+
+.source-health-ok .source-health-state {
+    background: rgba(34, 197, 94, 0.15);
+    color: #4ade80;
+}
+
+.source-health-unhealthy .source-health-state {
+    background: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+}
+
+.source-health-last-run {
+    color: var(--text-secondary);
+}
+
+.source-health-error {
+    color: #f87171;
+    font-style: italic;
+    margin-left: auto;
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 /* Workflow detail block. */

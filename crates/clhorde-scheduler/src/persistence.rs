@@ -197,7 +197,7 @@ fn is_valid_name(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::openspec::discovery::MarkerMetadata;
-    use crate::workflow::WorkflowStatus;
+    use crate::workflow::{SourceKind, WorkflowStatus};
     use tempfile::TempDir;
 
     fn store_in(tmp: &TempDir) -> WorkflowStore {
@@ -330,6 +330,82 @@ mod tests {
         assert_eq!(loaded.status, WorkflowStatus::Drafted);
         assert!(loaded.prompt_ids.is_empty());
         assert_eq!(loaded.metadata, MarkerMetadata::default());
+        // Pre-jira-source workflow files have no `source` field; they
+        // must default to OpenSpec on reload.
+        assert_eq!(loaded.source, SourceKind::OpenSpec);
+    }
+
+    #[test]
+    fn round_trip_preserves_exploring_and_jira_source() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+
+        let mut wf = Workflow::triggered("PROJ-1", SourceKind::Jira);
+        wf.start_exploring().unwrap();
+        store.save(&wf).unwrap();
+
+        let loaded = store.load("PROJ-1").unwrap().unwrap();
+        assert_eq!(loaded.status, WorkflowStatus::Exploring);
+        assert_eq!(loaded.source, SourceKind::Jira);
+        assert_eq!(loaded, wf);
+    }
+
+    #[test]
+    fn round_trip_preserves_triggered_state() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+
+        let wf = Workflow::triggered("PROJ-2", SourceKind::Jira);
+        store.save(&wf).unwrap();
+
+        let loaded = store.load("PROJ-2").unwrap().unwrap();
+        assert_eq!(loaded.status, WorkflowStatus::Triggered);
+        assert_eq!(loaded.source, SourceKind::Jira);
+        assert_eq!(loaded, wf);
+    }
+
+    #[test]
+    fn legacy_file_with_explicit_openspec_source_loads() {
+        // Forward compat: even if a future writer drops the source
+        // field altogether, today's reader treats absence as OpenSpec.
+        // Verify the explicit `"source": "open_spec"` form also loads.
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        fs::create_dir_all(store.dir()).unwrap();
+        let body = serde_json::json!({
+            "name": "explicit-openspec",
+            "status": { "kind": "drafted" },
+            "source": "open_spec"
+        });
+        fs::write(
+            store.dir().join("explicit-openspec.json"),
+            serde_json::to_vec_pretty(&body).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = store.load("explicit-openspec").unwrap().unwrap();
+        assert_eq!(loaded.source, SourceKind::OpenSpec);
+    }
+
+    #[test]
+    fn legacy_file_with_jira_source_loads() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        fs::create_dir_all(store.dir()).unwrap();
+        let body = serde_json::json!({
+            "name": "PROJ-3",
+            "status": { "kind": "exploring" },
+            "source": "jira"
+        });
+        fs::write(
+            store.dir().join("PROJ-3.json"),
+            serde_json::to_vec_pretty(&body).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = store.load("PROJ-3").unwrap().unwrap();
+        assert_eq!(loaded.status, WorkflowStatus::Exploring);
+        assert_eq!(loaded.source, SourceKind::Jira);
     }
 
     #[test]

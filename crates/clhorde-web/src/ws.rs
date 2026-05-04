@@ -108,12 +108,20 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     // next push event arrives. Wrapped in a Snapshot envelope so the
     // SPA dispatch code is identical for bootstrap and push paths.
     if state.scheduler.is_connected() {
-        if let Ok(ControlResponse::Status { workflows, root }) = state
+        if let Ok(ControlResponse::Status {
+            workflows,
+            root,
+            source_health,
+        }) = state
             .scheduler
             .request(ControlRequest::Status { name: None })
             .await
         {
-            let snapshot = SchedulerEvent::Snapshot { workflows, root };
+            let snapshot = SchedulerEvent::Snapshot {
+                workflows,
+                root,
+                source_health,
+            };
             if let Some(msg) = scheduler_message(&snapshot) {
                 if ws_tx.send(msg).await.is_err() {
                     let count = state.ws_disconnect();
@@ -552,6 +560,7 @@ mod tests {
         let event = SchedulerEvent::Snapshot {
             workflows: vec![],
             root: Some("/tmp/repo".into()),
+            source_health: vec![],
         };
         let msg = scheduler_message(&event).unwrap();
         let text = msg.into_text().unwrap();
@@ -574,6 +583,8 @@ mod tests {
             finished_at: None,
             prompt_ids: vec![],
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         };
         let event = SchedulerEvent::WorkflowUpdated { summary };
         let msg = scheduler_message(&event).unwrap();
@@ -602,6 +613,8 @@ mod tests {
             finished_at: None,
             prompt_ids: vec![],
             blocked_by: vec!["base".into(), "shared".into()],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         };
         let event = SchedulerEvent::WorkflowUpdated { summary };
         let msg = scheduler_message(&event).unwrap();
@@ -624,6 +637,8 @@ mod tests {
             verify: None,
             archive: None,
             blocked_by: vec![],
+            source: "open_spec".into(),
+            explore_worker_alive: false,
         }
     }
 

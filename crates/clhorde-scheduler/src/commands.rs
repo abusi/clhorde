@@ -34,8 +34,10 @@ use crate::openspec::discovery::{self, ChangeStatus};
 use crate::openspec::tasks_parser;
 use crate::orchestrator::Orchestrator;
 use crate::persistence::{StoreError, WorkflowStore};
+use crate::source;
 use crate::templates::{self, TemplateEngine};
 use crate::workflow::{Workflow, WorkflowStatus};
+use clhorde_core::control::SourceHealthReport;
 
 /// What every command produces. `stdout` is what the binary prints on
 /// success; `stderr` is shown alongside on any return value.
@@ -230,10 +232,19 @@ pub fn status(
 fn format_workflow_summary(wf: &Workflow) -> String {
     let label = workflow_status_label(&wf.status);
     let trail = workflow_status_detail(wf);
-    if trail.is_empty() {
-        format!("{}: {}", wf.name, label)
+    let source = format!(" [{}]", source::source_kind_name(wf.source));
+    let exploring_hint = if matches!(wf.status, WorkflowStatus::Exploring) {
+        " — awaiting human review"
     } else {
-        format!("{}: {} ({})", wf.name, label, trail)
+        ""
+    };
+    if trail.is_empty() {
+        format!("{}: {}{}{}", wf.name, label, source, exploring_hint)
+    } else {
+        format!(
+            "{}: {}{} ({}){}",
+            wf.name, label, source, trail, exploring_hint
+        )
     }
 }
 
@@ -244,6 +255,20 @@ fn format_workflow_detail(
     let mut s = String::new();
     s.push_str(&format!("name: {}\n", wf.name));
     s.push_str(&format!("status: {}\n", workflow_status_label(&wf.status)));
+    s.push_str(&format!(
+        "source: {}\n",
+        source::source_kind_name(wf.source)
+    ));
+    if matches!(wf.status, WorkflowStatus::Exploring) {
+        // Make the gate explicit: tell the user *why* the workflow is
+        // parked and how to unstick it. The actual `worker_alive`
+        // indicator only surfaces through the daemon-routed surface
+        // (TUI/web); the FS-only status command can't see live worker
+        // state, so we surface the contract instead.
+        s.push_str(
+            "exploring: awaiting human review — write `.clhorde-ready` (`clhorde-cli approve <name>`) or `clhorde-cli reject <name>`\n",
+        );
+    }
     if let WorkflowStatus::Failed { reason } = &wf.status {
         s.push_str(&format!("reason: {reason}\n"));
     }
@@ -290,6 +315,8 @@ fn format_workflow_detail(
 fn workflow_status_label(s: &WorkflowStatus) -> &'static str {
     match s {
         WorkflowStatus::Drafted => "drafted",
+        WorkflowStatus::Triggered => "triggered",
+        WorkflowStatus::Exploring => "exploring",
         WorkflowStatus::Queued => "queued",
         WorkflowStatus::Implementing => "implementing",
         WorkflowStatus::Verifying => "verifying",
@@ -298,6 +325,37 @@ fn workflow_status_label(s: &WorkflowStatus) -> &'static str {
         WorkflowStatus::Cancelled => "cancelled",
         WorkflowStatus::Failed { .. } => "failed",
     }
+}
+
+/// Render a `SourceHealth` block for CLI output. Public so the
+/// scheduler binary can append it to `status` after a best-effort
+/// daemon round-trip; tests round-trip just the formatter without
+/// going near a socket.
+///
+/// Empty input renders an empty string so the caller can splice the
+/// block into existing output unconditionally.
+pub fn format_source_health(reports: &[SourceHealthReport]) -> String {
+    if reports.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    s.push_str("\nsources:\n");
+    for r in reports {
+        let healthy = if r.is_healthy { "ok" } else { "unhealthy" };
+        let last_run = match r.last_successful_run {
+            Some(t) => format!("last_run={}", relative_time(t)),
+            None => "last_run=never".to_string(),
+        };
+        let suffix = match &r.last_error {
+            Some(e) => format!(" last_error={e}"),
+            None => String::new(),
+        };
+        s.push_str(&format!(
+            "  - {} [{healthy}] {last_run}{suffix}\n",
+            r.source
+        ));
+    }
+    s
 }
 
 fn workflow_status_detail(wf: &Workflow) -> String {
@@ -913,6 +971,101 @@ mod tests {
         let store = WorkflowStore::open(tmp.path().join("wf"));
         let out = status(StatusArgs { name: None }, &store).unwrap();
         assert!(out.stdout.contains("(no workflows"));
+    }
+
+    #[test]
+    fn status_summary_surfaces_source_label() {
+        let tmp = TempDir::new().unwrap();
+        let store = WorkflowStore::open(tmp.path().join("wf"));
+        let mut wf = Workflow::triggered("PROJ-1", crate::workflow::SourceKind::Jira);
+        wf.start_exploring().unwrap();
+        store.save(&wf).unwrap();
+        store.save(&Workflow::drafted("native")).unwrap();
+
+        let out = status(StatusArgs { name: None }, &store).unwrap();
+        // Source surfaced inline so multi-source ops can tell at a
+        // glance which workflow came from where.
+        assert!(
+            out.stdout.contains("PROJ-1: exploring [jira]"),
+            "expected PROJ-1 line with source tag, got:\n{}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("native: drafted [open_spec]"),
+            "expected native line with source tag, got:\n{}",
+            out.stdout
+        );
+        // Exploring rows tell the user explicitly that a human is
+        // expected to act — the label alone is not enough.
+        assert!(
+            out.stdout.contains("awaiting human review"),
+            "expected exploring hint in:\n{}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn status_detail_for_exploring_explains_the_gate() {
+        let tmp = TempDir::new().unwrap();
+        let store = WorkflowStore::open(tmp.path().join("wf"));
+        let mut wf = Workflow::triggered("PROJ-1", crate::workflow::SourceKind::Jira);
+        wf.start_exploring().unwrap();
+        store.save(&wf).unwrap();
+
+        let out = status(
+            StatusArgs {
+                name: Some("PROJ-1".into()),
+            },
+            &store,
+        )
+        .unwrap();
+        assert!(out.stdout.contains("status: exploring"));
+        assert!(out.stdout.contains("source: jira"));
+        assert!(
+            out.stdout.contains("exploring:"),
+            "expected explore-gate help line in:\n{}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("clhorde-cli approve"),
+            "expected approve hint in:\n{}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("clhorde-cli reject"),
+            "expected reject hint in:\n{}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn format_source_health_renders_each_source() {
+        let reports = vec![
+            SourceHealthReport {
+                source: "open_spec".into(),
+                last_successful_run: Some(Utc::now() - chrono::Duration::seconds(20)),
+                last_error: None,
+                is_healthy: true,
+            },
+            SourceHealthReport {
+                source: "jira".into(),
+                last_successful_run: None,
+                last_error: Some("401 Unauthorized".into()),
+                is_healthy: false,
+            },
+        ];
+        let out = format_source_health(&reports);
+        assert!(out.contains("sources:"));
+        assert!(out.contains("- open_spec [ok]"));
+        assert!(out.contains("- jira [unhealthy]"));
+        assert!(out.contains("last_error=401 Unauthorized"));
+        // Never-run sources surface "never" rather than a blank space.
+        assert!(out.contains("last_run=never"));
+    }
+
+    #[test]
+    fn format_source_health_empty_input_renders_nothing() {
+        assert!(format_source_health(&[]).is_empty());
     }
 
     // ── templates path / edit ──
